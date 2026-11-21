@@ -953,27 +953,47 @@ app.post('/api/leads/:leadId/toggle-ai', auth, async (req, res) => {
     res.status(500).json({ error: 'Erro ao alterar status da IA' });
   }
 });
-    const now = Date.now();
-    const activeClients = list
-      .filter((c) => {
-        const tipo = String(c.t || '').trim().toLowerCase();
-        const bloqueado = String(c.b || '').trim().toLowerCase();
-        if (tipo !== 'ativo') return false;
-        if (bloqueado !== 'no' && bloqueado !== '0' && bloqueado !== 'false' && bloqueado !== '') return false;
 
-        if (c.e) {
-          const expMs = Date.parse(String(c.e).replace(' ', 'T'));
-          if (!Number.isNaN(expMs) && expMs < now) return false;
-        }
-        return true;
-      })
-      .map((c, idx) => ({
-        id: String(c.i ?? idx),
-        username: String(c.u ?? 'Cliente NATV'),
-        name: String(c.n || c.u || 'Cliente NATV'),
-        exp_date: c.e ?? null,
-        plan: c.c ? `${c.c} tela(s)` : 'NATV',
-      }));
+// ==========================================
+// 8. LISTAR CLIENTES ATIVOS DO PAINEL NATV
+// ==========================================
+const natvClientsCache = new Map();
+
+app.get('/api/natv/clients', auth, async (req, res) => {
+  try {
+    const cached = natvClientsCache.get(req.user.id);
+    if (cached && Date.now() - cached.ts < 65000) {
+      return res.json(cached.payload);
+    }
+
+    const r = await pool.query(
+      'SELECT natv_api_key FROM resellers WHERE id = $1',
+      [req.user.id]
+    );
+    const natvKey = r.rows[0]?.natv_api_key;
+    if (!natvKey) {
+      return res.status(400).json({ error: 'Chave NATV não configurada' });
+    }
+
+    const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
+    const response = await fetch(`${baseUrl}/report/allusers`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${natvKey}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    const rawText = await response.text();
+    if (!response.ok) {
+      console.log('NATV /report/allusers erro:', response.status, rawText.slice(0, 300));
+      return res.status(response.status).json({ error: 'Não foi possível consultar os clientes na NATV' });
+    }
+
+    const raw = JSON.parse(rawText);
+    const list = Array.isArray(raw) ? raw : (raw.data || raw.users || raw.clients || []);
+
+    const now = Date
 
 
 
