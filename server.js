@@ -503,8 +503,8 @@ app.post('/api/webhooks/evolution', async (req, res) => {
         });
       }
 
-      // Segunda chamada para a IA montar a resposta final ao cliente
-      aiRes = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions')
+            // Segunda chamada para a IA montar a resposta final ao cliente
+      aiRes = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -516,6 +516,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
           messages: messagesPayload,
         }),
       });
+
       aiData = await aiRes.json();
       msg = aiData.choices?.[0]?.message;
     }
