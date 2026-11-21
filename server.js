@@ -1239,7 +1239,8 @@ const RECOVERY_MESSAGES = [
 
 async function generateMessageVariations(baseText) {
   try {
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = process.env.OPENAI_API_KEY || process.env.GEMINI_API_KEY;
+
     if (!apiKey) return [baseText];
 
     const response = await fetch(
