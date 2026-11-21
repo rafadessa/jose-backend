@@ -95,7 +95,12 @@ app.post('/api/auth/login', async (req, res) => {
         is_vip: isVipReseller(user),
       },
     });
-    // Login direto usando apenas a Chave de API NATV
+  } catch {
+    res.status(500).json({ error: 'Erro ao fazer login' });
+  }
+});
+
+// Login direto usando apenas a Chave de API NATV
 app.post('/api/auth/natv-login', async (req, res) => {
   const { natv_api_key } = req.body;
   if (!natv_api_key) {
@@ -103,11 +108,13 @@ app.post('/api/auth/natv-login', async (req, res) => {
   }
 
   try {
+    const cleanKey = natv_api_key.trim();
+
     // 1. Valida a chave direto na NATV e puxa nome + créditos
     const response = await fetch('https://revenda.pixbot.link/reseller/me', {
       method: 'GET',
       headers: {
-        Authorization: `Bearer ${natv_api_key.trim()}`,
+        Authorization: `Bearer ${cleanKey}`,
         'Content-Type': 'application/json',
       },
     });
@@ -122,17 +129,17 @@ app.post('/api/auth/natv-login', async (req, res) => {
     const fakeEmail = `${natvName.toLowerCase().replace(/[^a-z0-9]/g, '')}@natv.jose`;
 
     // 2. Busca se já existe no banco; se não existir, cria automaticamente
-    let result = await pool.query('SELECT * FROM resellers WHERE natv_api_key = $1', [natv_api_key.trim()]);
+    let result = await pool.query('SELECT * FROM resellers WHERE natv_api_key = $1', [cleanKey]);
     let user = result.rows[0];
 
     if (!user) {
-      const dummyHash = await bcrypt.hash(natv_api_key.trim(), 10);
+      const dummyHash = await bcrypt.hash(cleanKey, 10);
       const insert = await pool.query(
         `INSERT INTO resellers (name, email, password_hash, natv_api_key, natv_credits)
          VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (email) DO UPDATE SET natv_api_key = $4, natv_credits = $5
          RETURNING *`,
-        [natvName, fakeEmail, dummyHash, natv_api_key.trim(), credits]
+        [natvName, fakeEmail, dummyHash, cleanKey, credits]
       );
       user = insert.rows[0];
     } else {
@@ -162,12 +169,6 @@ app.post('/api/auth/natv-login', async (req, res) => {
     });
   } catch {
     res.status(500).json({ error: 'Erro ao validar acesso na API NATV' });
-  }
-});
-
-    
-  } catch {
-    res.status(500).json({ error: 'Erro ao fazer login' });
   }
 });
 
