@@ -1226,5 +1226,100 @@ setInterval(runRenewalFollowup, 60 * 60 * 1000);  // Renovação: checa a cada 1
 
 
 
+// ==========================================
+// 10. DISPARO MANUAL: TENTATIVA DE RECUPERAÇÃO (ANTI-BLOQUEIO)
+// ==========================================
+const runningRecoveryJobs = new Set();
+
+const RECOVERY_MESSAGES = [
+  'Oi! Tudo bem? Passando só pra saber se você ainda tem interesse em liberar o acesso aos canais, filmes e séries. Se quiser testar de novo ou ativar hoje, é só me chamar por aqui! 📺',
+  'Olá! Vi que a gente conversou outro dia sobre o streaming e acabou não fechando. Ainda está procurando um aplicativo bom e estável pra sua TV? Posso te ajudar agora mesmo 😉',
+  'Opa, tudo certo? Passando rapidinho pra avisar que nossos planos continuam disponíveis a partir de R$ 29,90/mês com ativação imediata. Se quiser voltar a assistir hoje, só dar um oi aqui!',
+  'Oi! Tudo bem por aí? Caso ainda tenha interesse em ativar o streaming na sua TV ou celular, continuo à disposição por aqui pra liberar rapidinho pra você 👍',
+];
+
+app.post('/api/followup/recovery', auth, async (req, res) => {
+  try {
+    if (runningRecoveryJobs.has(req.user.id)) {
+      return res.status(409).json({ error: 'Já existe uma tentativa de recuperação em andamento.' });
+    }
+
+    const instRes = await pool.query(
+      'SELECT instance_name FROM whatsapp_instances WHERE reseller_id = $1 LIMIT 1',
+      [req.user.id]
+    );
+    const instanceName = instRes.rows[0]?.instance_name;
+    if (!instanceName) {
+      return res.status(400).json({ error: 'WhatsApp não conectado.' });
+    }
+
+    // Busca até 40 leads que não assinaram, sem resposta há +24h e sem recuperação nos últimos 7 dias
+    const leadsRes = await pool.query(
+      `SELECT id, phone, name
+       FROM leads
+       WHERE reseller_id = $1
+         AND needs_human = false
+         AND COALESCE(stage, '') <> 'ATIVO'
+         AND last_interaction < NOW() - INTERVAL '24 hours'
+         AND (last_followup_at IS NULL OR last_followup_at < NOW() - INTERVAL '7 days')
+       ORDER BY last_interaction DESC
+       LIMIT 40`,
+      [req.user.id]
+    );
+
+    const targets = leadsRes.rows;
+    if (targets.length === 0) {
+      return res.json({
+        started: false,
+        total_targets: 0,
+        message: 'Nenhum lead elegível para recuperação no momento.',
+      });
+    }
+
+    // Responde imediatamente pro painel não travar e dispara em segundo plano
+    runningRecoveryJobs.add(req.user.id);
+    res.json({
+      started: true,
+      total_targets: targets.length,
+      message: `Recuperação iniciada para ${targets.length} contato(s) com intervalo seguro de 45s a 90s.`,
+    });
+
+    (async () => {
+      try {
+        for (let i = 0; i < targets.length; i++) {
+          const lead = targets[i];
+          const text = RECOVERY_MESSAGES[i % RECOVERY_MESSAGES.length];
+
+          try {
+            await sendWhatsAppText(instanceName, lead.phone, text);
+            await pool.query(
+              `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`,
+              [lead.id, text]
+            );
+            await pool.query(
+              `UPDATE leads SET last_followup_at = now(), last_message = $1, last_interaction = now() WHERE id = $2`,
+              [text, lead.id]
+            );
+          } catch (sendErr) {
+            console.error(`Erro ao enviar recuperação para ${lead.phone}:`, sendErr.message);
+          }
+
+          // Pausa aleatória entre 45 e 90 segundos antes do próximo número
+          if (i < targets.length - 1) {
+            const delayMs = (45 + Math.floor(Math.random() * 46)) * 1000;
+            await new Promise((r) => setTimeout(r, delayMs));
+          }
+        }
+        console.log(`Recuperação finalizada para revendedor ${req.user.id} (${targets.length} envios).`);
+      } finally {
+        runningRecoveryJobs.delete(req.user.id);
+      }
+    })();
+  } catch (err) {
+    console.error('Erro /api/followup/recovery:', err);
+    res.status(500).json({ error: 'Erro ao iniciar tentativa de recuperação.' });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`API do José rodando na porta ${PORT}`));
