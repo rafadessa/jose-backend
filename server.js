@@ -8,6 +8,8 @@ const jwt = require('jsonwebtoken');
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.get('/', (req, res) => res.json({ status: 'ok', app: 'API do José' }));
+
 
 // Conexão com o PostgreSQL da sua VPS
 const pool = new Pool({
