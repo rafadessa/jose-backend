@@ -1035,6 +1035,194 @@ app.get('/api/natv/clients', auth, async (req, res) => {
 });
 
 
+// ==========================================
+// 9. MOTOR DE FOLLOW-UP AUTOMÁTICO (VENDAS + RENOVAÇÃO NATV)
+// ==========================================
+async function initFollowupColumns() {
+  try {
+    await pool.query(`
+      ALTER TABLE leads
+      ADD COLUMN IF NOT EXISTS followup_step INTEGER DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS last_followup_at TIMESTAMP,
+      ADD COLUMN IF NOT EXISTS renewal_last_exp TEXT,
+      ADD COLUMN IF NOT EXISTS renewal_stage TEXT;
+    `);
+    console.log('Colunas de follow-up verificadas com sucesso.');
+  } catch (err) {
+    console.error('Erro ao criar colunas de follow-up:', err.message);
+  }
+}
+
+function getBrazilHour() {
+  const hourStr = new Intl.DateTimeFormat('pt-BR', {
+    timeZone: 'America/Sao_Paulo',
+    hour: 'numeric',
+    hour12: false,
+  }).format(new Date());
+  return Number(hourStr);
+}
+
+// 9.1 FOLLOW-UP DE VENDAS (Pré-teste 45m | Pós-teste 65m | Recuperação 24h)
+async function runSalesFollowup() {
+  const hour = getBrazilHour();
+  if (hour < 8 || hour >= 22) return; // Só envia entre 08h e 22h (horário de Brasília)
+
+  try {
+    const { rows } = await pool.query(`
+      SELECT l.*, r.id AS r_id, r.bot_active, r.wallet_balance, r.natv_api_key, wi.instance_name
+      FROM leads l
+      JOIN resellers r ON r.id = l.reseller_id
+      JOIN whatsapp_instances wi ON wi.reseller_id = r.id
+      WHERE r.bot_active = true
+        AND l.needs_human = false
+        AND COALESCE(l.stage, '') <> 'ATIVO'
+        AND COALESCE(l.followup_step, 0) < 2
+    `);
+
+    const now = Date.now();
+
+    for (const lead of rows) {
+      if (!isVipReseller(lead) && Number(lead.wallet_balance) <= 0) continue;
+
+      const lastTime = new Date(lead.last_interaction || lead.created_at).getTime();
+      const diffMin = (now - lastTime) / 60000;
+      const step = Number(lead.followup_step || 0);
+      const stage = String(lead.stage || '').toUpperCase();
+
+      let msg = null;
+      let nextStep = step;
+
+      // Caso 1: Abandonou antes de gerar o teste (45 min sem resposta)
+      if (stage !== 'TESTE' && step === 0 && diffMin >= 45 && diffMin < 1440) {
+        msg = 'Opa! Conseguiu encontrar o aplicativo na loja da sua TV? Se precisar de ajuda pra achar, me avisa aqui que te auxilio 👍';
+        nextStep = 1;
+      }
+      // Caso 2: Acabou o teste grátis de 1h (65 min após o teste)
+      else if (stage === 'TESTE' && step === 0 && diffMin >= 65 && diffMin < 1440) {
+        msg = 'E aí, o que achou da qualidade dos canais e filmes no teste? Quer que eu já libere o plano mensal de R$ 29,90 pra você continuar assistindo? 📺';
+        nextStep = 1;
+      }
+      // Caso 3: Recuperação 24h depois do teste
+      else if (stage === 'TESTE' && step === 1 && diffMin >= 1440 && diffMin < 4320) {
+        msg = 'Passando só pra avisar que o seu usuário ainda está salvo por aqui! Se quiser ativar hoje, levo 1 minutinho pra liberar o acesso 😉';
+        nextStep = 2;
+      }
+
+      if (msg) {
+        await sendWhatsAppText(lead.instance_name, lead.phone, msg);
+        await pool.query(
+          `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`,
+          [lead.id, msg]
+        );
+        await pool.query(
+          `UPDATE leads SET followup_step = $1, last_followup_at = now(), last_message = $2, last_interaction = now() WHERE id = $3`,
+          [nextStep, msg, lead.id]
+        );
+        // Pequena pausa entre envios para evitar bloqueio no WhatsApp
+        await new Promise((r) => setTimeout(r, 2500));
+      }
+    }
+  } catch (err) {
+    console.error('Erro no follow-up de vendas:', err.message);
+  }
+}
+
+// 9.2 FOLLOW-UP DE RENOVAÇÃO (3 dias antes | No dia | 1 dia após vencer)
+async function runRenewalFollowup() {
+  const hour = getBrazilHour();
+  if (hour < 9 || hour >= 21) return; // Só envia entre 09h e 21h
+
+  try {
+    const resellersRes = await pool.query(`
+      SELECT r.*, wi.instance_name
+      FROM resellers r
+      JOIN whatsapp_instances wi ON wi.reseller_id = r.id
+      WHERE r.bot_active = true AND r.natv_api_key IS NOT NULL
+    `);
+
+    const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
+
+    for (const reseller of resellersRes.rows) {
+      if (!isVipReseller(reseller) && Number(reseller.wallet_balance) <= 0) continue;
+
+      const response = await fetch(`${baseUrl}/report/allusers`, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${reseller.natv_api_key}`,
+          'Content-Type': 'application/json',
+        },
+      });
+      if (!response.ok) continue;
+
+      const raw = await response.json();
+      const list = Array.isArray(raw) ? raw : (raw.data || raw.users || raw.clients || []);
+      const resellerName = String(reseller.name || '').trim().toLowerCase();
+
+      // Busca leads com natv_username vinculado a este revendedor
+      const leadsRes = await pool.query(
+        `SELECT * FROM leads WHERE reseller_id = $1 AND natv_username IS NOT NULL AND needs_human = false`,
+        [reseller.id]
+      );
+      const leadByUser = new Map(
+        leadsRes.rows.map((l) => [String(l.natv_username).trim().toLowerCase(), l])
+      );
+
+      const now = Date.now();
+
+      for (const c of list) {
+        const dono = String(c.r || '').trim().toLowerCase();
+        if (resellerName && dono && dono !== resellerName) continue;
+        if (!c.e || !c.u) continue;
+
+        const lead = leadByUser.get(String(c.u).trim().toLowerCase());
+        if (!lead) continue;
+
+        const expMs = Date.parse(String(c.e).replace(' ', 'T'));
+        if (Number.isNaN(expMs)) continue;
+
+        const daysLeft = Math.ceil((expMs - now) / (1000 * 60 * 60 * 24));
+        let stageToSend = null;
+        let msg = null;
+
+        if (daysLeft === 3) {
+          stageToSend = '3d';
+          msg = `Oi! Passando pra lembrar que o seu plano vence em 3 dias (${String(c.e).slice(0, 10)}). Se já quiser deixar renovado pra não ficar sem sinal, é só me chamar aqui que gero o Pix na hora! 📺`;
+        } else if (daysLeft === 0) {
+          stageToSend = '0d';
+          msg = `Olá! Seu plano vence hoje. Quer que eu já envie o Pix para renovar automaticamente e manter seu acesso ativo?`;
+        } else if (daysLeft === -1) {
+          stageToSend = '-1d';
+          msg = `Oi! Vi aqui que o seu acesso venceu ontem. Se quiser reativar agora, é só responder aqui que libero em 1 minutinho pra você 😉`;
+        }
+
+        if (!stageToSend) continue;
+
+        // Evita reenviar o mesmo aviso para a mesma data de vencimento
+        if (lead.renewal_last_exp === String(c.e) && lead.renewal_stage === stageToSend) {
+          continue;
+        }
+
+        await sendWhatsAppText(reseller.instance_name, lead.phone, msg);
+        await pool.query(
+          `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`,
+          [lead.id, msg]
+        );
+        await pool.query(
+          `UPDATE leads SET renewal_last_exp = $1, renewal_stage = $2, last_message = $3, last_interaction = now() WHERE id = $4`,
+          [String(c.e), stageToSend, msg, lead.id]
+        );
+        await new Promise((r) => setTimeout(r, 3000));
+      }
+    }
+  } catch (err) {
+    console.error('Erro no follow-up de renovação:', err.message);
+  }
+}
+
+// Inicia as colunas e agenda os disparos automáticos
+initFollowupColumns();
+setInterval(runSalesFollowup, 5 * 60 * 1000);     // Vendas: checa a cada 5 minutos
+setInterval(runRenewalFollowup, 60 * 60 * 1000);  // Renovação: checa a cada 1 hora
 
 
 
