@@ -953,7 +953,6 @@ app.post('/api/leads/:leadId/toggle-ai', auth, async (req, res) => {
     res.status(500).json({ error: 'Erro ao alterar status da IA' });
   }
 });
-
 // ==========================================
 // 8. LISTAR CLIENTES ATIVOS DO PAINEL NATV
 // ==========================================
@@ -968,8 +967,8 @@ app.get('/api/natv/clients', auth, async (req, res) => {
       return res.status(400).json({ error: 'Chave NATV não configurada' });
     }
 
-    const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link/api').replace(/\/$/, '');
-        const response = await fetch(`${baseUrl}/user`, {
+    const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
+    const response = await fetch(`${baseUrl}/user`, {
       method: 'GET',
       headers: {
         Authorization: `Bearer ${natvKey}`,
@@ -977,20 +976,17 @@ app.get('/api/natv/clients', auth, async (req, res) => {
       },
     });
 
-    
-
+    const rawText = await response.text();
+    console.log('NATV /user status:', response.status);
+    console.log('NATV /user body:', rawText.slice(0, 500));
 
     if (!response.ok) {
       return res.status(response.status).json({ error: 'Não foi possível consultar os clientes na NATV' });
     }
 
-    console.log('NATV /user status:', response.status);
-    const rawText = await response.text();
-    console.log('NATV /user body:', rawText.slice(0, 500));
     const raw = JSON.parse(rawText);
     const list = Array.isArray(raw) ? raw : (raw.data || raw.users || raw.clients || []);
 
-    // Filtra apenas clientes ativos (sem expirados/bloqueados/testes, quando o campo existir)
     const now = Date.now();
     const activeClients = list.filter((c) => {
       const status = String(c.status || '').toLowerCase();
