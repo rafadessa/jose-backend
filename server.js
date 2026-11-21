@@ -28,7 +28,7 @@ const MP_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN; // Seu MP (recarg
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // Chave do Google AI Studio (Gemini)
 
 // Configure BASE_URL no Easypanel ou troque o link abaixo pelo domínio real da sua jose-api
-const BASE_URL = process.env.BASE_URL || 'https://bot-streaming-jose-api.celuyv.easypanel.host';
+const BASE_URL = (process.env.BASE_URL || 'https://bot-streaming-jose-api.celuyv.easypanel.host').replace(/\/$/, '');
 
 // Chaves NATV VIP (não exigem saldo na carteira do José e não sofrem débito)
 const VIP_NATV_KEYS = (process.env.VIP_NATV_KEYS || '')
@@ -39,6 +39,14 @@ const VIP_NATV_KEYS = (process.env.VIP_NATV_KEYS || '')
 function isVipReseller(reseller) {
   return Boolean(reseller?.natv_api_key && VIP_NATV_KEYS.includes(reseller.natv_api_key.trim()));
 }
+
+// Tabela oficial de preços (por quantidade de telas e meses)
+const PLAN_PRICES = {
+  1: { 1: 29.9, 3: 74.9, 6: 149.9, 12: 279.9 },
+  2: { 1: 50.0, 3: 149.9, 6: 299.9, 12: 499.9 },
+  3: { 1: 70.0 },
+  4: { 1: 90.0 },
+};
 
 // Middleware de Autenticação
 function auth(req, res, next) {
@@ -167,11 +175,10 @@ app.post('/api/auth/natv-login', async (req, res) => {
         is_vip: isVipReseller(user),
       },
     });
-   } catch (err) {
+  } catch (err) {
     console.error('Erro detalhado no natv-login:', err);
     res.status(500).json({ error: `Erro interno: ${err.message}` });
   }
-
 });
 
 // ==========================================
@@ -196,10 +203,9 @@ app.post('/api/natv/validate', auth, async (req, res) => {
     const credits = natvData.credits ?? 0;
 
     await pool.query(
-  'UPDATE leads SET last_message = $1, last_interaction = now(), followup_step = 0 WHERE id = $2',
-  [text, lead.id]
-);
-
+      'UPDATE resellers SET natv_api_key = $1, natv_credits = $2 WHERE id = $3',
+      [natv_api_key, credits, req.user.id]
+    );
 
     res.json({ success: true, credits, natvData });
   } catch {
@@ -378,24 +384,28 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
     const payment = await mpRes.json();
 
     if (payment.status === 'approved' && payment.external_reference) {
-      const [leadId, monthsStr] = payment.external_reference.split('|');
+      const [leadId, monthsStr, screensStr] = payment.external_reference.split('|');
       const months = Number(monthsStr) || 1;
+      const screens = Number(screensStr) || 1;
 
       const leadRes = await pool.query('SELECT * FROM leads WHERE id = $1', [leadId]);
       const lead = leadRes.rows[0];
       if (!lead?.natv_username || lead.stage === 'ATIVO') return;
 
       // Ativa/renova o usuário na NATV (desconta os créditos do revendedor)
+      const actBody = {
+        username: lead.natv_username,
+        months,
+        ...(screens > 1 ? { connections: screens } : {}),
+      };
+
       const actRes = await fetch('https://revenda.pixbot.link/user/activation', {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${reseller.natv_api_key}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          username: lead.natv_username,
-          months,
-        }),
+        body: JSON.stringify(actBody),
       });
       const actData = await actRes.json();
 
@@ -407,7 +417,7 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
             reseller.id,
             Number(reseller.cost_per_activation ?? 0.50),
             'activation',
-            `Ativação (${months}m): ${lead.natv_username}`
+            `Ativação (${months}m / ${screens} tela(s)): ${lead.natv_username}`
           );
         }
 
@@ -427,7 +437,7 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
           await sendWhatsAppText(
             instanceName,
             lead.phone,
-            `Pagamento confirmado! 🎉 Seu plano de ${months} ${months === 1 ? 'mês' : 'meses'} já foi ativado automaticamente. Bom entretenimento!`
+            `Pagamento confirmado! 🎉 Seu plano de ${months} ${months === 1 ? 'mês' : 'meses'} (${screens} ${screens === 1 ? 'tela' : 'telas'}) já foi ativado automaticamente. Bom entretenimento!`
           );
         }
       }
@@ -453,8 +463,13 @@ const APP_LOGOS = {
 const JOSE_SYSTEM_PROMPT = `Você é o José, atendente comercial de streaming no WhatsApp.
 Estilo: leve, direto, simpático e natural. Mensagens CURTAS (máx. 2 a 3 linhas) e APENAS UMA pergunta por vez.
 
-PLANOS: Mensal R$ 29,90 | Trimestral R$ 74,90 | Semestral R$ 149,90 | Anual R$ 279,90 | Teste grátis: 1 hora.
-Regra: nunca jogue a tabela completa antes de oferecer o teste grátis (se perguntar preço, diga "a partir de R$ 29,90/mês" e puxe para o teste).
+PLANOS (até 4 telas simultâneas):
+- 1 tela: Mensal R$ 29,90 | Trimestral R$ 74,90 | Semestral R$ 149,90 | Anual R$ 279,90
+- 2 telas: Mensal R$ 50,00 | Trimestral R$ 149,90 | Semestral R$ 299,90 | Anual R$ 499,90
+- 3 telas: Mensal R$ 70,00
+- 4 telas: Mensal R$ 90,00
+- Teste grátis: 1 hora.
+Regra: nunca jogue a tabela completa antes de oferecer o teste grátis (se perguntar preço, diga "a partir de R$ 29,90/mês" e puxe para o teste). Só informe opções de 2, 3 ou 4 telas se o cliente perguntar ou demonstrar interesse em mais telas.
 
 APPS POR APARELHO (indique sempre a 1ª opção primeiro):
 - Samsung: 1º WATCH HUB | 2º HD PLAYER | 3º MAXPLAYER
@@ -484,7 +499,7 @@ FERRAMENTAS:
     Usuário: [usuario]
     Senha: [senha]
   - Para os demais apps, entregue usuário, senha e domínio normalmente.
-- Quando o cliente quiser fechar/comprar um plano (Mensal=1, Trimestral=3, Semestral=6, Anual=12), chame \`gerar_pix_plano\` passando a quantidade de meses e envie o código Pix Copia e Cola retornado avisando que a ativação é automática após o pagamento.
+- Quando o cliente quiser fechar/comprar um plano, chame \`gerar_pix_plano\` passando \`months\` (1, 3, 6 ou 12) e \`screens\` (1, 2, 3 ou 4; padrão 1) e envie o código Pix Copia e Cola retornado avisando que a ativação é automática após o pagamento.
 - Se for cliente relatando travamento, problema de pagamento ou pedir humano, chame \`chamar_humano\`.`;
 
 async function sendWhatsAppText(instanceName, remoteJid, text) {
@@ -568,7 +583,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       lead = insertLead.rows[0];
     } else {
       await pool.query(
-        'UPDATE leads SET last_message = $1, last_interaction = now() WHERE id = $2',
+        'UPDATE leads SET last_message = $1, last_interaction = now(), followup_step = 0 WHERE id = $2',
         [text, lead.id]
       );
     }
@@ -625,6 +640,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
             type: 'object',
             properties: {
               months: { type: 'number', enum: [1, 3, 6, 12] },
+              screens: { type: 'number', enum: [1, 2, 3, 4], description: 'Quantidade de telas simultâneas (padrão 1).' },
             },
             required: ['months'],
           },
@@ -769,11 +785,13 @@ app.post('/api/webhooks/evolution', async (req, res) => {
         }
 
         if (fnName === 'gerar_pix_plano') {
-          const prices = { 1: 29.9, 3: 74.9, 6: 149.9, 12: 279.9 };
+          const screens = Number(args.screens) || 1;
           const months = Number(args.months) || 1;
-          const amount = prices[months] || 29.9;
+          const amount = PLAN_PRICES[screens]?.[months];
 
-          if (!reseller.mp_access_token) {
+          if (!amount) {
+            toolResult = `Plano indisponível para ${screens} tela(s) e ${months} mês(es). Para 3 e 4 telas, temos apenas o plano mensal.`;
+          } else if (!reseller.mp_access_token) {
             toolResult = 'Erro: revendedor sem Mercado Pago configurado. Chame um humano.';
           } else if (!lead.natv_username) {
             toolResult = 'Erro: cliente ainda não possui usuário de teste gerado.';
@@ -787,10 +805,10 @@ app.post('/api/webhooks/evolution', async (req, res) => {
               },
               body: JSON.stringify({
                 transaction_amount: amount,
-                description: `Plano ${months} mês(es) - ${lead.natv_username}`,
+                description: `Plano ${months} mês(es) - ${screens} tela(s) - ${lead.natv_username}`,
                 payment_method_id: 'pix',
                 payer: { email: `${lead.natv_username}@cliente.com` },
-                external_reference: `${lead.id}|${months}`,
+                external_reference: `${lead.id}|${months}|${screens}`,
                 notification_url: `${BASE_URL}/api/webhooks/mp-reseller/${reseller.id}`,
               }),
             });
@@ -798,7 +816,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
             const pixCode = payment.point_of_interaction?.transaction_data?.qr_code;
 
             toolResult = pixCode
-              ? JSON.stringify({ valor: amount, meses: months, pix_copia_e_cola: pixCode })
+              ? JSON.stringify({ valor: amount, meses: months, telas: screens, pix_copia_e_cola: pixCode })
               : 'Erro ao gerar Pix no Mercado Pago do revendedor.';
           }
         }
@@ -1034,7 +1052,6 @@ app.get('/api/natv/clients', auth, async (req, res) => {
   }
 });
 
-
 // ==========================================
 // 9. MOTOR DE FOLLOW-UP AUTOMÁTICO (VENDAS + RENOVAÇÃO NATV)
 // ==========================================
@@ -1224,7 +1241,6 @@ initFollowupColumns();
 setInterval(runSalesFollowup, 5 * 60 * 1000);     // Vendas: checa a cada 5 minutos
 setInterval(runRenewalFollowup, 60 * 60 * 1000);  // Renovação: checa a cada 1 hora
 
-
 // ==========================================
 // 10. DISPARO MANUAL: TENTATIVA DE RECUPERAÇÃO (ANTI-BLOQUEIO COM IA)
 // ==========================================
@@ -1240,7 +1256,6 @@ const RECOVERY_MESSAGES = [
 async function generateMessageVariations(baseText) {
   try {
     const apiKey = process.env.OPENAI_API_KEY || process.env.GEMINI_API_KEY;
-
     if (!apiKey) return [baseText];
 
     const response = await fetch(
@@ -1364,8 +1379,6 @@ app.post('/api/followup/recovery', auth, async (req, res) => {
     res.status(500).json({ error: 'Erro ao iniciar tentativa de recuperação.' });
   }
 });
-
-
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`API do José rodando na porta ${PORT}`));
