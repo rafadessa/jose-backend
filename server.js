@@ -953,81 +953,28 @@ app.post('/api/leads/:leadId/toggle-ai', auth, async (req, res) => {
     res.status(500).json({ error: 'Erro ao alterar status da IA' });
   }
 });
-// ==========================================
-// 8. LISTAR CLIENTES ATIVOS DO PAINEL NATV
-// ==========================================
-const natvClientsCache = new Map();
-
-app.get('/api/natv/clients', auth, async (req, res) => {
-  try {
-    const cached = natvClientsCache.get(req.user.id);
-    if (cached && Date.now() - cached.ts < 65000) {
-      return res.json(cached.payload);
-    }
-
-    const r = await pool.query(
-      'SELECT natv_api_key FROM resellers WHERE id = $1',
-      [req.user.id]
-    );
-    const natvKey = r.rows[0]?.natv_api_key;
-    if (!natvKey) {
-      return res.status(400).json({ error: 'Chave NATV não configurada' });
-    }
-
-    const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
-    const response = await fetch(`${baseUrl}/report/allusers`, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${natvKey}`,
-        'Content-Type': 'application/json',
-      },
-    });
-
-    const rawText = await response.text();
-    console.log('NATV /report/allusers status:', response.status);
-
-    if (!response.ok) {
-      console.log('NATV /report/allusers erro:', rawText.slice(0, 300));
-      return res.status(response.status).json({ error: 'Não foi possível consultar os clientes na NATV' });
-    }
-
-    const raw = JSON.parse(rawText);
-    const list = Array.isArray(raw) ? raw : (raw.data || raw.users || raw.clients || []);
-    console.log('NATV amostra (2 primeiros):', JSON.stringify(list.slice(0, 2)));
-
     const now = Date.now();
     const activeClients = list
       .filter((c) => {
-        const blocked = String(c.b ?? '').toLowerCase();
-        if (blocked === '1' || blocked === 'true') return false;
-        const exp = c.e || c.exp_date || c.expires_at;
-        if (exp) {
-          const num = Number(exp);
-          const expMs = !Number.isNaN(num) ? (num < 1e12 ? num * 1000 : num) : Date.parse(String(exp));
+        const tipo = String(c.t || '').trim().toLowerCase();
+        const bloqueado = String(c.b || '').trim().toLowerCase();
+        if (tipo !== 'ativo') return false;
+        if (bloqueado !== 'no' && bloqueado !== '0' && bloqueado !== 'false' && bloqueado !== '') return false;
+
+        if (c.e) {
+          const expMs = Date.parse(String(c.e).replace(' ', 'T'));
           if (!Number.isNaN(expMs) && expMs < now) return false;
         }
         return true;
       })
       .map((c, idx) => ({
-        id: String(c.i ?? c.id ?? c.u ?? idx),
-        username: String(c.u ?? c.username ?? 'Cliente NATV'),
-        name: String(c.n || c.u || c.name || 'Cliente NATV'),
-        exp_date: c.e ?? c.exp_date ?? null,
+        id: String(c.i ?? idx),
+        username: String(c.u ?? 'Cliente NATV'),
+        name: String(c.n || c.u || 'Cliente NATV'),
+        exp_date: c.e ?? null,
         plan: c.c ? `${c.c} tela(s)` : 'NATV',
       }));
 
-    const payload = {
-      total_active: activeClients.length,
-      clients: activeClients,
-    };
-
-    natvClientsCache.set(req.user.id, { ts: Date.now(), payload });
-    res.json(payload);
-  } catch (err) {
-    console.error('Erro /api/natv/clients:', err);
-    res.status(500).json({ error: 'Erro interno ao buscar clientes NATV' });
-  }
-});
 
 
 const PORT = process.env.PORT || 3000;
