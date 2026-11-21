@@ -8,6 +8,9 @@ const jwt = require('jsonwebtoken');
 const app = express();
 app.use(cors());
 app.use(express.json());
+const path = require('path');
+app.use('/logos', express.static(path.join(__dirname, 'logos')));
+
 app.get('/', (req, res) => res.json({ status: 'ok', app: 'API do José' }));
 
 
@@ -230,15 +233,18 @@ app.post('/api/webhooks/mercadopago', async (req, res) => {
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 // Coloque aqui os links públicos das imagens dos logos dos apps
+const BASE_URL = 'https://bot-streaming-jose-api.celuyv.easypanel.host/';
+
 const APP_LOGOS = {
-  'WATCH HUB': 'https://COLE_AQUI_LINK_LOGO_WATCH_HUB.png',
-  'HD PLAYER': 'https://COLE_AQUI_LINK_LOGO_HD_PLAYER.png',
-  'MAXPLAYER': 'https://COLE_AQUI_LINK_LOGO_MAXPLAYER.png',
-  'PLAYER MASTER': 'https://COLE_AQUI_LINK_LOGO_PLAYER_MASTER.png',
-  'LOBO PLAYER': 'https://COLE_AQUI_LINK_LOGO_LOBO_PLAYER.png',
-  'MEGATV PLAYER': 'https://COLE_AQUI_LINK_LOGO_MEGATV.png',
-  'TOPTV': 'https://COLE_AQUI_LINK_LOGO_TOPTV.png',
+  'WATCH HUB': `${BASE_URL}/logos/watch-hub.png`,
+  'HD PLAYER': `${BASE_URL}/logos/hd-player.png`,
+  'MAXPLAYER': `${BASE_URL}/logos/maxplayer.png`,
+  'PLAYER MASTER': `${BASE_URL}/logos/player-master.png`,
+  'LOBO PLAYER': `${BASE_URL}/logos/lobo-player.png`,
+  'MEGATV PLAYER': `${BASE_URL}/logos/megatv.png`,
+  'TOPTV': `${BASE_URL}/logos/toptv.png`,
 };
+
 
 const JOSE_SYSTEM_PROMPT = `Você é o José, atendente comercial de streaming no WhatsApp.
 Estilo: leve, direto, simpático e natural. Mensagens CURTAS (máx. 2 a 3 linhas) e APENAS UMA pergunta por vez.
