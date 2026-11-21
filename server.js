@@ -28,7 +28,7 @@ const MP_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN; // Seu MP (recarg
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // Chave do Google AI Studio (Gemini)
 
 // Configure BASE_URL no Easypanel ou troque o link abaixo pelo domínio real da sua jose-api
-const BASE_URL = process.env.BASE_URL || 'https://bot-streaming-jose-api.celuyv.easypanel.host/';
+const BASE_URL = process.env.BASE_URL || 'https://bot-streaming-jose-api.celuyv.easypanel.host';
 
 // Chaves NATV VIP (não exigem saldo na carteira do José e não sofrem débito)
 const VIP_NATV_KEYS = (process.env.VIP_NATV_KEYS || '')
