@@ -111,6 +111,19 @@ app.post('/api/natv/validate', auth, async (req, res) => {
     res.status(500).json({ error: 'Erro ao conectar na API NATV' });
   }
 });
+// Salvar código do Watch Hub do revendedor
+app.post('/api/reseller/watch-hub', auth, async (req, res) => {
+  const { watch_hub_code } = req.body;
+  try {
+    await pool.query(
+      'UPDATE resellers SET watch_hub_code = $1 WHERE id = $2',
+      [watch_hub_code, req.user.id]
+    );
+    res.json({ success: true, watch_hub_code });
+  } catch {
+    res.status(500).json({ error: 'Erro ao salvar código do Watch Hub' });
+  }
+});
 
 // ==========================================
 // 3. CONECTAR WHATSAPP (GERAR QR CODE)
@@ -260,7 +273,14 @@ APPS POR APARELHO (indique sempre a 1ª opção primeiro):
 
 FERRAMENTAS:
 - Ao indicar um app pela primeira vez, chame \`enviar_logo_app\` com o nome exato do app.
-- Quando o cliente instalar o app e confirmar que pode testar AGORA, chame \`gerar_teste\` e entregue usuário, senha e domínio retornados.
+- Quando o cliente instalar o app e confirmar que pode testar AGORA, chame \`gerar_teste\`.
+  - Se o app escolhido for WATCH HUB e existir \`codigo_watch_hub\`, entregue EXATAMENTE neste formato:
+    Seu teste está pronto, aqui os dados:
+    Código: [codigo_watch_hub]
+    Usuário: [usuario]
+    Senha: [senha]
+  - Para os demais apps, entregue usuário, senha e domínio normalmente.
+
 - Se for cliente relatando travamento, problema de pagamento ou pedir humano, chame \`chamar_humano\`.`;
 
 async function sendWhatsAppText(instanceName, remoteJid, text) {
@@ -477,11 +497,14 @@ app.post('/api/webhooks/evolution', async (req, res) => {
                 'test_created',
                 `Teste gerado: ${natvUser.username}`
               );
-              toolResult = JSON.stringify({
+                            toolResult = JSON.stringify({
+                app_escolhido: lead.chosen_app || '',
+                codigo_watch_hub: reseller.watch_hub_code || '',
                 usuario: natvUser.username,
                 senha: natvUser.password,
                 dominio: natvUser.domain,
               });
+
             } else {
               toolResult = 'Erro ao gerar teste na API NATV.';
             }
