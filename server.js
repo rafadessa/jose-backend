@@ -14,7 +14,7 @@ app.use(express.json());
 app.use('/logos', express.static(path.join(__dirname, 'logos')));
 
 // Rota de saúde para o Easypanel não reiniciar o contêiner
-app.get('/', (req, res) => res.json({ status: 'ok', app: 'API do José' }));
+app.get('/', (req, res) => res.json({ status: 'ok', app: 'API do José v2' }));
 
 // Conexão com o PostgreSQL da sua VPS
 const pool = new Pool({
