@@ -1225,9 +1225,8 @@ setInterval(runSalesFollowup, 5 * 60 * 1000);     // Vendas: checa a cada 5 minu
 setInterval(runRenewalFollowup, 60 * 60 * 1000);  // Renovação: checa a cada 1 hora
 
 
-
 // ==========================================
-// 10. DISPARO MANUAL: TENTATIVA DE RECUPERAÇÃO (ANTI-BLOQUEIO)
+// 10. DISPARO MANUAL: TENTATIVA DE RECUPERAÇÃO (ANTI-BLOQUEIO COM IA)
 // ==========================================
 const runningRecoveryJobs = new Set();
 
@@ -1238,13 +1237,53 @@ const RECOVERY_MESSAGES = [
   'Oi! Tudo bem por aí? Caso ainda tenha interesse em ativar o streaming na sua TV ou celular, continuo à disposição por aqui pra liberar rapidinho pra você 👍',
 ];
 
+async function generateMessageVariations(baseText) {
+  try {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) return [baseText];
+
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                {
+                  text: `Crie 5 variações naturais e amigáveis para WhatsApp da mensagem abaixo, mantendo exatamente a mesma oferta e sentido, mas mudando saudações, palavras e estrutura para evitar bloqueio por spam. Retorne APENAS um JSON válido com um array de 5 strings, sem texto extra.\n\nMensagem original:\n"${baseText}"`,
+                },
+              ],
+            },
+          ],
+          generationConfig: { responseMimeType: 'application/json' },
+        }),
+      }
+    );
+
+    if (!response.ok) return [baseText];
+    const data = await response.json();
+    const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    const parsed = JSON.parse(raw);
+
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      return parsed.map((m) => String(m).trim()).filter(Boolean);
+    }
+    return [baseText];
+  } catch (err) {
+    console.error('Erro ao gerar variações de recuperação:', err.message);
+    return [baseText];
+  }
+}
+
 app.post('/api/followup/recovery', auth, async (req, res) => {
   try {
-    const customMessage = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
-
     if (runningRecoveryJobs.has(req.user.id)) {
       return res.status(409).json({ error: 'Já existe uma tentativa de recuperação em andamento.' });
     }
+
+    const customMessage = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
 
     const instRes = await pool.query(
       'SELECT instance_name FROM whatsapp_instances WHERE reseller_id = $1 LIMIT 1',
@@ -1255,7 +1294,6 @@ app.post('/api/followup/recovery', auth, async (req, res) => {
       return res.status(400).json({ error: 'WhatsApp não conectado.' });
     }
 
-    // Busca até 40 leads que não assinaram, sem resposta há +24h e sem recuperação nos últimos 7 dias
     const leadsRes = await pool.query(
       `SELECT id, phone, name
        FROM leads
@@ -1278,20 +1316,23 @@ app.post('/api/followup/recovery', auth, async (req, res) => {
       });
     }
 
-    // Responde imediatamente pro painel não travar e dispara em segundo plano
+    // Se o revendedor escreveu uma mensagem, a IA gera 5 variações dela antes de disparar
+    const messagePool = customMessage
+      ? await generateMessageVariations(customMessage)
+      : RECOVERY_MESSAGES;
+
     runningRecoveryJobs.add(req.user.id);
     res.json({
       started: true,
       total_targets: targets.length,
-      message: `Recuperação iniciada para ${targets.length} contato(s) com intervalo seguro de 45s a 90s.`,
+      message: `Recuperação iniciada para ${targets.length} contato(s) com ${messagePool.length} variação(ões) e pausa de 45s a 90s.`,
     });
 
     (async () => {
       try {
         for (let i = 0; i < targets.length; i++) {
           const lead = targets[i];
-          const text = customMessage || RECOVERY_MESSAGES[i % RECOVERY_MESSAGES.length];
-
+          const text = messagePool[i % messagePool.length];
 
           try {
             await sendWhatsAppText(instanceName, lead.phone, text);
@@ -1307,7 +1348,6 @@ app.post('/api/followup/recovery', auth, async (req, res) => {
             console.error(`Erro ao enviar recuperação para ${lead.phone}:`, sendErr.message);
           }
 
-          // Pausa aleatória entre 45 e 90 segundos antes do próximo número
           if (i < targets.length - 1) {
             const delayMs = (45 + Math.floor(Math.random() * 46)) * 1000;
             await new Promise((r) => setTimeout(r, delayMs));
@@ -1323,6 +1363,8 @@ app.post('/api/followup/recovery', auth, async (req, res) => {
     res.status(500).json({ error: 'Erro ao iniciar tentativa de recuperação.' });
   }
 });
+
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`API do José rodando na porta ${PORT}`));
