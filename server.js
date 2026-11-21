@@ -967,10 +967,12 @@ app.get('/api/natv/clients', auth, async (req, res) => {
     }
 
     const r = await pool.query(
-      'SELECT natv_api_key FROM resellers WHERE id = $1',
+      'SELECT name, natv_api_key FROM resellers WHERE id = $1',
       [req.user.id]
     );
     const natvKey = r.rows[0]?.natv_api_key;
+    const resellerName = String(r.rows[0]?.name || '').trim().toLowerCase();
+
     if (!natvKey) {
       return res.status(400).json({ error: 'Chave NATV não configurada' });
     }
@@ -998,8 +1000,11 @@ app.get('/api/natv/clients', auth, async (req, res) => {
       .filter((c) => {
         const tipo = String(c.t || '').trim().toLowerCase();
         const bloqueado = String(c.b || '').trim().toLowerCase();
+        const dono = String(c.r || '').trim().toLowerCase();
+
         if (tipo !== 'ativo') return false;
         if (bloqueado !== 'no' && bloqueado !== '0' && bloqueado !== 'false' && bloqueado !== '') return false;
+        if (resellerName && dono && dono !== resellerName) return false;
 
         if (c.e) {
           const expMs = Date.parse(String(c.e).replace(' ', 'T'));
@@ -1027,6 +1032,7 @@ app.get('/api/natv/clients', auth, async (req, res) => {
     res.status(500).json({ error: 'Erro interno ao buscar clientes NATV' });
   }
 });
+
 
 
 
