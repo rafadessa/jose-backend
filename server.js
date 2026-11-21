@@ -24,11 +24,11 @@ const pool = new Pool({
 const JWT_SECRET = process.env.JWT_SECRET || 'jose_super_secret_key';
 const EVOLUTION_URL = process.env.EVOLUTION_API_URL;
 const EVOLUTION_KEY = process.env.EVOLUTION_API_KEY;
-const MP_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN;
+const MP_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN; // Seu MP (recarga da carteira do José)
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // Chave do Google AI Studio (Gemini)
 
-// TROQUE PELO LINK REAL DA SUA JOSE-API NO EASYPANEL (ou crie a variável BASE_URL lá)
-const BASE_URL = process.env.BASE_URL || 'https://bot-streaming-jose-api.celuyv.easypanel.host/';
+// Configure BASE_URL no Easypanel ou troque o link abaixo pelo domínio real da sua jose-api
+const BASE_URL = process.env.BASE_URL || 'https://SEU_LINK_DO_JOSE_API';
 
 // Middleware de Autenticação
 function auth(req, res, next) {
@@ -81,6 +81,7 @@ app.post('/api/auth/login', async (req, res) => {
         has_natv_key: Boolean(user.natv_api_key),
         watch_hub_code: user.watch_hub_code || '',
         has_maxplayer_token: Boolean(user.maxplayer_token),
+        has_mp_token: Boolean(user.mp_access_token),
       },
     });
   } catch {
@@ -89,7 +90,7 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // ==========================================
-// 2. INTEGRAÇÕES DO REVENDEDOR (NATV, WATCH HUB, MAXPLAYER)
+// 2. INTEGRAÇÕES DO REVENDEDOR (NATV, WATCH HUB, MAXPLAYER, MERCADO PAGO)
 // ==========================================
 app.post('/api/natv/validate', auth, async (req, res) => {
   const { natv_api_key } = req.body;
@@ -146,6 +147,19 @@ app.post('/api/reseller/maxplayer', auth, async (req, res) => {
   }
 });
 
+app.post('/api/reseller/mercadopago', auth, async (req, res) => {
+  const { mp_access_token } = req.body;
+  try {
+    await pool.query(
+      'UPDATE resellers SET mp_access_token = $1 WHERE id = $2',
+      [mp_access_token, req.user.id]
+    );
+    res.json({ success: true });
+  } catch {
+    res.status(500).json({ error: 'Erro ao salvar Token do Mercado Pago' });
+  }
+});
+
 // ==========================================
 // 3. CONECTAR WHATSAPP (GERAR QR CODE)
 // ==========================================
@@ -189,7 +203,7 @@ app.post('/api/whatsapp/connect', auth, async (req, res) => {
 });
 
 // ==========================================
-// 4. RECARGA DA CARTEIRA VIA PIX (MERCADO PAGO)
+// 4. RECARGA DA CARTEIRA DO JOSÉ (SEU MERCADO PAGO)
 // ==========================================
 app.post('/api/wallet/recharge', auth, async (req, res) => {
   const { amount } = req.body;
@@ -259,7 +273,77 @@ app.post('/api/webhooks/mercadopago', async (req, res) => {
 });
 
 // ==========================================
-// 5. MOTOR DO JOSÉ (GEMINI AI + LOGOS + CARTEIRA + NATV + MAXPLAYER)
+// 5. WEBHOOK DE VENDA DE PLANOS (MERCADO PAGO DO REVENDEDOR -> ATIVAÇÃO NATV)
+// ==========================================
+app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
+  res.sendStatus(200);
+  const paymentId = req.body?.data?.id;
+  const { resellerId } = req.params;
+  if (!paymentId || !resellerId) return;
+
+  try {
+    const resRes = await pool.query('SELECT * FROM resellers WHERE id = $1', [resellerId]);
+    const reseller = resRes.rows[0];
+    if (!reseller?.mp_access_token || !reseller?.natv_api_key) return;
+
+    const mpRes = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
+      headers: { Authorization: `Bearer ${reseller.mp_access_token}` },
+    });
+    const payment = await mpRes.json();
+
+    if (payment.status === 'approved' && payment.external_reference) {
+      const [leadId, monthsStr] = payment.external_reference.split('|');
+      const months = Number(monthsStr) || 1;
+
+      const leadRes = await pool.query('SELECT * FROM leads WHERE id = $1', [leadId]);
+      const lead = leadRes.rows[0];
+      if (!lead?.natv_username || lead.stage === 'ATIVO') return;
+
+      // Ativa/renova o usuário na NATV (desconta os créditos do revendedor)
+      const actRes = await fetch('https://revenda.pixbot.link/user/activation', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${reseller.natv_api_key}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          username: lead.natv_username,
+          months,
+        }),
+      });
+      const actData = await actRes.json();
+
+      if (actRes.ok) {
+        await pool.query(`UPDATE leads SET stage = 'ATIVO' WHERE id = $1`, [lead.id]);
+
+        if (actData.owner?.credits !== undefined) {
+          await pool.query('UPDATE resellers SET natv_credits = $1 WHERE id = $2', [
+            actData.owner.credits,
+            reseller.id,
+          ]);
+        }
+
+        const instRes = await pool.query(
+          'SELECT instance_name FROM whatsapp_instances WHERE reseller_id = $1 LIMIT 1',
+          [reseller.id]
+        );
+        const instanceName = instRes.rows[0]?.instance_name;
+        if (instanceName) {
+          await sendWhatsAppText(
+            instanceName,
+            lead.phone,
+            `Pagamento confirmado! 🎉 Seu plano de ${months} ${months === 1 ? 'mês' : 'meses'} já foi ativado automaticamente. Bom entretenimento!`
+          );
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Erro no webhook mp-reseller:', err);
+  }
+});
+
+// ==========================================
+// 6. MOTOR DO JOSÉ (GEMINI AI + LOGOS + CARTEIRA + NATV + MAXPLAYER + PIX)
 // ==========================================
 const APP_LOGOS = {
   'WATCH HUB': `${BASE_URL}/logos/watch-hub.png`,
@@ -305,6 +389,7 @@ FERRAMENTAS:
     Usuário: [usuario]
     Senha: [senha]
   - Para os demais apps, entregue usuário, senha e domínio normalmente.
+- Quando o cliente quiser fechar/comprar um plano (Mensal=1, Trimestral=3, Semestral=6, Anual=12), chame \`gerar_pix_plano\` passando a quantidade de meses e envie o código Pix Copia e Cola retornado avisando que a ativação é automática após o pagamento.
 - Se for cliente relatando travamento, problema de pagamento ou pedir humano, chame \`chamar_humano\`.`;
 
 async function sendWhatsAppText(instanceName, remoteJid, text) {
@@ -443,6 +528,20 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       {
         type: 'function',
         function: {
+          name: 'gerar_pix_plano',
+          description: 'Gera o Pix Copia e Cola na conta Mercado Pago do revendedor para ativar o plano do cliente.',
+          parameters: {
+            type: 'object',
+            properties: {
+              months: { type: 'number', enum: [1, 3, 6, 12] },
+            },
+            required: ['months'],
+          },
+        },
+      },
+      {
+        type: 'function',
+        function: {
           name: 'chamar_humano',
           description: 'Pausa a IA e alerta o revendedor para assumir o atendimento.',
           parameters: { type: 'object', properties: {} },
@@ -509,6 +608,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
             const natvUser = await natvRes.json();
 
             if (natvRes.ok) {
+              lead.natv_username = natvUser.username;
               await pool.query(
                 `UPDATE leads SET stage = 'TESTE', natv_username = $1 WHERE id = $2`,
                 [natvUser.username, lead.id]
@@ -572,6 +672,41 @@ app.post('/api/webhooks/evolution', async (req, res) => {
             } else {
               toolResult = 'Erro ao gerar teste na API NATV.';
             }
+          }
+        }
+
+        if (fnName === 'gerar_pix_plano') {
+          const prices = { 1: 29.9, 3: 74.9, 6: 149.9, 12: 279.9 };
+          const months = Number(args.months) || 1;
+          const amount = prices[months] || 29.9;
+
+          if (!reseller.mp_access_token) {
+            toolResult = 'Erro: revendedor sem Mercado Pago configurado. Chame um humano.';
+          } else if (!lead.natv_username) {
+            toolResult = 'Erro: cliente ainda não possui usuário de teste gerado.';
+          } else {
+            const mpRes = await fetch('https://api.mercadopago.com/v1/payments', {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${reseller.mp_access_token}`,
+                'Content-Type': 'application/json',
+                'X-Idempotency-Key': `plan-${lead.id}-${Date.now()}`,
+              },
+              body: JSON.stringify({
+                transaction_amount: amount,
+                description: `Plano ${months} mês(es) - ${lead.natv_username}`,
+                payment_method_id: 'pix',
+                payer: { email: `${lead.natv_username}@cliente.com` },
+                external_reference: `${lead.id}|${months}`,
+                notification_url: `${BASE_URL}/api/webhooks/mp-reseller/${reseller.id}`,
+              }),
+            });
+            const payment = await mpRes.json();
+            const pixCode = payment.point_of_interaction?.transaction_data?.qr_code;
+
+            toolResult = pixCode
+              ? JSON.stringify({ valor: amount, meses: months, pix_copia_e_cola: pixCode })
+              : 'Erro ao gerar Pix no Mercado Pago do revendedor.';
           }
         }
 
