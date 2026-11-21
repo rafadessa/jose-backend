@@ -196,9 +196,10 @@ app.post('/api/natv/validate', auth, async (req, res) => {
     const credits = natvData.credits ?? 0;
 
     await pool.query(
-      'UPDATE resellers SET natv_api_key = $1, natv_credits = $2 WHERE id = $3',
-      [natv_api_key, credits, req.user.id]
-    );
+  'UPDATE leads SET last_message = $1, last_interaction = now(), followup_step = 0 WHERE id = $2',
+  [text, lead.id]
+);
+
 
     res.json({ success: true, credits, natvData });
   } catch {
