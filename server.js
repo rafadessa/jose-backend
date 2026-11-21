@@ -498,14 +498,14 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       }
 
       // Segunda chamada para a IA montar a resposta final ao cliente
-      aiRes = await fetch('https://api.openai.com/v1/chat/completions', {
+      aiRes = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions')
         method: 'POST',
         headers: {
           Authorization: `Bearer ${OPENAI_API_KEY}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          model: 'gpt-4o-mini',
+          model: 'gemini-2.5-flash',
           temperature: 0.3,
           messages: messagesPayload,
         }),
