@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const path = require('path');
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -8,11 +9,12 @@ const jwt = require('jsonwebtoken');
 const app = express();
 app.use(cors());
 app.use(express.json());
-const path = require('path');
+
+// Serve os logos hospedados na pasta /logos do repositório
 app.use('/logos', express.static(path.join(__dirname, 'logos')));
 
+// Rota de saúde para o Easypanel não reiniciar o contêiner
 app.get('/', (req, res) => res.json({ status: 'ok', app: 'API do José' }));
-
 
 // Conexão com o PostgreSQL da sua VPS
 const pool = new Pool({
@@ -20,11 +22,15 @@ const pool = new Pool({
 });
 
 const JWT_SECRET = process.env.JWT_SECRET || 'jose_super_secret_key';
-const EVOLUTION_URL = process.env.EVOLUTION_API_URL; // ex: https://bot-streaming-evolution.celuyv.easypanel.host
+const EVOLUTION_URL = process.env.EVOLUTION_API_URL;
 const EVOLUTION_KEY = process.env.EVOLUTION_API_KEY;
 const MP_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // Chave do Google AI Studio (Gemini)
 
-// Middleware de Autenticação (verifica o token do revendedor)
+// TROQUE PELO LINK REAL DA SUA JOSE-API NO EASYPANEL (ou crie a variável BASE_URL lá)
+const BASE_URL = process.env.BASE_URL || 'https://SEU_LINK_DO_JOSE_API';
+
+// Middleware de Autenticação
 function auth(req, res, next) {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'Token não fornecido' });
@@ -50,7 +56,7 @@ app.post('/api/auth/register', async (req, res) => {
     const user = result.rows[0];
     const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
     res.json({ user, token });
-  } catch (err) {
+  } catch {
     res.status(400).json({ error: 'E-mail já cadastrado ou dados inválidos' });
   }
 });
@@ -73,15 +79,17 @@ app.post('/api/auth/login', async (req, res) => {
         wallet_balance: user.wallet_balance,
         natv_credits: user.natv_credits,
         has_natv_key: Boolean(user.natv_api_key),
+        watch_hub_code: user.watch_hub_code || '',
+        has_maxplayer_token: Boolean(user.maxplayer_token),
       },
     });
-  } catch (err) {
+  } catch {
     res.status(500).json({ error: 'Erro ao fazer login' });
   }
 });
 
 // ==========================================
-// 2. VALIDAR CHAVE NATV E PUXAR CRÉDITOS
+// 2. INTEGRAÇÕES DO REVENDEDOR (NATV, WATCH HUB, MAXPLAYER)
 // ==========================================
 app.post('/api/natv/validate', auth, async (req, res) => {
   const { natv_api_key } = req.body;
@@ -107,11 +115,11 @@ app.post('/api/natv/validate', auth, async (req, res) => {
     );
 
     res.json({ success: true, credits, natvData });
-  } catch (err) {
+  } catch {
     res.status(500).json({ error: 'Erro ao conectar na API NATV' });
   }
 });
-// Salvar código do Watch Hub do revendedor
+
 app.post('/api/reseller/watch-hub', auth, async (req, res) => {
   const { watch_hub_code } = req.body;
   try {
@@ -125,6 +133,19 @@ app.post('/api/reseller/watch-hub', auth, async (req, res) => {
   }
 });
 
+app.post('/api/reseller/maxplayer', auth, async (req, res) => {
+  const { maxplayer_token } = req.body;
+  try {
+    await pool.query(
+      'UPDATE resellers SET maxplayer_token = $1 WHERE id = $2',
+      [maxplayer_token, req.user.id]
+    );
+    res.json({ success: true, maxplayer_token });
+  } catch {
+    res.status(500).json({ error: 'Erro ao salvar Token do MaxPlayer' });
+  }
+});
+
 // ==========================================
 // 3. CONECTAR WHATSAPP (GERAR QR CODE)
 // ==========================================
@@ -132,7 +153,6 @@ app.post('/api/whatsapp/connect', auth, async (req, res) => {
   const instanceName = `jose_${req.user.id.slice(0, 8)}`;
 
   try {
-    // Tenta criar a instância na Evolution API (ignora se já existir)
     await fetch(`${EVOLUTION_URL}/instance/create`, {
       method: 'POST',
       headers: {
@@ -146,7 +166,6 @@ app.post('/api/whatsapp/connect', auth, async (req, res) => {
       }),
     });
 
-    // Busca o QR Code em Base64
     const qrRes = await fetch(`${EVOLUTION_URL}/instance/connect/${instanceName}`, {
       method: 'GET',
       headers: { apikey: EVOLUTION_KEY },
@@ -164,7 +183,7 @@ app.post('/api/whatsapp/connect', auth, async (req, res) => {
     );
 
     res.json({ instanceName, qr_code_base64: qrBase64 });
-  } catch (err) {
+  } catch {
     res.status(500).json({ error: 'Erro ao gerar QR Code na Evolution API' });
   }
 });
@@ -173,7 +192,7 @@ app.post('/api/whatsapp/connect', auth, async (req, res) => {
 // 4. RECARGA DA CARTEIRA VIA PIX (MERCADO PAGO)
 // ==========================================
 app.post('/api/wallet/recharge', auth, async (req, res) => {
-  const { amount } = req.body; // Ex: 50.00
+  const { amount } = req.body;
   if (!amount || amount < 5) {
     return res.status(400).json({ error: 'Valor mínimo de recarga é R$ 5,00' });
   }
@@ -203,12 +222,11 @@ app.post('/api/wallet/recharge', auth, async (req, res) => {
       pix_copia_e_cola: pixData?.qr_code,
       qr_code_base64: pixData?.qr_code_base64,
     });
-  } catch (err) {
+  } catch {
     res.status(500).json({ error: 'Erro ao gerar cobrança Pix' });
   }
 });
 
-// Webhook do Mercado Pago (adiciona saldo automático quando o Pix cair)
 app.post('/api/webhooks/mercadopago', async (req, res) => {
   const paymentId = req.body?.data?.id;
   if (!paymentId) return res.sendStatus(200);
@@ -241,13 +259,8 @@ app.post('/api/webhooks/mercadopago', async (req, res) => {
 });
 
 // ==========================================
-// FASE 2: MOTOR DO JOSÉ (IA + LOGOS + CARTEIRA + NATV)
+// 5. MOTOR DO JOSÉ (GEMINI AI + LOGOS + CARTEIRA + NATV + MAXPLAYER)
 // ==========================================
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-
-// Coloque aqui os links públicos das imagens dos logos dos apps
-const BASE_URL = 'https://bot-streaming-jose-api.celuyv.easypanel.host/';
-
 const APP_LOGOS = {
   'WATCH HUB': `${BASE_URL}/logos/watch-hub.png`,
   'HD PLAYER': `${BASE_URL}/logos/hd-player.png`,
@@ -257,7 +270,6 @@ const APP_LOGOS = {
   'MEGATV PLAYER': `${BASE_URL}/logos/megatv.png`,
   'TOPTV': `${BASE_URL}/logos/toptv.png`,
 };
-
 
 const JOSE_SYSTEM_PROMPT = `Você é o José, atendente comercial de streaming no WhatsApp.
 Estilo: leve, direto, simpático e natural. Mensagens CURTAS (máx. 2 a 3 linhas) e APENAS UMA pergunta por vez.
@@ -279,8 +291,20 @@ FERRAMENTAS:
     Código: [codigo_watch_hub]
     Usuário: [usuario]
     Senha: [senha]
-  - Para os demais apps, entregue usuário, senha e domínio normalmente.
+  - Se o app escolhido for HD PLAYER, entregue EXATAMENTE neste formato:
+    Seu teste está pronto! Acesse o link abaixo e siga o passo a passo do site com o app aberto:
+    https://hd.activation.click
 
+    Código do servidor: 4200
+    Usuário: [usuario]
+    Senha: [senha]
+  - Se o app escolhido for MAXPLAYER, entregue EXATAMENTE neste formato:
+    Seu teste está pronto! Já cadastrei o seu acesso no MaxPlayer.
+    Para assistir, basta abrir o app no seu aparelho e usar estes dados:
+
+    Usuário: [usuario]
+    Senha: [senha]
+  - Para os demais apps, entregue usuário, senha e domínio normalmente.
 - Se for cliente relatando travamento, problema de pagamento ou pedir humano, chame \`chamar_humano\`.`;
 
 async function sendWhatsAppText(instanceName, remoteJid, text) {
@@ -292,7 +316,7 @@ async function sendWhatsAppText(instanceName, remoteJid, text) {
 }
 
 async function sendWhatsAppImage(instanceName, remoteJid, imageUrl, caption) {
-  if (!imageUrl || imageUrl.includes('COLE_AQUI')) return;
+  if (!imageUrl || imageUrl.includes('SEU_LINK_DO_JOSE_API')) return;
   await fetch(`${EVOLUTION_URL}/message/sendMedia/${instanceName}`, {
     method: 'POST',
     headers: { apikey: EVOLUTION_KEY, 'Content-Type': 'application/json' },
@@ -317,16 +341,15 @@ async function debitWallet(resellerId, amount, category, description) {
   );
 }
 
-// Webhook que recebe as mensagens da Evolution API
 app.post('/api/webhooks/evolution', async (req, res) => {
-  res.sendStatus(200); // Responde rápido para a Evolution não reenviar
+  res.sendStatus(200);
 
   try {
     const { event, instance, data } = req.body;
     if (event !== 'messages.upsert' || !data || data.key?.fromMe) return;
 
     const remoteJid = data.key?.remoteJid;
-    if (!remoteJid || remoteJid.includes('@g.us')) return; // Ignora grupos
+    if (!remoteJid || remoteJid.includes('@g.us')) return;
 
     const text =
       data.message?.conversation ||
@@ -344,7 +367,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
     );
     const reseller = instRes.rows[0];
     if (!reseller || !reseller.bot_active || Number(reseller.wallet_balance) <= 0) {
-      return; // Bot pausado ou sem saldo na carteira
+      return;
     }
 
     // 2. Busca ou cria o Lead
@@ -361,7 +384,6 @@ app.post('/api/webhooks/evolution', async (req, res) => {
         [reseller.id, remoteJid, pushName, text]
       );
       lead = insertLead.rows[0];
-      // Cobra por nova conversa iniciada
       await debitWallet(
         reseller.id,
         Number(reseller.cost_per_conversation),
@@ -375,16 +397,14 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       );
     }
 
-    // Salva mensagem do cliente no banco
     await pool.query(
       `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'client', $2)`,
       [lead.id, text]
     );
 
-    // Se o revendedor assumiu o atendimento, o José fica em silêncio
     if (lead.needs_human) return;
 
-    // 3. Carrega histórico recente (últimas 12 mensagens)
+    // 3. Carrega histórico recente
     const histRes = await pool.query(
       `SELECT sender, content FROM messages WHERE lead_id = $1 ORDER BY created_at DESC LIMIT 12`,
       [lead.id]
@@ -416,150 +436,3 @@ app.post('/api/webhooks/evolution', async (req, res) => {
         type: 'function',
         function: {
           name: 'gerar_teste',
-          description: 'Gera um teste grátis de 60 minutos na conta NATV do revendedor.',
-          parameters: { type: 'object', properties: {} },
-        },
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'chamar_humano',
-          description: 'Pausa a IA e alerta o revendedor para assumir o atendimento.',
-          parameters: { type: 'object', properties: {} },
-        },
-      },
-    ];
-
-    const messagesPayload = [
-      { role: 'system', content: JOSE_SYSTEM_PROMPT },
-      ...history,
-    ];
-
-    // 4. Chama a OpenAI
-    let aiRes = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        temperature: 0.3,
-        messages: messagesPayload,
-        tools,
-      }),
-    });
-    let aiData = await aiRes.json();
-    let msg = aiData.choices?.[0]?.message;
-
-    // 5. Executa ferramentas se a IA solicitou
-    if (msg?.tool_calls?.length) {
-      messagesPayload.push(msg);
-
-      for (const toolCall of msg.tool_calls) {
-        const fnName = toolCall.function.name;
-        const args = JSON.parse(toolCall.function.arguments || '{}');
-        let toolResult = 'ok';
-
-        if (fnName === 'enviar_logo_app') {
-          const appName = args.app_name;
-          await pool.query('UPDATE leads SET chosen_app = $1 WHERE id = $2', [appName, lead.id]);
-          await sendWhatsAppImage(
-            instance,
-            remoteJid,
-            APP_LOGOS[appName],
-            `Procura por esse ícone na loja: ${appName} 📺`
-          );
-          toolResult = `Logo do ${appName} enviado com sucesso.`;
-        }
-
-        if (fnName === 'gerar_teste') {
-          if (!reseller.natv_api_key) {
-            toolResult = 'Erro: revendedor sem chave NATV configurada.';
-          } else {
-            const natvRes = await fetch('https://revenda.pixbot.link/user', {
-              method: 'POST',
-              headers: {
-                Authorization: `Bearer ${reseller.natv_api_key}`,
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({ minutes: '60' }),
-            });
-            const natvUser = await natvRes.json();
-            if (natvRes.ok) {
-              await pool.query(
-                `UPDATE leads SET stage = 'TESTE', natv_username = $1 WHERE id = $2`,
-                [natvUser.username, lead.id]
-              );
-              await debitWallet(
-                reseller.id,
-                Number(reseller.cost_per_test),
-                'test_created',
-                `Teste gerado: ${natvUser.username}`
-              );
-                            toolResult = JSON.stringify({
-                app_escolhido: lead.chosen_app || '',
-                codigo_watch_hub: reseller.watch_hub_code || '',
-                usuario: natvUser.username,
-                senha: natvUser.password,
-                dominio: natvUser.domain,
-              });
-
-            } else {
-              toolResult = 'Erro ao gerar teste na API NATV.';
-            }
-          }
-        }
-
-        if (fnName === 'chamar_humano') {
-          await pool.query(
-            `UPDATE leads SET needs_human = true, tab = 'suporte' WHERE id = $1`,
-            [lead.id]
-          );
-          toolResult = 'Atendimento transferido para humano.';
-        }
-
-        messagesPayload.push({
-          role: 'tool',
-          tool_call_id: toolCall.id,
-          content: toolResult,
-        });
-      }
-
-            // Segunda chamada para a IA montar a resposta final ao cliente
-      aiRes = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: 'gemini-2.5-flash',
-          temperature: 0.3,
-          messages: messagesPayload,
-        }),
-      });
-
-      aiData = await aiRes.json();
-      msg = aiData.choices?.[0]?.message;
-    }
-
-    const replyText = msg?.content;
-    if (replyText) {
-      await sendWhatsAppText(instance, remoteJid, replyText);
-      await pool.query(
-        `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`,
-        [lead.id, replyText]
-      );
-      await pool.query(
-        'UPDATE leads SET last_message = $1, last_interaction = now() WHERE id = $2',
-        [replyText, lead.id]
-      );
-    }
-  } catch (err) {
-    console.error('Erro no webhook do José:', err);
-  }
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`API do José rodando na porta ${PORT}`));
