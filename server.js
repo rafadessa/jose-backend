@@ -436,3 +436,193 @@ app.post('/api/webhooks/evolution', async (req, res) => {
         type: 'function',
         function: {
           name: 'gerar_teste',
+          description: 'Gera um teste grátis de 60 minutos na conta NATV do revendedor.',
+          parameters: { type: 'object', properties: {} },
+        },
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'chamar_humano',
+          description: 'Pausa a IA e alerta o revendedor para assumir o atendimento.',
+          parameters: { type: 'object', properties: {} },
+        },
+      },
+    ];
+
+    const messagesPayload = [
+      { role: 'system', content: JOSE_SYSTEM_PROMPT },
+      ...history,
+    ];
+
+    // 4. Primeira chamada ao Google Gemini
+    let aiRes = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'gemini-2.5-flash',
+        temperature: 0.3,
+        messages: messagesPayload,
+        tools,
+      }),
+    });
+    let aiData = await aiRes.json();
+    let msg = aiData.choices?.[0]?.message;
+
+    // 5. Executa ferramentas se a IA solicitou
+    if (msg?.tool_calls?.length) {
+      messagesPayload.push(msg);
+
+      for (const toolCall of msg.tool_calls) {
+        const fnName = toolCall.function.name;
+        const args = JSON.parse(toolCall.function.arguments || '{}');
+        let toolResult = 'ok';
+
+        if (fnName === 'enviar_logo_app') {
+          const appName = args.app_name;
+          lead.chosen_app = appName;
+          await pool.query('UPDATE leads SET chosen_app = $1 WHERE id = $2', [appName, lead.id]);
+          await sendWhatsAppImage(
+            instance,
+            remoteJid,
+            APP_LOGOS[appName],
+            `Procura por esse ícone na loja: ${appName} 📺`
+          );
+          toolResult = `Logo do ${appName} enviado com sucesso.`;
+        }
+
+        if (fnName === 'gerar_teste') {
+          if (!reseller.natv_api_key) {
+            toolResult = 'Erro: revendedor sem chave NATV configurada.';
+          } else {
+            const natvRes = await fetch('https://revenda.pixbot.link/user', {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${reseller.natv_api_key}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({ minutes: '60' }),
+            });
+            const natvUser = await natvRes.json();
+
+            if (natvRes.ok) {
+              await pool.query(
+                `UPDATE leads SET stage = 'TESTE', natv_username = $1 WHERE id = $2`,
+                [natvUser.username, lead.id]
+              );
+              await debitWallet(
+                reseller.id,
+                Number(reseller.cost_per_test),
+                'test_created',
+                `Teste gerado: ${natvUser.username}`
+              );
+
+              let maxplayerStatus = 'Não configurado';
+
+              if (lead.chosen_app === 'MAXPLAYER' && reseller.maxplayer_token) {
+                try {
+                  const maxUserRes = await fetch('https://api.maxplayer.tv/v3/users', {
+                    method: 'POST',
+                    headers: {
+                      Authorization: `Bearer ${reseller.maxplayer_token}`,
+                      'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                      username: natvUser.username,
+                      password: natvUser.password,
+                      email: `${natvUser.username}@josebot.com`,
+                      reseller_id: reseller.id.slice(0, 8),
+                    }),
+                  });
+
+                  if (maxUserRes.ok) {
+                    const m3uUrl = `https://dns.pixbot.link/get.php?auth=${natvUser.username}&pass=${natvUser.password}&output=ts`;
+                    await fetch('https://api.maxplayer.tv/v3/users/list', {
+                      method: 'POST',
+                      headers: {
+                        Authorization: `Bearer ${reseller.maxplayer_token}`,
+                        'Content-Type': 'application/json',
+                      },
+                      body: JSON.stringify({
+                        username: natvUser.username,
+                        list_url: m3uUrl,
+                        name: 'Lista José',
+                      }),
+                    });
+                    maxplayerStatus = 'Criado com sucesso';
+                  } else {
+                    maxplayerStatus = 'Erro ao cadastrar usuário no MaxPlayer';
+                  }
+                } catch {
+                  maxplayerStatus = 'Falha na comunicação com a API MaxPlayer';
+                }
+              }
+
+              toolResult = JSON.stringify({
+                app_escolhido: lead.chosen_app || '',
+                codigo_watch_hub: reseller.watch_hub_code || '',
+                usuario: natvUser.username,
+                senha: natvUser.password,
+                dominio: natvUser.domain,
+                maxplayer_status: maxplayerStatus,
+              });
+            } else {
+              toolResult = 'Erro ao gerar teste na API NATV.';
+            }
+          }
+        }
+
+        if (fnName === 'chamar_humano') {
+          await pool.query(
+            `UPDATE leads SET needs_human = true, tab = 'suporte' WHERE id = $1`,
+            [lead.id]
+          );
+          toolResult = 'Atendimento transferido para humano.';
+        }
+
+        messagesPayload.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: toolResult,
+        });
+      }
+
+      // Segunda chamada para a IA montar a resposta final ao cliente
+      aiRes = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'gemini-2.5-flash',
+          temperature: 0.3,
+          messages: messagesPayload,
+        }),
+      });
+      aiData = await aiRes.json();
+      msg = aiData.choices?.[0]?.message;
+    }
+
+    const replyText = msg?.content;
+    if (replyText) {
+      await sendWhatsAppText(instance, remoteJid, replyText);
+      await pool.query(
+        `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`,
+        [lead.id, replyText]
+      );
+      await pool.query(
+        'UPDATE leads SET last_message = $1, last_interaction = now() WHERE id = $2',
+        [replyText, lead.id]
+      );
+    }
+  } catch (err) {
+    console.error('Erro no webhook do José:', err);
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`API do José rodando na porta ${PORT}`));
