@@ -167,9 +167,11 @@ app.post('/api/auth/natv-login', async (req, res) => {
         is_vip: isVipReseller(user),
       },
     });
-  } catch {
-    res.status(500).json({ error: 'Erro ao validar acesso na API NATV' });
+   } catch (err) {
+    console.error('Erro detalhado no natv-login:', err);
+    res.status(500).json({ error: `Erro interno: ${err.message}` });
   }
+
 });
 
 // ==========================================
