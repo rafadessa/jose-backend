@@ -224,5 +224,312 @@ app.post('/api/webhooks/mercadopago', async (req, res) => {
   }
 });
 
+// ==========================================
+// FASE 2: MOTOR DO JOSÉ (IA + LOGOS + CARTEIRA + NATV)
+// ==========================================
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+
+// Coloque aqui os links públicos das imagens dos logos dos apps
+const APP_LOGOS = {
+  'WATCH HUB': 'https://COLE_AQUI_LINK_LOGO_WATCH_HUB.png',
+  'HD PLAYER': 'https://COLE_AQUI_LINK_LOGO_HD_PLAYER.png',
+  'MAXPLAYER': 'https://COLE_AQUI_LINK_LOGO_MAXPLAYER.png',
+  'PLAYER MASTER': 'https://COLE_AQUI_LINK_LOGO_PLAYER_MASTER.png',
+  'LOBO PLAYER': 'https://COLE_AQUI_LINK_LOGO_LOBO_PLAYER.png',
+  'MEGATV PLAYER': 'https://COLE_AQUI_LINK_LOGO_MEGATV.png',
+  'TOPTV': 'https://COLE_AQUI_LINK_LOGO_TOPTV.png',
+};
+
+const JOSE_SYSTEM_PROMPT = `Você é o José, atendente comercial de streaming no WhatsApp.
+Estilo: leve, direto, simpático e natural. Mensagens CURTAS (máx. 2 a 3 linhas) e APENAS UMA pergunta por vez.
+
+PLANOS: Mensal R$ 29,90 | Trimestral R$ 74,90 | Semestral R$ 149,90 | Anual R$ 279,90 | Teste grátis: 1 hora.
+Regra: nunca jogue a tabela completa antes de oferecer o teste grátis (se perguntar preço, diga "a partir de R$ 29,90/mês" e puxe para o teste).
+
+APPS POR APARELHO (indique sempre a 1ª opção primeiro):
+- Samsung: 1º WATCH HUB | 2º HD PLAYER | 3º MAXPLAYER
+- Roku: 1º PLAYER MASTER | 2º WATCH HUB | 3º HD PLAYER
+- LG: 1º HD PLAYER | 2º MAXPLAYER | 3º TOPTV
+- Android/Google TV / TV Box / Fire Stick: 1º WATCH HUB | 2º LOBO PLAYER | 3º MEGATV PLAYER
+
+FERRAMENTAS:
+- Ao indicar um app pela primeira vez, chame \`enviar_logo_app\` com o nome exato do app.
+- Quando o cliente instalar o app e confirmar que pode testar AGORA, chame \`gerar_teste\` e entregue usuário, senha e domínio retornados.
+- Se for cliente relatando travamento, problema de pagamento ou pedir humano, chame \`chamar_humano\`.`;
+
+async function sendWhatsAppText(instanceName, remoteJid, text) {
+  await fetch(`${EVOLUTION_URL}/message/sendText/${instanceName}`, {
+    method: 'POST',
+    headers: { apikey: EVOLUTION_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ number: remoteJid, delay: 1200, text }),
+  });
+}
+
+async function sendWhatsAppImage(instanceName, remoteJid, imageUrl, caption) {
+  if (!imageUrl || imageUrl.includes('COLE_AQUI')) return;
+  await fetch(`${EVOLUTION_URL}/message/sendMedia/${instanceName}`, {
+    method: 'POST',
+    headers: { apikey: EVOLUTION_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      number: remoteJid,
+      mediatype: 'image',
+      media: imageUrl,
+      caption,
+    }),
+  });
+}
+
+async function debitWallet(resellerId, amount, category, description) {
+  await pool.query(
+    'UPDATE resellers SET wallet_balance = GREATEST(wallet_balance - $1, 0) WHERE id = $2',
+    [amount, resellerId]
+  );
+  await pool.query(
+    `INSERT INTO wallet_transactions (reseller_id, type, category, amount, description)
+     VALUES ($1, 'debit', $2, $3, $4)`,
+    [resellerId, category, amount, description]
+  );
+}
+
+// Webhook que recebe as mensagens da Evolution API
+app.post('/api/webhooks/evolution', async (req, res) => {
+  res.sendStatus(200); // Responde rápido para a Evolution não reenviar
+
+  try {
+    const { event, instance, data } = req.body;
+    if (event !== 'messages.upsert' || !data || data.key?.fromMe) return;
+
+    const remoteJid = data.key?.remoteJid;
+    if (!remoteJid || remoteJid.includes('@g.us')) return; // Ignora grupos
+
+    const text =
+      data.message?.conversation ||
+      data.message?.extendedTextMessage?.text;
+    if (!text) return;
+
+    const pushName = data.pushName || 'Cliente';
+
+    // 1. Busca o revendedor dono da instância
+    const instRes = await pool.query(
+      `SELECT r.* FROM whatsapp_instances wi
+       JOIN resellers r ON r.id = wi.reseller_id
+       WHERE wi.instance_name = $1`,
+      [instance]
+    );
+    const reseller = instRes.rows[0];
+    if (!reseller || !reseller.bot_active || Number(reseller.wallet_balance) <= 0) {
+      return; // Bot pausado ou sem saldo na carteira
+    }
+
+    // 2. Busca ou cria o Lead
+    let leadRes = await pool.query(
+      'SELECT * FROM leads WHERE reseller_id = $1 AND phone = $2',
+      [reseller.id, remoteJid]
+    );
+    let lead = leadRes.rows[0];
+
+    if (!lead) {
+      const insertLead = await pool.query(
+        `INSERT INTO leads (reseller_id, phone, name, last_message)
+         VALUES ($1, $2, $3, $4) RETURNING *`,
+        [reseller.id, remoteJid, pushName, text]
+      );
+      lead = insertLead.rows[0];
+      // Cobra por nova conversa iniciada
+      await debitWallet(
+        reseller.id,
+        Number(reseller.cost_per_conversation),
+        'conversation',
+        `Nova conversa: ${pushName}`
+      );
+    } else {
+      await pool.query(
+        'UPDATE leads SET last_message = $1, last_interaction = now() WHERE id = $2',
+        [text, lead.id]
+      );
+    }
+
+    // Salva mensagem do cliente no banco
+    await pool.query(
+      `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'client', $2)`,
+      [lead.id, text]
+    );
+
+    // Se o revendedor assumiu o atendimento, o José fica em silêncio
+    if (lead.needs_human) return;
+
+    // 3. Carrega histórico recente (últimas 12 mensagens)
+    const histRes = await pool.query(
+      `SELECT sender, content FROM messages WHERE lead_id = $1 ORDER BY created_at DESC LIMIT 12`,
+      [lead.id]
+    );
+    const history = histRes.rows.reverse().map((m) => ({
+      role: m.sender === 'client' ? 'user' : 'assistant',
+      content: m.content,
+    }));
+
+    const tools = [
+      {
+        type: 'function',
+        function: {
+          name: 'enviar_logo_app',
+          description: 'Envia a imagem do logo do aplicativo recomendado para o cliente.',
+          parameters: {
+            type: 'object',
+            properties: {
+              app_name: {
+                type: 'string',
+                enum: Object.keys(APP_LOGOS),
+              },
+            },
+            required: ['app_name'],
+          },
+        },
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'gerar_teste',
+          description: 'Gera um teste grátis de 60 minutos na conta NATV do revendedor.',
+          parameters: { type: 'object', properties: {} },
+        },
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'chamar_humano',
+          description: 'Pausa a IA e alerta o revendedor para assumir o atendimento.',
+          parameters: { type: 'object', properties: {} },
+        },
+      },
+    ];
+
+    const messagesPayload = [
+      { role: 'system', content: JOSE_SYSTEM_PROMPT },
+      ...history,
+    ];
+
+    // 4. Chama a OpenAI
+    let aiRes = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        temperature: 0.3,
+        messages: messagesPayload,
+        tools,
+      }),
+    });
+    let aiData = await aiRes.json();
+    let msg = aiData.choices?.[0]?.message;
+
+    // 5. Executa ferramentas se a IA solicitou
+    if (msg?.tool_calls?.length) {
+      messagesPayload.push(msg);
+
+      for (const toolCall of msg.tool_calls) {
+        const fnName = toolCall.function.name;
+        const args = JSON.parse(toolCall.function.arguments || '{}');
+        let toolResult = 'ok';
+
+        if (fnName === 'enviar_logo_app') {
+          const appName = args.app_name;
+          await pool.query('UPDATE leads SET chosen_app = $1 WHERE id = $2', [appName, lead.id]);
+          await sendWhatsAppImage(
+            instance,
+            remoteJid,
+            APP_LOGOS[appName],
+            `Procura por esse ícone na loja: ${appName} 📺`
+          );
+          toolResult = `Logo do ${appName} enviado com sucesso.`;
+        }
+
+        if (fnName === 'gerar_teste') {
+          if (!reseller.natv_api_key) {
+            toolResult = 'Erro: revendedor sem chave NATV configurada.';
+          } else {
+            const natvRes = await fetch('https://revenda.pixbot.link/user', {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${reseller.natv_api_key}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({ minutes: '60' }),
+            });
+            const natvUser = await natvRes.json();
+            if (natvRes.ok) {
+              await pool.query(
+                `UPDATE leads SET stage = 'TESTE', natv_username = $1 WHERE id = $2`,
+                [natvUser.username, lead.id]
+              );
+              await debitWallet(
+                reseller.id,
+                Number(reseller.cost_per_test),
+                'test_created',
+                `Teste gerado: ${natvUser.username}`
+              );
+              toolResult = JSON.stringify({
+                usuario: natvUser.username,
+                senha: natvUser.password,
+                dominio: natvUser.domain,
+              });
+            } else {
+              toolResult = 'Erro ao gerar teste na API NATV.';
+            }
+          }
+        }
+
+        if (fnName === 'chamar_humano') {
+          await pool.query(
+            `UPDATE leads SET needs_human = true, tab = 'suporte' WHERE id = $1`,
+            [lead.id]
+          );
+          toolResult = 'Atendimento transferido para humano.';
+        }
+
+        messagesPayload.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: toolResult,
+        });
+      }
+
+      // Segunda chamada para a IA montar a resposta final ao cliente
+      aiRes = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          temperature: 0.3,
+          messages: messagesPayload,
+        }),
+      });
+      aiData = await aiRes.json();
+      msg = aiData.choices?.[0]?.message;
+    }
+
+    const replyText = msg?.content;
+    if (replyText) {
+      await sendWhatsAppText(instance, remoteJid, replyText);
+      await pool.query(
+        `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`,
+        [lead.id, replyText]
+      );
+      await pool.query(
+        'UPDATE leads SET last_message = $1, last_interaction = now() WHERE id = $2',
+        [replyText, lead.id]
+      );
+    }
+  } catch (err) {
+    console.error('Erro no webhook do José:', err);
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`API do José rodando na porta ${PORT}`));
