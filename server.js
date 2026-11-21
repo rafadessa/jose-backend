@@ -28,7 +28,7 @@ const MP_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // Chave do Google AI Studio (Gemini)
 
 // TROQUE PELO LINK REAL DA SUA JOSE-API NO EASYPANEL (ou crie a variável BASE_URL lá)
-const BASE_URL = process.env.BASE_URL || 'https://SEU_LINK_DO_JOSE_API';
+const BASE_URL = process.env.BASE_URL || 'https://bot-streaming-jose-api.celuyv.easypanel.host/';
 
 // Middleware de Autenticação
 function auth(req, res, next) {
