@@ -30,6 +30,16 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // Chave do Google AI Studio 
 // Configure BASE_URL no Easypanel ou troque o link abaixo pelo domínio real da sua jose-api
 const BASE_URL = process.env.BASE_URL || 'https://SEU_LINK_DO_JOSE_API';
 
+// Chaves NATV VIP (não exigem saldo na carteira do José e não sofrem débito)
+const VIP_NATV_KEYS = (process.env.VIP_NATV_KEYS || '')
+  .split(',')
+  .map((k) => k.trim())
+  .filter(Boolean);
+
+function isVipReseller(reseller) {
+  return Boolean(reseller?.natv_api_key && VIP_NATV_KEYS.includes(reseller.natv_api_key.trim()));
+}
+
 // Middleware de Autenticação
 function auth(req, res, next) {
   const token = req.headers.authorization?.split(' ')[1];
@@ -82,6 +92,7 @@ app.post('/api/auth/login', async (req, res) => {
         watch_hub_code: user.watch_hub_code || '',
         has_maxplayer_token: Boolean(user.maxplayer_token),
         has_mp_token: Boolean(user.mp_access_token),
+        is_vip: isVipReseller(user),
       },
     });
   } catch {
@@ -315,12 +326,15 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
 
       if (actRes.ok) {
         await pool.query(`UPDATE leads SET stage = 'ATIVO' WHERE id = $1`, [lead.id]);
-        await debitWallet(
-          reseller.id,
-          Number(reseller.cost_per_activation ?? 0.50),
-          'activation',
-          `Ativação (${months}m): ${lead.natv_username}`
-        );
+
+        if (!isVipReseller(reseller)) {
+          await debitWallet(
+            reseller.id,
+            Number(reseller.cost_per_activation ?? 0.50),
+            'activation',
+            `Ativação (${months}m): ${lead.natv_username}`
+          );
+        }
 
         if (actData.owner?.credits !== undefined) {
           await pool.query('UPDATE resellers SET natv_credits = $1 WHERE id = $2', [
@@ -457,7 +471,9 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       [instance]
     );
     const reseller = instRes.rows[0];
-    if (!reseller || !reseller.bot_active || Number(reseller.wallet_balance) <= 0) {
+    const isVip = isVipReseller(reseller);
+
+    if (!reseller || !reseller.bot_active || (!isVip && Number(reseller.wallet_balance) <= 0)) {
       return;
     }
 
@@ -613,12 +629,14 @@ app.post('/api/webhooks/evolution', async (req, res) => {
                 `UPDATE leads SET stage = 'TESTE', natv_username = $1 WHERE id = $2`,
                 [natvUser.username, lead.id]
               );
-              await debitWallet(
-                reseller.id,
-                Number(reseller.cost_per_test ?? 0.25),
-                'test_created',
-                `Teste gerado: ${natvUser.username}`
-              );
+              if (!isVip) {
+                await debitWallet(
+                  reseller.id,
+                  Number(reseller.cost_per_test ?? 0.25),
+                  'test_created',
+                  `Teste gerado: ${natvUser.username}`
+                );
+              }
 
               let maxplayerStatus = 'Não configurado';
 
@@ -745,12 +763,14 @@ app.post('/api/webhooks/evolution', async (req, res) => {
     const replyText = msg?.content;
     if (replyText) {
       await sendWhatsAppText(instance, remoteJid, replyText);
-      await debitWallet(
-        reseller.id,
-        Number(reseller.cost_per_reply ?? 0.10),
-        'reply',
-        `Resposta IA: ${lead.name || lead.phone}`
-      );
+      if (!isVip) {
+        await debitWallet(
+          reseller.id,
+          Number(reseller.cost_per_reply ?? 0.10),
+          'reply',
+          `Resposta IA: ${lead.name || lead.phone}`
+        );
+      }
       await pool.query(
         `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`,
         [lead.id, replyText]
