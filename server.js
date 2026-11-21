@@ -993,7 +993,41 @@ app.get('/api/natv/clients', auth, async (req, res) => {
     const raw = JSON.parse(rawText);
     const list = Array.isArray(raw) ? raw : (raw.data || raw.users || raw.clients || []);
 
-    const now = Date
+    const now = Date.now();
+    const activeClients = list
+      .filter((c) => {
+        const tipo = String(c.t || '').trim().toLowerCase();
+        const bloqueado = String(c.b || '').trim().toLowerCase();
+        if (tipo !== 'ativo') return false;
+        if (bloqueado !== 'no' && bloqueado !== '0' && bloqueado !== 'false' && bloqueado !== '') return false;
+
+        if (c.e) {
+          const expMs = Date.parse(String(c.e).replace(' ', 'T'));
+          if (!Number.isNaN(expMs) && expMs < now) return false;
+        }
+        return true;
+      })
+      .map((c, idx) => ({
+        id: String(c.i ?? idx),
+        username: String(c.u ?? 'Cliente NATV'),
+        name: String(c.n || c.u || 'Cliente NATV'),
+        exp_date: c.e ?? null,
+        plan: c.c ? `${c.c} tela(s)` : 'NATV',
+      }));
+
+    const payload = {
+      total_active: activeClients.length,
+      clients: activeClients,
+    };
+
+    natvClientsCache.set(req.user.id, { ts: Date.now(), payload });
+    res.json(payload);
+  } catch (err) {
+    console.error('Erro /api/natv/clients:', err);
+    res.status(500).json({ error: 'Erro interno ao buscar clientes NATV' });
+  }
+});
+
 
 
 
