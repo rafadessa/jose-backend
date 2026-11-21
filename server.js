@@ -969,7 +969,7 @@ app.get('/api/natv/clients', auth, async (req, res) => {
     }
 
     const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link/api').replace(/\/$/, '');
-    const response = await fetch(`${baseUrl}/user`, {
+        const response = await fetch(`${baseUrl}/user`, {
       method: 'GET',
       headers: {
         Authorization: `Bearer ${natvKey}`,
@@ -977,11 +977,17 @@ app.get('/api/natv/clients', auth, async (req, res) => {
       },
     });
 
+    
+
+
     if (!response.ok) {
       return res.status(response.status).json({ error: 'Não foi possível consultar os clientes na NATV' });
     }
 
-    const raw = await response.json();
+    console.log('NATV /user status:', response.status);
+    const rawText = await response.text();
+    console.log('NATV /user body:', rawText.slice(0, 500));
+    const raw = JSON.parse(rawText);
     const list = Array.isArray(raw) ? raw : (raw.data || raw.users || raw.clients || []);
 
     // Filtra apenas clientes ativos (sem expirados/bloqueados/testes, quando o campo existir)
