@@ -315,6 +315,12 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
 
       if (actRes.ok) {
         await pool.query(`UPDATE leads SET stage = 'ATIVO' WHERE id = $1`, [lead.id]);
+        await debitWallet(
+          reseller.id,
+          Number(reseller.cost_per_activation ?? 0.50),
+          'activation',
+          `Ativação (${months}m): ${lead.natv_username}`
+        );
 
         if (actData.owner?.credits !== undefined) {
           await pool.query('UPDATE resellers SET natv_credits = $1 WHERE id = $2', [
@@ -469,12 +475,6 @@ app.post('/api/webhooks/evolution', async (req, res) => {
         [reseller.id, remoteJid, pushName, text]
       );
       lead = insertLead.rows[0];
-      await debitWallet(
-        reseller.id,
-        Number(reseller.cost_per_conversation),
-        'conversation',
-        `Nova conversa: ${pushName}`
-      );
     } else {
       await pool.query(
         'UPDATE leads SET last_message = $1, last_interaction = now() WHERE id = $2',
@@ -615,7 +615,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
               );
               await debitWallet(
                 reseller.id,
-                Number(reseller.cost_per_test),
+                Number(reseller.cost_per_test ?? 0.25),
                 'test_created',
                 `Teste gerado: ${natvUser.username}`
               );
@@ -745,6 +745,12 @@ app.post('/api/webhooks/evolution', async (req, res) => {
     const replyText = msg?.content;
     if (replyText) {
       await sendWhatsAppText(instance, remoteJid, replyText);
+      await debitWallet(
+        reseller.id,
+        Number(reseller.cost_per_reply ?? 0.10),
+        'reply',
+        `Resposta IA: ${lead.name || lead.phone}`
+      );
       await pool.query(
         `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`,
         [lead.id, replyText]
