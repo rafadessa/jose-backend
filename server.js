@@ -1240,6 +1240,8 @@ const RECOVERY_MESSAGES = [
 
 app.post('/api/followup/recovery', auth, async (req, res) => {
   try {
+    const customMessage = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
+
     if (runningRecoveryJobs.has(req.user.id)) {
       return res.status(409).json({ error: 'Já existe uma tentativa de recuperação em andamento.' });
     }
@@ -1288,7 +1290,8 @@ app.post('/api/followup/recovery', auth, async (req, res) => {
       try {
         for (let i = 0; i < targets.length; i++) {
           const lead = targets[i];
-          const text = RECOVERY_MESSAGES[i % RECOVERY_MESSAGES.length];
+          const text = customMessage || RECOVERY_MESSAGES[i % RECOVERY_MESSAGES.length];
+
 
           try {
             await sendWhatsAppText(instanceName, lead.phone, text);
