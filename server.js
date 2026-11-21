@@ -448,7 +448,7 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
 });
 
 // ==========================================
-// 6. MOTOR DO JOSÉ (GEMINI AI + LOGOS + CARTEIRA + NATV + MAXPLAYER + PIX)
+// 6. MOTOR DO JOSÉ (GEMINI AI + LOGOS + ÁUDIO/FOTO + CARTEIRA + NATV + MAXPLAYER + PIX)
 // ==========================================
 const APP_LOGOS = {
   'WATCH HUB': `${BASE_URL}/logos/watch-hub.png`,
@@ -536,6 +536,58 @@ async function debitWallet(resellerId, amount, category, description) {
   );
 }
 
+async function getEvolutionMediaBase64(instanceName, messageData) {
+  try {
+    const res = await fetch(`${EVOLUTION_URL}/chat/getBase64FromMediaMessage/${instanceName}`, {
+      method: 'POST',
+      headers: { apikey: EVOLUTION_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: { key: messageData.key },
+        convertToMp4: false,
+      }),
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    return json.base64 || null;
+  } catch (err) {
+    console.error('Erro ao baixar mídia da Evolution:', err.message);
+    return null;
+  }
+}
+
+async function analyzeMediaWithGemini(base64, mimeType, promptText) {
+  try {
+    const apiKey = process.env.OPENAI_API_KEY || process.env.GEMINI_API_KEY;
+    if (!apiKey || !base64) return null;
+
+    const cleanBase64 = base64.replace(/^data:[^;]+;base64,/, '');
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                { text: promptText },
+                { inlineData: { mimeType, data: cleanBase64 } },
+              ],
+            },
+          ],
+        }),
+      }
+    );
+
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null;
+  } catch (err) {
+    console.error('Erro ao analisar mídia no Gemini:', err.message);
+    return null;
+  }
+}
+
 app.post('/api/webhooks/evolution', async (req, res) => {
   res.sendStatus(200);
 
@@ -546,9 +598,44 @@ app.post('/api/webhooks/evolution', async (req, res) => {
     const remoteJid = data.key?.remoteJid;
     if (!remoteJid || remoteJid.includes('@g.us')) return;
 
-    const text =
+    let text =
       data.message?.conversation ||
-      data.message?.extendedTextMessage?.text;
+      data.message?.extendedTextMessage?.text ||
+      '';
+
+    // Se o cliente mandou ÁUDIO, transcreve com o Gemini
+    if (!text && data.message?.audioMessage) {
+      const base64 = await getEvolutionMediaBase64(instance, data);
+      const mimeType = (data.message.audioMessage.mimetype || 'audio/ogg').split(';')[0];
+      const transcript = await analyzeMediaWithGemini(
+        base64,
+        mimeType,
+        'Transcreva exatamente o que o cliente falou neste áudio em português. Retorne apenas a transcrição, sem comentários.'
+      );
+      if (transcript) {
+        text = `[Áudio transcrito]: ${transcript}`;
+      }
+    }
+
+    // Se o cliente mandou FOTO, analisa com o Gemini (tela de TV, app, erro ou comprovante)
+    if (!text && data.message?.imageMessage) {
+      const base64 = await getEvolutionMediaBase64(instance, data);
+      const mimeType = (data.message.imageMessage.mimetype || 'image/jpeg').split(';')[0];
+      const caption = data.message.imageMessage.caption || '';
+      const description = await analyzeMediaWithGemini(
+        base64,
+        mimeType,
+        'Descreva de forma objetiva o que aparece nesta imagem enviada por um cliente de streaming/IPTV. Se for tela de TV ou celular, identifique o aplicativo, códigos, MAC, mensagens de erro ou dados visíveis. Se for comprovante Pix, informe valor e status.'
+      );
+      if (description) {
+        text = caption
+          ? `${caption}\n[Imagem enviada pelo cliente]: ${description}`
+          : `[Imagem enviada pelo cliente]: ${description}`;
+      } else if (caption) {
+        text = caption;
+      }
+    }
+
     if (!text) return;
 
     const pushName = data.pushName || 'Cliente';
@@ -974,26 +1061,43 @@ app.post('/api/leads/:leadId/toggle-ai', auth, async (req, res) => {
 });
 
 // ==========================================
-// 8. LISTAR CLIENTES ATIVOS DO PAINEL NATV
+// 8. LISTAR CLIENTES ATIVOS DO PAINEL NATV (COM FILA ÚNICA + BACKUP ANTI-429)
 // ==========================================
 const natvClientsCache = new Map();
+const natvClientsInFlight = new Map();
 
 app.get('/api/natv/clients', auth, async (req, res) => {
-  try {
-    const cached = natvClientsCache.get(req.user.id);
-    if (cached && Date.now() - cached.ts < 65000) {
-      return res.json(cached.payload);
-    }
+  const userId = req.user.id;
+  const cached = natvClientsCache.get(userId);
 
+  // 1. Se o cache tem menos de 65s, devolve direto sem chamar a NATV
+  if (cached && Date.now() - cached.ts < 65000) {
+    return res.json(cached.payload);
+  }
+
+  // 2. Se já existe uma consulta rodando para este revendedor, aguarda a mesma
+  if (natvClientsInFlight.has(userId)) {
+    try {
+      const payload = await natvClientsInFlight.get(userId);
+      return res.json(payload);
+    } catch {
+      if (cached?.payload) return res.json(cached.payload);
+      return res.status(500).json({ error: 'Erro ao aguardar consulta na NATV' });
+    }
+  }
+
+  const fetchPromise = (async () => {
     const r = await pool.query(
       'SELECT name, natv_api_key FROM resellers WHERE id = $1',
-      [req.user.id]
+      [userId]
     );
     const natvKey = r.rows[0]?.natv_api_key;
     const resellerName = String(r.rows[0]?.name || '').trim().toLowerCase();
 
     if (!natvKey) {
-      return res.status(400).json({ error: 'Chave NATV não configurada' });
+      const err = new Error('Chave NATV não configurada');
+      err.status = 400;
+      throw err;
     }
 
     const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
@@ -1008,7 +1112,14 @@ app.get('/api/natv/clients', auth, async (req, res) => {
     const rawText = await response.text();
     if (!response.ok) {
       console.log('NATV /report/allusers erro:', response.status, rawText.slice(0, 300));
-      return res.status(response.status).json({ error: 'Não foi possível consultar os clientes na NATV' });
+      // Se tomou 429 ou erro temporário, devolve o último cache válido em vez de zerar o painel
+      if (cached?.payload) {
+        natvClientsCache.set(userId, { ts: Date.now(), payload: cached.payload });
+        return cached.payload;
+      }
+      const err = new Error('Não foi possível consultar os clientes na NATV');
+      err.status = response.status;
+      throw err;
     }
 
     const raw = JSON.parse(rawText);
@@ -1044,11 +1155,20 @@ app.get('/api/natv/clients', auth, async (req, res) => {
       clients: activeClients,
     };
 
-    natvClientsCache.set(req.user.id, { ts: Date.now(), payload });
-    res.json(payload);
+    natvClientsCache.set(userId, { ts: Date.now(), payload });
+    return payload;
+  })();
+
+  natvClientsInFlight.set(userId, fetchPromise);
+
+  try {
+    const payload = await fetchPromise;
+    return res.json(payload);
   } catch (err) {
-    console.error('Erro /api/natv/clients:', err);
-    res.status(500).json({ error: 'Erro interno ao buscar clientes NATV' });
+    console.error('Erro /api/natv/clients:', err.message);
+    return res.status(err.status || 500).json({ error: err.message || 'Erro interno ao buscar clientes NATV' });
+  } finally {
+    natvClientsInFlight.delete(userId);
   }
 });
 
