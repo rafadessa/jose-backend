@@ -859,5 +859,101 @@ app.post('/api/webhooks/evolution', async (req, res) => {
   }
 });
 
+// ==========================================
+// 7. CHAT AO VIVO NO PAINEL (VER E RESPONDER WHATSAPP)
+// ==========================================
+
+// 1. Lista todas as conversas (leads) do revendedor
+app.get('/api/leads', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, phone, name, last_message, last_interaction, stage, chosen_app, natv_username, needs_human, tab
+       FROM leads
+       WHERE reseller_id = $1
+       ORDER BY last_interaction DESC`,
+      [req.user.id]
+    );
+    res.json(result.rows);
+  } catch {
+    res.status(500).json({ error: 'Erro ao carregar conversas' });
+  }
+});
+
+// 2. Carrega o histórico de mensagens de um cliente específico
+app.get('/api/leads/:leadId/messages', auth, async (req, res) => {
+  try {
+    const leadCheck = await pool.query(
+      'SELECT id FROM leads WHERE id = $1 AND reseller_id = $2',
+      [req.params.leadId, req.user.id]
+    );
+    if (!leadCheck.rows[0]) return res.status(404).json({ error: 'Conversa não encontrada' });
+
+    const msgs = await pool.query(
+      `SELECT id, sender, content, created_at
+       FROM messages
+       WHERE lead_id = $1
+       ORDER BY created_at ASC`,
+      [req.params.leadId]
+    );
+    res.json(msgs.rows);
+  } catch {
+    res.status(500).json({ error: 'Erro ao carregar mensagens' });
+  }
+});
+
+// 3. Envia uma resposta manual do revendedor direto pro WhatsApp do cliente
+app.post('/api/leads/:leadId/messages', auth, async (req, res) => {
+  const { text } = req.body;
+  if (!text?.trim()) return res.status(400).json({ error: 'Digite uma mensagem' });
+
+  try {
+    const leadRes = await pool.query(
+      'SELECT * FROM leads WHERE id = $1 AND reseller_id = $2',
+      [req.params.leadId, req.user.id]
+    );
+    const lead = leadRes.rows[0];
+    if (!lead) return res.status(404).json({ error: 'Conversa não encontrada' });
+
+    const instRes = await pool.query(
+      'SELECT instance_name FROM whatsapp_instances WHERE reseller_id = $1 LIMIT 1',
+      [req.user.id]
+    );
+    const instanceName = instRes.rows[0]?.instance_name;
+    if (!instanceName) return res.status(400).json({ error: 'WhatsApp não conectado' });
+
+    // Envia no WhatsApp via Evolution API
+    await sendWhatsAppText(instanceName, lead.phone, text.trim());
+
+    // Salva no banco como mensagem humana e pausa a IA nessa conversa para não atravessar
+    const saved = await pool.query(
+      `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'human', $2) RETURNING *`,
+      [lead.id, text.trim()]
+    );
+    await pool.query(
+      `UPDATE leads SET last_message = $1, last_interaction = now(), needs_human = true WHERE id = $2`,
+      [text.trim(), lead.id]
+    );
+
+    res.json(saved.rows[0]);
+  } catch {
+    res.status(500).json({ error: 'Erro ao enviar mensagem no WhatsApp' });
+  }
+});
+
+// 4. Pausar ou reativar a IA do José em uma conversa específica
+app.post('/api/leads/:leadId/toggle-ai', auth, async (req, res) => {
+  const { pause_ai } = req.body;
+  try {
+    await pool.query(
+      'UPDATE leads SET needs_human = $1 WHERE id = $2 AND reseller_id = $3',
+      [Boolean(pause_ai), req.params.leadId, req.user.id]
+    );
+    res.json({ success: true, needs_human: Boolean(pause_ai) });
+  } catch {
+    res.status(500).json({ error: 'Erro ao alterar status da IA' });
+  }
+});
+
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`API do José rodando na porta ${PORT}`));
