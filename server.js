@@ -954,6 +954,62 @@ app.post('/api/leads/:leadId/toggle-ai', auth, async (req, res) => {
   }
 });
 
+// ==========================================
+// 8. LISTAR CLIENTES ATIVOS DO PAINEL NATV
+// ==========================================
+app.get('/api/natv/clients', auth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      'SELECT natv_api_key FROM resellers WHERE id = $1',
+      [req.user.id]
+    );
+    const natvKey = r.rows[0]?.natv_api_key;
+    if (!natvKey) {
+      return res.status(400).json({ error: 'Chave NATV não configurada' });
+    }
+
+    const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link/api').replace(/\/$/, '');
+    const response = await fetch(`${baseUrl}/user`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${natvKey}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      return res.status(response.status).json({ error: 'Não foi possível consultar os clientes na NATV' });
+    }
+
+    const raw = await response.json();
+    const list = Array.isArray(raw) ? raw : (raw.data || raw.users || raw.clients || []);
+
+    // Filtra apenas clientes ativos (sem expirados/bloqueados/testes, quando o campo existir)
+    const now = Date.now();
+    const activeClients = list.filter((c) => {
+      const status = String(c.status || '').toLowerCase();
+      if (status && ['inactive', 'expired', 'disabled', 'blocked', 'banned'].includes(status)) {
+        return false;
+      }
+      if (c.is_trial === true || c.trial === true) return false;
+      const exp = c.exp_date || c.expires_at || c.expiration || c.vencimento;
+      if (exp) {
+        const expMs = typeof exp === 'number' ? (exp < 1e12 ? exp * 1000 : exp) : Date.parse(exp);
+        if (!Number.isNaN(expMs) && expMs < now) return false;
+      }
+      return true;
+    });
+
+    res.json({
+      total_active: activeClients.length,
+      clients: activeClients,
+    });
+  } catch (err) {
+    console.error('Erro /api/natv/clients:', err);
+    res.status(500).json({ error: 'Erro interno ao buscar clientes NATV' });
+  }
+});
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`API do José rodando na porta ${PORT}`));
