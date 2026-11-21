@@ -95,6 +95,77 @@ app.post('/api/auth/login', async (req, res) => {
         is_vip: isVipReseller(user),
       },
     });
+    // Login direto usando apenas a Chave de API NATV
+app.post('/api/auth/natv-login', async (req, res) => {
+  const { natv_api_key } = req.body;
+  if (!natv_api_key) {
+    return res.status(400).json({ error: 'Informe sua Chave de API NATV' });
+  }
+
+  try {
+    // 1. Valida a chave direto na NATV e puxa nome + créditos
+    const response = await fetch('https://revenda.pixbot.link/reseller/me', {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${natv_api_key.trim()}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      return res.status(401).json({ error: 'Chave de API NATV inválida' });
+    }
+
+    const natvData = await response.json();
+    const credits = natvData.credits ?? 0;
+    const natvName = natvData.username || natvData.name || `revenda_${natvData.id || Date.now()}`;
+    const fakeEmail = `${natvName.toLowerCase().replace(/[^a-z0-9]/g, '')}@natv.jose`;
+
+    // 2. Busca se já existe no banco; se não existir, cria automaticamente
+    let result = await pool.query('SELECT * FROM resellers WHERE natv_api_key = $1', [natv_api_key.trim()]);
+    let user = result.rows[0];
+
+    if (!user) {
+      const dummyHash = await bcrypt.hash(natv_api_key.trim(), 10);
+      const insert = await pool.query(
+        `INSERT INTO resellers (name, email, password_hash, natv_api_key, natv_credits)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (email) DO UPDATE SET natv_api_key = $4, natv_credits = $5
+         RETURNING *`,
+        [natvName, fakeEmail, dummyHash, natv_api_key.trim(), credits]
+      );
+      user = insert.rows[0];
+    } else {
+      const update = await pool.query(
+        'UPDATE resellers SET natv_credits = $1, name = $2 WHERE id = $3 RETURNING *',
+        [credits, natvName, user.id]
+      );
+      user = update.rows[0];
+    }
+
+    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        wallet_balance: user.wallet_balance,
+        natv_credits: user.natv_credits,
+        has_natv_key: true,
+        watch_hub_code: user.watch_hub_code || '',
+        has_maxplayer_token: Boolean(user.maxplayer_token),
+        has_mp_token: Boolean(user.mp_access_token),
+        is_vip: isVipReseller(user),
+      },
+    });
+  } catch {
+    res.status(500).json({ error: 'Erro ao validar acesso na API NATV' });
+  }
+});
+
+    
   } catch {
     res.status(500).json({ error: 'Erro ao fazer login' });
   }
