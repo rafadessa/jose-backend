@@ -719,51 +719,60 @@ app.post('/api/webhooks/evolution', async (req, res) => {
   res.sendStatus(200);
 
   try {
-    console.log('--- WEBHOOK EVOLUTION RECEBIDO ---');
-    console.log(JSON.stringify(req.body, null, 2));
-
-    const event = req.body.event || req.body.type;
-    const instance = req.body.instance;
-    const data = req.body.data || req.body;
-
-    // Aceita tanto 'messages.upsert' quanto qualquer evento que traga mensagens
-    const messageData = data?.message || data?.data?.message;
-    const remoteJid = data?.key?.remoteJid || data?.data?.key?.remoteJid;
-    const fromMe = data?.key?.fromMe || data?.data?.key?.fromMe;
-
-    if (!remoteJid || remoteJid.includes('@g.us') || fromMe) return;
-
-    let text =
-      messageData?.conversation ||
-      messageData?.extendedTextMessage?.text ||
-      data?.message?.conversation ||
-      '';
-
-    if (!text && messageData?.audioMessage) {
-      try {
-        const base64 = await getEvolutionMediaBase64(instance, data);
-        if (base64) {
-          const mimeType = (messageData.audioMessage.mimetype || 'audio/ogg').split(';')[0];
-          const transcript = await analyzeMediaWithGemini(
-            base64,
-            mimeType,
-            'Transcreva exatamente o que o cliente falou neste áudio em português. Retorne apenas a transcrição, sem comentários.'
-          );
-          if (transcript) {
-            text = `[Áudio transcrito]: ${transcript}`;
-          }
-        }
-      } catch (err) {
-        console.error('Erro ao processar áudio no webhook:', err.message);
-      }
-      if (!text) {
-        text = '[O cliente enviou um áudio, mas não foi possível transcrever.]';
-      }
+    console.log('1. [WEBHOOK] Requisição recebida da Evolution API');
+    const { event, instance, data } = req.body;
+    
+    if (event !== 'messages.upsert' || !data || data.key?.fromMe) {
+      console.log('1.1. [WEBHOOK] Ignorado (evento não é messages.upsert, sem dados ou mensagem própria)');
+      return;
     }
 
-    if (!text) return;
+    const remoteJid = data.key?.remoteJid;
+    if (!remoteJid || remoteJid.includes('@g.us')) {
+      console.log('1.2. [WEBHOOK] Ignorado (mensagem de grupo ou JID inválido):', remoteJid);
+      return;
+    }
 
-    let pushName = data.pushName || 'Cliente';
+    let text =
+      data.message?.conversation ||
+      data.message?.extendedTextMessage?.text ||
+      '';
+
+    console.log(`2. [MENSAGEM] Texto extraído de ${remoteJid}:`, text);
+
+    if (!text) {
+      console.log('2.1. [AVISO] Mensagem vazia ou mídia não tratada nesta etapa.');
+      return;
+    }
+
+    // Busca o revendedor
+    const instRes = await pool.query(
+      `SELECT r.*, COALESCE(wi.bot_type, 'sales') AS bot_type
+       FROM whatsapp_instances wi
+       JOIN resellers r ON r.id = wi.reseller_id
+       WHERE wi.instance_name = $1`,
+      [instance]
+    );
+    const reseller = instRes.rows[0];
+
+    if (!reseller) {
+      console.log('3. [ERRO] Revendedor não encontrado para a instância:', instance);
+      return;
+    }
+
+    if (!reseller.bot_active) {
+      console.log('3.1. [BLOQUEIO] Bot está desativado para este revendedor.');
+      return;
+    }
+
+    console.log('4. [SUCESSO] Revendedor validado. Iniciando chamada à IA...');
+
+    // O restante da sua lógica de IA continua aqui...
+
+  } catch (err) {
+    console.error('ERRO CRÍTICO NO WEBHOOK:', err);
+  }
+});
 
 
     // Restante da sua lógica de busca de revendedor, lead e chamada ao Gemini...
