@@ -790,7 +790,8 @@ app.post('/api/webhooks/evolution', async (req, res) => {
 
     if (!text) return;
 
-     let pushName = data.pushName || 'Cliente';
+     pushName = data.pushName || 'Cliente';
+
 
     // 1. Busca o revendedor dono da instância e identifica se é Vendas ou Suporte
     const instRes = await pool.query(
