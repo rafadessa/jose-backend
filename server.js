@@ -783,7 +783,6 @@ app.post('/api/webhooks/evolution', async (req, res) => {
     console.log('3. [BUSCA INSTÂNCIA NO BANCO]:', instance, '| Revendedor encontrado:', reseller ? reseller.name : '❌ NÃO ENCONTRADO');
 
     if (!reseller) {
-      // Tenta buscar por aproximação caso o nome venha ligeiramente diferente
       const fallbackRes = await pool.query(
         `SELECT r.*, COALESCE(wi.bot_type, 'sales') AS bot_type
          FROM whatsapp_instances wi
@@ -931,7 +930,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
 
     console.log('4. [GEMINI] Enviando mensagens para o Gemini...');
 
-    // 6. Chamada ao Google Gemini
+    // 6. Chamada ao Google Gemini com tratamento robusto de resposta e fallback
     let aiRes = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
       method: 'POST',
       headers: {
@@ -1034,8 +1033,19 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       msg = aiData.choices?.[0]?.message;
     }
 
-    const replyText = msg?.content;
-    console.log('5. [RESPOSTA DA IA GERADA]:', replyText || 'Nenhuma resposta gerada');
+    let replyText = msg?.content;
+    if (!replyText) {
+      replyText = aiData.choices?.[0]?.text || aiData.candidates?.[0]?.content?.parts?.[0]?.text || null;
+    }
+
+    if (!replyText) {
+      console.log('⚠️ Aviso: Gemini retornou sem texto direto. Resposta bruta:', JSON.stringify(aiData));
+      replyText = isSupportBot 
+        ? 'Olá! Como posso ajudar no seu suporte técnico hoje?' 
+        : 'Olá! Sou o José. Como posso te ajudar hoje com os nossos planos de streaming?';
+    }
+
+    console.log('5. [RESPOSTA DA IA GERADA]:', replyText);
 
     if (replyText) {
       await sendWhatsAppText(instance, remoteJid, replyText);
