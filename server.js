@@ -14,7 +14,9 @@ app.use(express.json());
 app.use('/logos', express.static(path.join(__dirname, 'logos')));
 
 // Rota de saúde para o Easypanel não reiniciar o contêiner
-app.get('/', (req, res) => res.json({ status: 'ok', app: 'API do José v3.2 (Vendas + Suporte Gestor + Webhook Auto)' }));
+app.get('/', (req, res) =>
+  res.json({ status: 'ok', app: 'API do José v3.3 (Vendas + Suporte Gestor + Status + Webhook Auto)' })
+);
 
 // Conexão com o PostgreSQL da sua VPS
 const pool = new Pool({
@@ -264,7 +266,7 @@ app.post('/api/reseller/support-whatsapp', auth, async (req, res) => {
 });
 
 // ==========================================
-// 3. CONECTAR WHATSAPP (VENDAS E SUPORTE + WEBHOOK AUTOMÁTICO)
+// 3. CONECTAR WHATSAPP (VENDAS E SUPORTE + WEBHOOK AUTO + STATUS)
 // ==========================================
 app.post('/api/whatsapp/connect', auth, async (req, res) => {
   const botType = req.body?.type === 'support' ? 'support' : 'sales';
@@ -276,8 +278,8 @@ app.post('/api/whatsapp/connect', auth, async (req, res) => {
   const webhookConfig = {
     enabled: true,
     url: `${BASE_URL}/api/webhooks/evolution`,
-    webhookByEvents: false,
-    webhookBase64: false,
+    byEvents: false,
+    base64: false,
     events: ['MESSAGES_UPSERT'],
   };
 
@@ -296,15 +298,20 @@ app.post('/api/whatsapp/connect', auth, async (req, res) => {
       }),
     });
 
-    // Garante o Webhook mesmo se a instância já existia antes
-    await fetch(`${EVOLUTION_URL}/webhook/set/${instanceName}`, {
+    // Garante o Webhook na Evolution v2.3.x mesmo se a instância já existia
+    const whRes = await fetch(`${EVOLUTION_URL}/webhook/set/${instanceName}`, {
       method: 'POST',
       headers: {
         apikey: EVOLUTION_KEY,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ webhook: webhookConfig }),
-    }).catch((err) => console.error('Aviso ao configurar webhook automático:', err.message));
+    });
+
+    if (!whRes.ok) {
+      const whErr = await whRes.text();
+      console.error(`Erro ao setar webhook em ${instanceName}:`, whRes.status, whErr);
+    }
 
     const qrRes = await fetch(`${EVOLUTION_URL}/instance/connect/${instanceName}`, {
       method: 'GET',
@@ -326,6 +333,35 @@ app.post('/api/whatsapp/connect', auth, async (req, res) => {
   } catch {
     res.status(500).json({ error: 'Erro ao gerar QR Code na Evolution API' });
   }
+});
+
+app.get('/api/whatsapp/status', auth, async (req, res) => {
+  const salesInstance = `jose_${req.user.id.slice(0, 8)}`;
+  const supportInstance = `jose_sup_${req.user.id.slice(0, 8)}`;
+
+  async function checkState(instanceName) {
+    try {
+      const r = await fetch(`${EVOLUTION_URL}/instance/connectionState/${instanceName}`, {
+        method: 'GET',
+        headers: { apikey: EVOLUTION_KEY },
+      });
+      if (!r.ok) return 'close';
+      const data = await r.json();
+      return data?.instance?.state || data?.state || 'close';
+    } catch {
+      return 'close';
+    }
+  }
+
+  const [salesState, supportState] = await Promise.all([
+    checkState(salesInstance),
+    checkState(supportInstance),
+  ]);
+
+  res.json({
+    sales: salesState === 'open',
+    support: supportState === 'open',
+  });
 });
 
 // ==========================================
