@@ -607,6 +607,7 @@ FLUXO DE ATENDIMENTO DE SUPORTE:
 1. PRIMEIRO PASSO (VERIFICAÇÃO NA NATV): Se o cliente disser que caiu, não funciona o reprodutor, não entra, deu erro de login ou está sem sinal, peça o usuário dele (se ainda não souber) e chame \'consultar_status_natv'\ para checar se o plano está ativo, bloqueado, vencido ou já ONLINE em outra tela.
    - Se o cliente pedir ou disser que perdeu a senha/dados de acesso, consulte o status NATV e informe normalmente o usuário e a senha retornados pela ferramenta.
 - Se possivel_tela_ocupada for true, avise o cliente que o plano dele é de 1 tela e consta um acesso recente (informe o horário de ultimo_acesso), explique que abrir em dois aparelhos ao mesmo tempo derruba o sinal e pergunte se ficou aberto em outra TV/celular ou se deseja adicionar uma 2ª tela (Mensal R$ 50,00).
+- Na NATV, o nome de usuário do cliente geralmente é o próprio número de telefone (ex.: 55119...). Sempre que o cliente enviar um número ou login, chame consultar_status_natv imediatamente sem questionar.
 
   - Se estiver VENCIDO: avise a data de vencimento com educação e ofereça renovar na hora via Pix (usando \`gerar_pix_plano\`).
    - Se \`online_agora\` for true e \`conexoes_ativas >= telas_contratadas\` (ex.: plano de 1 tela já sendo usado em outro aparelho): avise com educação que o login já está conectado assistindo em outro aparelho agora! Como o plano dele é de 1 tela, peça para fechar o app na outra TV/celular primeiro para liberar este aparelho — e avise que, se quiser assistir em duas telas ao mesmo tempo, ele pode migrar para o plano de 2 telas (R$ 50,00/mês).
@@ -937,7 +938,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
           toolResult = `Logo do ${appName} enviado com sucesso.`;
         }
 
-                if (fnName === 'consultar_status_natv') {
+                        if (fnName === 'consultar_status_natv') {
           const busca = String(args.username || lead.natv_username || lead.phone || '')
             .trim()
             .toLowerCase();
@@ -948,14 +949,93 @@ app.post('/api/webhooks/evolution', async (req, res) => {
             toolResult = JSON.stringify({ encontrado: false, erro: 'Login ou telefone não informado.' });
           } else {
             try {
-              const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
-              const natvRes = await fetch(`${baseUrl}/report/allusers`, {
-                method: 'GET',
-                headers: {
-                  'Content-Type': 'application/json',
-                  Authorization: `Bearer ${reseller.natv_api_key}`,
-                },
-              });
+              const cached = natvClientsCache.get(reseller.id);
+              let lista = null;
+
+              // Usa o cache se tiver menos de 60 segundos para evitar bloqueio 429 da NATV
+              if (cached?.rawList && Date.now() - cached.ts < 60000) {
+                lista = cached.rawList;
+              } else {
+                const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
+                const natvRes = await fetch(`${baseUrl}/report/allusers`, {
+                  method: 'GET',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${reseller.natv_api_key}`,
+                  },
+                });
+
+                if (natvRes.ok) {
+                  const data = await natvRes.json();
+                  lista = Array.isArray(data) ? data : data.users || data.data || data.clients || [];
+                } else {
+                  console.log('NATV consulta erro:', natvRes.status);
+                  // Backup anti-429: se falhar, usa a última lista salva em cache
+                  if (cached?.rawList) lista = cached.rawList;
+                }
+              }
+
+              if (!lista) {
+                toolResult = JSON.stringify({
+                  encontrado: false,
+                  erro: 'Painel NATV temporariamente ocupado (limite de consultas). Peça para tentar novamente em 1 minuto.',
+                });
+              } else {
+                const buscaLimpa = busca.replace(/\D/g, '');
+
+                const found = lista.find((u) => {
+                  const userLogin = String(u.u || '').trim().toLowerCase();
+                  const userLimpo = userLogin.replace(/\D/g, '');
+                  return (
+                    userLogin === busca ||
+                    (buscaLimpa.length >= 8 && userLimpo.endsWith(buscaLimpa.slice(-8)))
+                  );
+                });
+
+                if (!found) {
+                  console.log('NATV usuário não encontrado:', busca, '| Total na lista:', lista.length);
+                  toolResult = JSON.stringify({
+                    encontrado: false,
+                    mensagem: 'Usuário não encontrado no painel NATV.',
+                  });
+                } else {
+                  lead.natv_username = found.u;
+                  await pool.query('UPDATE leads SET natv_username = $1 WHERE id = $2', [found.u, lead.id]);
+
+                  const expMs = found.e ? Date.parse(String(found.e).replace(' ', 'T')) : NaN;
+                  const expired = !Number.isNaN(expMs) && expMs < Date.now();
+                  const ultimoAcesso = found.l || null;
+                  const maxTelas = Number(found.c || 1);
+
+                  // Detecta se houve acesso nos últimos 15 minutos (fuso Brasília -03:00)
+                  let usoRecente = false;
+                  if (ultimoAcesso) {
+                    const dataAcesso = new Date(ultimoAcesso.replace(' ', 'T') + '-03:00');
+                    const diffMinutos = (Date.now() - dataAcesso.getTime()) / 60000;
+                    if (!Number.isNaN(diffMinutos) && diffMinutos >= -5 && diffMinutos <= 15) {
+                      usoRecente = true;
+                    }
+                  }
+
+                  toolResult = JSON.stringify({
+                    encontrado: true,
+                    usuario: found.u,
+                    senha: found.p || null,
+                    status: expired ? 'VENCIDO' : String(found.t || 'ATIVO').toUpperCase(),
+                    bloqueado: found.b === 'Yes' || found.b === true,
+                    vencimento: found.e || 'Não informado',
+                    max_telas: maxTelas,
+                    ultimo_acesso: ultimoAcesso,
+                    possivel_tela_ocupada: maxTelas === 1 && usoRecente,
+                  });
+                }
+              }
+            } catch (err) {
+              console.error('Erro consultar_status_natv:', err.message);
+              toolResult = JSON.stringify({ encontrado: false, erro: 'Erro interno ao consultar NATV.' });
+            }
+          }
+        }
 
               if (!natvRes.ok) {
                 toolResult = JSON.stringify({ encontrado: false, erro: 'Falha ao consultar o painel NATV.' });
