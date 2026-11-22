@@ -763,7 +763,8 @@ app.post('/api/webhooks/evolution', async (req, res) => {
 
     if (!text) return;
 
-    const pushName = data.pushName || data?.data?.pushName || 'Cliente';
+    let pushName = data.pushName || 'Cliente';
+
 
     // Restante da sua lógica de busca de revendedor, lead e chamada ao Gemini...
 
