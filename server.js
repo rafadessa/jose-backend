@@ -1271,6 +1271,8 @@ app.get('/api/natv/clients', auth, async (req, res) => {
 // ==========================================
 async function initFollowupColumns() {
   try {
+    await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS instance_name TEXT;`);
+
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS support_whatsapp TEXT;`);
     await pool.query(`
       ALTER TABLE leads
