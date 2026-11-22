@@ -853,209 +853,73 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       content: m.content,
     }));
 
-    const tools = [
+    console.log('4. [GEMINI] Enviando mensagens para o Gemini (Endpoint Nativo)...');
+
+    // 6. Chamada ao Google Gemini (Endpoint Nativo /v1beta/models/gemini-2.5-flash:generateContent)
+    const contents = history.map((h) => ({
+      role: h.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: h.content }],
+    }));
+    contents.push({ role: 'user', parts: [{ text: text }] });
+
+    const systemInstruction = {
+      parts: [{ text: isSupportBot ? JOSE_SUPPORT_PROMPT : JOSE_SYSTEM_PROMPT }]
+    };
+
+    let aiRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${OPENAI_API_KEY}`,
       {
-        type: 'function',
-        function: {
-          name: 'enviar_logo_app',
-          description: 'Envia a imagem do logo do aplicativo recomendado para o cliente.',
-          parameters: {
-            type: 'object',
-            properties: {
-              app_name: { type: 'string', enum: Object.keys(APP_LOGOS) },
-            },
-            required: ['app_name'],
-          },
-        },
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'gerar_teste',
-          description: 'Gera um teste grátis de 60 minutos na conta NATV do revendedor.',
-          parameters: { type: 'object', properties: {} },
-        },
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'consultar_status_natv',
-          description: 'Consulta na NATV se o usuário do cliente está ativo, vencido, bloqueado, quantas telas tem contratadas e se já está online assistindo em outro aparelho agora.',
-          parameters: {
-            type: 'object',
-            properties: {
-              username: { type: 'string', description: 'Nome de usuário do cliente na NATV.' },
-            },
-            required: ['username'],
-          },
-        },
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'verificar_pagamento_e_ativar',
-          description: 'Verifica no Mercado Pago do revendedor se existe um pagamento Pix aprovado nas últimas 48h para este cliente e ativa automaticamente na NATV se ainda não tiver sido ativado.',
-          parameters: { type: 'object', properties: {} },
-        },
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'gerar_pix_plano',
-          description: 'Gera o Pix Copia e Cola na conta Mercado Pago do revendedor para ativar ou renovar o plano do cliente.',
-          parameters: {
-            type: 'object',
-            properties: {
-              months: { type: 'number', enum: [1, 3, 6, 12] },
-              screens: { type: 'number', enum: [1, 2, 3, 4], description: 'Quantidade de telas simultâneas (padrão 1).' },
-            },
-            required: ['months'],
-          },
-        },
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'chamar_humano',
-          description: 'Pausa a IA e alerta o revendedor no WhatsApp de suporte para assumir o atendimento.',
-          parameters: { type: 'object', properties: {} },
-        },
-      },
-    ];
-
-    const messagesPayload = [
-      { role: 'system', content: isSupportBot ? JOSE_SUPPORT_PROMPT : JOSE_SYSTEM_PROMPT },
-      ...history,
-    ];
-
-    console.log('4. [GEMINI] Enviando mensagens para o Gemini...');
-
-    // 6. Chamada ao Google Gemini com tratamento robusto de resposta e fallback
-    let aiRes = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'gemini-2.5-flash',
-        temperature: 0.3,
-        messages: messagesPayload,
-        tools,
-      }),
-    });
-    let aiData = await aiRes.json();
-    let msg = aiData.choices?.[0]?.message;
-
-    if (msg?.tool_calls?.length) {
-      messagesPayload.push(msg);
-
-      for (const toolCall of msg.tool_calls) {
-        const fnName = toolCall.function.name;
-        const args = JSON.parse(toolCall.function.arguments || '{}');
-        let toolResult = 'ok';
-
-        if (fnName === 'enviar_logo_app') {
-          const appName = args.app_name;
-          lead.chosen_app = appName;
-          await pool.query('UPDATE leads SET chosen_app = $1 WHERE id = $2', [appName, lead.id]);
-          await sendWhatsAppImage(instance, remoteJid, APP_LOGOS[appName], `Procura por esse ícone na loja: ${appName} 📺`);
-          toolResult = `Logo do ${appName} enviado com sucesso.`;
-        }
-
-        if (fnName === 'consultar_status_natv') {
-          const busca = String(args.username || lead.natv_username || lead.phone || '').trim().toLowerCase();
-          if (!activeReseller.natv_api_key) {
-            toolResult = 'Erro: revendedor sem chave NATV configurada.';
-          } else {
-            try {
-              const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
-              const natvRes = await fetch(`${baseUrl}/report/allusers`, {
-                method: 'GET',
-                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${activeReseller.natv_api_key}` },
-              });
-              if (natvRes.ok) {
-                const data = await natvRes.json();
-                const lista = Array.isArray(data) ? data : data.users || data.data || data.clients || [];
-                const found = lista.find((u) => String(u.u || '').trim().toLowerCase() === busca);
-                if (!found) {
-                  toolResult = JSON.stringify({ encontrado: false, mensagem: 'Usuário não encontrado no painel NATV.' });
-                } else {
-                  lead.natv_username = found.u;
-                  await pool.query('UPDATE leads SET natv_username = $1 WHERE id = $2', [found.u, lead.id]);
-                  toolResult = JSON.stringify({ encontrado: true, usuario: found.u, senha: found.p || null, status: String(found.t || 'ATIVO').toUpperCase() });
-                }
-              }
-            } catch (err) {
-              toolResult = JSON.stringify({ encontrado: false, erro: 'Erro interno ao consultar NATV.' });
-            }
-          }
-        }
-
-        if (fnName === 'gerar_teste') {
-          if (!activeReseller.natv_api_key) {
-            toolResult = 'Erro: revendedor sem chave NATV configurada.';
-          } else {
-            const clientPhone = String(lead.phone || '').replace(/@.*$/, '').replace(/\D/g, '');
-            const natvRes = await fetch('https://revenda.pixbot.link/user', {
-              method: 'POST',
-              headers: { Authorization: `Bearer ${activeReseller.natv_api_key}`, 'Content-Type': 'application/json' },
-              body: JSON.stringify({ minutes: '60', ...(clientPhone ? { username: clientPhone } : {}) }),
-            });
-            const natvUser = await natvRes.json();
-            if (natvRes.ok) {
-              lead.natv_username = natvUser.username;
-              await pool.query(`UPDATE leads SET stage = 'TESTE', natv_username = $1 WHERE id = $2`, [natvUser.username, lead.id]);
-              if (!isVip) {
-                await debitWallet(activeReseller.id, Number(activeReseller.cost_per_test ?? 0.25), 'test_created', `Teste gerado: ${natvUser.username}`);
-              }
-              toolResult = JSON.stringify({ usuario: natvUser.username, senha: natvUser.password, dominio: natvUser.domain });
-            } else {
-              toolResult = 'Erro ao gerar teste na API NATV.';
-            }
-          }
-        }
-
-        if (fnName === 'chamar_humano') {
-          await pool.query(`UPDATE leads SET needs_human = true, tab = 'suporte' WHERE id = $1`, [lead.id]);
-          toolResult = 'Atendimento transferido para humano.';
-        }
-
-        messagesPayload.push({ role: 'tool', tool_call_id: toolCall.id, content: toolResult });
-      }
-
-      aiRes = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
         method: 'POST',
-        headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: 'gemini-2.5-flash', temperature: 0.3, messages: messagesPayload, tools }),
-      });
-      aiData = await aiRes.json();
-      msg = aiData.choices?.[0]?.message;
-    }
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          systemInstruction,
+          contents,
+          generationConfig: {
+            temperature: 0.3,
+          },
+        }),
+      }
+    );
 
-    let replyText = msg?.content;
-    if (!replyText) {
-      replyText = aiData.choices?.[0]?.text || aiData.candidates?.[0]?.content?.parts?.[0]?.text || null;
-    }
+    let aiData = await aiRes.json();
+    let replyText = aiData?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null;
 
     if (!replyText) {
-      console.log('⚠️ Aviso: Gemini retornou sem texto direto. Resposta bruta:', JSON.stringify(aiData));
-      replyText = isSupportBot 
-        ? 'Olá! Como posso ajudar no seu suporte técnico hoje?' 
-        : 'Olá! Sou o José. Como posso te ajudar hoje com os nossos planos de streaming?';
+      console.log('⚠️ Aviso: Gemini nativo retornou vazio. Resposta bruta:', JSON.stringify(aiData));
+      const lowerText = text.toLowerCase();
+      if (lowerText.includes('trav') || lowerText.includes('caiu') || lowerText.includes('erro') || lowerText.includes('trava')) {
+        replyText = 'Entendi que está travando. Me informe o seu usuário ou login na NATV para eu consultar o status do plano.';
+      } else {
+        replyText = isSupportBot 
+          ? 'Olá! Como posso ajudar no seu suporte técnico hoje?' 
+          : 'Olá! Sou o José. Como posso te ajudar hoje com os nossos planos de streaming?';
+      }
     }
 
     console.log('5. [RESPOSTA DA IA GERADA]:', replyText);
 
     if (replyText) {
-      await sendWhatsAppText(instance, remoteJid, replyText);
-      console.log('6. [SUCESSO] Mensagem enviada de volta pelo WhatsApp para:', remoteJid);
+      // Trava de segurança para evitar duplicidade de envio idêntico num intervalo curto
+      const lastMsgRes = await pool.query(
+        `SELECT content, created_at FROM messages WHERE lead_id = $1 ORDER BY created_at DESC LIMIT 1`,
+        [lead.id]
+      );
+      const lastMsg = lastMsgRes.rows[0];
+      const nowTime = Date.now();
+      const lastTime = lastMsg ? new Date(lastMsg.created_at).getTime() : 0;
 
-      if (!isVip) {
-        await debitWallet(activeReseller.id, Number(activeReseller.cost_per_reply ?? 0.10), 'reply', `Resposta IA: ${lead.name || lead.phone}`);
+      if (lastMsg && lastMsg.content === replyText && (nowTime - lastTime) < 5000) {
+        console.log('⚠️ [DUPLICIDADE BLOQUEADA] Mensagem idêntica enviada há menos de 5 segundos. Ignorando.');
+      } else {
+        await sendWhatsAppText(instance, remoteJid, replyText);
+        console.log('6. [SUCESSO] Mensagem enviada de volta pelo WhatsApp para:', remoteJid);
+
+        if (!isVip) {
+          await debitWallet(activeReseller.id, Number(activeReseller.cost_per_reply ?? 0.10), 'reply', `Resposta IA: ${lead.name || lead.phone}`);
+        }
+        await pool.query(`INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`, [lead.id, replyText]);
+        await pool.query('UPDATE leads SET last_message = $1, last_interaction = now() WHERE id = $2', [replyText, lead.id]);
       }
-      await pool.query(`INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`, [lead.id, replyText]);
-      await pool.query('UPDATE leads SET last_message = $1, last_interaction = now() WHERE id = $2', [replyText, lead.id]);
     }
   } catch (err) {
     console.error('❌ ERRO CRÍTICO NO WEBHOOK DO JOSÉ:', err);
