@@ -938,7 +938,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
           toolResult = `Logo do ${appName} enviado com sucesso.`;
         }
 
-                        if (fnName === 'consultar_status_natv') {
+                                if (fnName === 'consultar_status_natv') {
           const busca = String(args.username || lead.natv_username || lead.phone || '')
             .trim()
             .toLowerCase();
@@ -952,7 +952,6 @@ app.post('/api/webhooks/evolution', async (req, res) => {
               const cached = natvClientsCache.get(reseller.id);
               let lista = null;
 
-              // Usa o cache se tiver menos de 60 segundos para evitar bloqueio 429 da NATV
               if (cached?.rawList && Date.now() - cached.ts < 60000) {
                 lista = cached.rawList;
               } else {
@@ -970,7 +969,6 @@ app.post('/api/webhooks/evolution', async (req, res) => {
                   lista = Array.isArray(data) ? data : data.users || data.data || data.clients || [];
                 } else {
                   console.log('NATV consulta erro:', natvRes.status);
-                  // Backup anti-429: se falhar, usa a última lista salva em cache
                   if (cached?.rawList) lista = cached.rawList;
                 }
               }
@@ -1007,7 +1005,6 @@ app.post('/api/webhooks/evolution', async (req, res) => {
                   const ultimoAcesso = found.l || null;
                   const maxTelas = Number(found.c || 1);
 
-                  // Detecta se houve acesso nos últimos 15 minutos (fuso Brasília -03:00)
                   let usoRecente = false;
                   if (ultimoAcesso) {
                     const dataAcesso = new Date(ultimoAcesso.replace(' ', 'T') + '-03:00');
@@ -1037,65 +1034,6 @@ app.post('/api/webhooks/evolution', async (req, res) => {
           }
         }
 
-              if (!natvRes.ok) {
-                toolResult = JSON.stringify({ encontrado: false, erro: 'Falha ao consultar o painel NATV.' });
-              } else {
-                const data = await natvRes.json();
-                const lista = Array.isArray(data) ? data : data.users || data.data || data.clients || [];
-                const buscaLimpa = busca.replace(/\D/g, '');
-
-                const found = lista.find((u) => {
-                  const userLogin = String(u.u || '').trim().toLowerCase();
-                  const userLimpo = userLogin.replace(/\D/g, '');
-                  return (
-                    userLogin === busca ||
-                    (buscaLimpa.length >= 8 && userLimpo.endsWith(buscaLimpa.slice(-8)))
-                  );
-                });
-
-                if (!found) {
-                  toolResult = JSON.stringify({
-                    encontrado: false,
-                    mensagem: 'Usuário não encontrado no painel NATV.',
-                  });
-                } else {
-                  lead.natv_username = found.u;
-                  await pool.query('UPDATE leads SET natv_username = $1 WHERE id = $2', [found.u, lead.id]);
-
-                  const expMs = found.e ? Date.parse(String(found.e).replace(' ', 'T')) : NaN;
-                  const expired = !Number.isNaN(expMs) && expMs < Date.now();
-                  const ultimoAcesso = found.l || null;
-                  const maxTelas = Number(found.c || 1);
-
-                  // Detecta se houve acesso nos últimos 15 minutos (fuso Brasília -03:00)
-                  let usoRecente = false;
-                  if (ultimoAcesso) {
-                    const dataAcesso = new Date(ultimoAcesso.replace(' ', 'T') + '-03:00');
-                    const diffMinutos = (Date.now() - dataAcesso.getTime()) / 60000;
-                    if (!Number.isNaN(diffMinutos) && diffMinutos >= -5 && diffMinutos <= 15) {
-                      usoRecente = true;
-                    }
-                  }
-
-                  toolResult = JSON.stringify({
-                    encontrado: true,
-                    usuario: found.u,
-                    senha: found.p || null,
-                    status: expired ? 'VENCIDO' : String(found.t || 'ATIVO').toUpperCase(),
-                    bloqueado: found.b === 'Yes' || found.b === true,
-                    vencimento: found.e || 'Não informado',
-                    max_telas: maxTelas,
-                    ultimo_acesso: ultimoAcesso,
-                    possivel_tela_ocupada: maxTelas === 1 && usoRecente,
-                  });
-                
-              }
-            } catch (err) {
-              console.error('Erro consultar_status_natv:', err.message);
-              toolResult = JSON.stringify({ encontrado: false, erro: 'Erro interno ao consultar NATV.' });
-            }
-          }
-        }
 
 
         if (fnName === 'verificar_pagamento_e_ativar') {
