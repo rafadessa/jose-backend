@@ -1291,7 +1291,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
 app.get('/api/leads', auth, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, phone, name, last_message, last_interaction, stage, chosen_app, natv_username, needs_human, tab
+      `SELECT id, phone, name, last_message, last_interaction, stage, chosen_app, natv_username, needs_human, needs_human AS ai_paused, tab
        FROM leads
        WHERE reseller_id = $1
        ORDER BY last_interaction DESC`,
@@ -1347,7 +1347,7 @@ app.get('/api/leads/:leadId/messages', auth, async (req, res) => {
     if (!leadCheck.rows[0]) return res.status(404).json({ error: 'Conversa não encontrada' });
 
     const msgs = await pool.query(
-      `SELECT id, sender, content, created_at
+      `SELECT id, sender, content, content AS text, created_at
        FROM messages
        WHERE lead_id = $1
        ORDER BY created_at ASC`,
@@ -1386,7 +1386,7 @@ app.post('/api/leads/:leadId/messages', auth, async (req, res) => {
     await sendWhatsAppText(instanceName, lead.phone, text.trim());
 
     const saved = await pool.query(
-      `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'human', $2) RETURNING *`,
+      `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'human', $2) RETURNING id, sender, content, content AS text, created_at`,
       [lead.id, text.trim()]
     );
     await pool.query(
@@ -1407,7 +1407,7 @@ app.post('/api/leads/:leadId/toggle-ai', auth, async (req, res) => {
       'UPDATE leads SET needs_human = $1 WHERE id = $2 AND reseller_id = $3',
       [Boolean(pause_ai), req.params.leadId, req.user.id]
     );
-    res.json({ success: true, needs_human: Boolean(pause_ai) });
+    res.json({ success: true, needs_human: Boolean(pause_ai), ai_paused: Boolean(pause_ai) });
   } catch {
     res.status(500).json({ error: 'Erro ao alterar status da IA' });
   }
