@@ -1387,7 +1387,7 @@ async function runRenewalFollowup() {
       const resellerName = String(reseller.name || '').trim().toLowerCase();
 
       const leadsRes = await pool.query(
-        `SELECT * FROM leads WHERE reseller_id = $1 AND natv_username IS NOT NULL AND needs_human = false`,
+        `SELECT * FROM leads WHERE reseller_id = $1 AND natv_username IS NOT NULL`,
         [reseller.id]
       );
       const leadByUser = new Map(
@@ -1400,9 +1400,6 @@ async function runRenewalFollowup() {
         const dono = String(c.r || '').trim().toLowerCase();
         if (resellerName && dono && dono !== resellerName) continue;
         if (!c.e || !c.u) continue;
-
-        const lead = leadByUser.get(String(c.u).trim().toLowerCase());
-        if (!lead) continue;
 
         const expMs = Date.parse(String(c.e).replace(' ', 'T'));
         if (Number.isNaN(expMs)) continue;
@@ -1430,6 +1427,39 @@ async function runRenewalFollowup() {
 
         if (!stageToSend) continue;
 
+        const userKey = String(c.u).trim().toLowerCase();
+        let lead = leadByUser.get(userKey);
+
+        // Se o cliente ainda não está no banco, tenta criar automaticamente usando o número do login NATV
+        if (!lead) {
+          const digits = String(c.u).replace(/\D/g, '');
+          // Só cria se o usuário parecer um telefone válido (10 a 13 dígitos)
+          if (digits.length < 10 || digits.length > 13) continue;
+
+          const phoneWithDdi = digits.length <= 11 ? `55${digits}` : digits;
+          const remoteJid = `${phoneWithDdi}@s.whatsapp.net`;
+
+          // Verifica se já existe lead por telefone para não duplicar
+          const existingByPhone = await pool.query(
+            `SELECT * FROM leads WHERE reseller_id = $1 AND phone = $2 LIMIT 1`,
+            [reseller.id, remoteJid]
+          );
+
+          if (existingByPhone.rows[0]) {
+            lead = existingByPhone.rows[0];
+            await pool.query(`UPDATE leads SET natv_username = $1 WHERE id = $2`, [String(c.u).trim(), lead.id]);
+          } else {
+            const created = await pool.query(
+              `INSERT INTO leads (reseller_id, phone, name, stage, natv_username, instance_name)
+               VALUES ($1, $2, $3, 'ATIVO', $4, $5) RETURNING *`,
+              [reseller.id, remoteJid, String(c.n || c.u).trim(), String(c.u).trim(), reseller.instance_name]
+            );
+            lead = created.rows[0];
+          }
+          leadByUser.set(userKey, lead);
+        }
+
+        if (lead.needs_human) continue;
         if (lead.renewal_last_exp === String(c.e) && lead.renewal_stage === stageToSend) {
           continue;
         }
@@ -1451,8 +1481,6 @@ async function runRenewalFollowup() {
   }
 }
 
-setInterval(runSalesFollowup, 5 * 60 * 1000);
-setInterval(runRenewalFollowup, 60 * 60 * 1000);
 
 
 const PORT = process.env.PORT || 3000;
