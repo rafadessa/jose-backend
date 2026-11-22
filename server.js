@@ -252,6 +252,20 @@ app.post('/api/reseller/mercadopago', auth, async (req, res) => {
   }
 });
 
+app.post('/api/reseller/support-whatsapp', auth, async (req, res) => {
+  const cleanPhone = String(req.body?.support_whatsapp || '').replace(/\D/g, '');
+  try {
+    await pool.query(
+      'UPDATE resellers SET support_whatsapp = $1 WHERE id = $2',
+      [cleanPhone, req.user.id]
+    );
+    res.json({ success: true, support_whatsapp: cleanPhone });
+  } catch {
+    res.status(500).json({ error: 'Erro ao salvar WhatsApp de suporte' });
+  }
+});
+
+
 // ==========================================
 // 3. CONECTAR WHATSAPP (GERAR QR CODE)
 // ==========================================
