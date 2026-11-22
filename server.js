@@ -1223,6 +1223,7 @@ app.get('/api/natv/clients', auth, async (req, res) => {
 // ==========================================
 async function initFollowupColumns() {
   try {
+    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS support_whatsapp TEXT;`);
     await pool.query(`
       ALTER TABLE leads
       ADD COLUMN IF NOT EXISTS followup_step INTEGER DEFAULT 0,
@@ -1234,6 +1235,8 @@ async function initFollowupColumns() {
   } catch (err) {
     console.error('Erro ao criar colunas de follow-up:', err.message);
   }
+  
+
 }
 
 function getBrazilHour() {
