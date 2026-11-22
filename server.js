@@ -1127,6 +1127,36 @@ app.get('/api/natv/clients', auth, async (req, res) => {
 
     const now = Date.now();
     const activeClients = list
+        // Consulta também o saldo atualizado de créditos na NATV
+    let liveCredits = null;
+    try {
+      const meRes = await fetch(`${baseUrl}/reseller/me`, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${natvKey}`,
+          'Content-Type': 'application/json',
+        },
+      });
+      if (meRes.ok) {
+        const meData = await meRes.json();
+        if (meData.credits !== undefined) {
+          liveCredits = meData.credits;
+          await pool.query('UPDATE resellers SET natv_credits = $1 WHERE id = $2', [
+            liveCredits,
+            userId,
+          ]);
+        }
+      }
+    } catch (e) {
+      console.error('Erro ao atualizar créditos NATV:', e.message);
+    }
+
+    const payload = {
+      total_active: activeClients.length,
+      clients: activeClients,
+      credits: liveCredits,
+    };
+
       .filter((c) => {
         const tipo = String(c.t || '').trim().toLowerCase();
         const bloqueado = String(c.b || '').trim().toLowerCase();
