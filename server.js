@@ -966,6 +966,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
                 const expMs = found.e ? Date.parse(String(found.e).replace(' ', 'T')) : NaN;
                 const expired = !Number.isNaN(expMs) && expMs < Date.now();
                 const telasContratadas = Number(found.c || 1);
+console.log('NATV FOUND:', JSON.stringify(found));
 
                 // Verifica se o usuário está online assistindo em outra tela agora
                 let conexoesAtivas = Number(found.o ?? found.online ?? found.active_connections ?? 0) || 0;
