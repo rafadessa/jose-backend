@@ -434,7 +434,7 @@ app.post('/api/webhooks/mercadopago', async (req, res) => {
 });
 
 // ==========================================
-// 5. WEBHOOK DE VENDA DE PLANOS (MERCADO PAGO DO REVENDEDOR -> ATIVAÇÃO NATV)
+// 5. WEBHOOK DE VENDA DE PLANOS
 // ==========================================
 app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
   res.sendStatus(200);
@@ -531,7 +531,7 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
 });
 
 // ==========================================
-// 6. MOTOR DO JOSÉ (VENDAS + SUPORTE + ÁUDIO/FOTO + NATV + MAXPLAYER + PIX)
+// 6. MOTOR DO JOSÉ (VENDAS + SUPORTE + ÁUDIO/FOTO)
 // ==========================================
 const APP_LOGOS = {
   'WATCH HUB': `${BASE_URL}/logos/watch-hub.png`,
@@ -719,18 +719,15 @@ app.post('/api/webhooks/evolution', async (req, res) => {
   try {
     console.log('1. [WEBHOOK] Requisição recebida da Evolution API');
     
-    // Flexibilidade total para pegar dados de qualquer versão da Evolution API
     const body = req.body || {};
     const event = body.event || body.type;
     const instance = body.instance;
     const dataObj = body.data || body;
 
-    // Se for evento de atualização de contato/chat/conexão, ignora limpidamente
     if (event && (event.includes('contact') || event.includes('chat') || event.includes('connection') || event.includes('presence'))) {
       return;
     }
 
-    // Extração segura do remetente e da mensagem em qualquer estrutura da Evolution
     const key = dataObj.key || dataObj.data?.key;
     const remoteJid = key?.remoteJid || dataObj.remoteJid;
     const fromMe = key?.fromMe || dataObj.fromMe;
@@ -747,7 +744,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       dataObj.text ||
       '';
 
-    console.log(`2. [MENSAGEM CAPTURADA] De: ${remoteJid} | Texto: ${text || '[Mídia ou outro tipo]'}`);
+    console.log(`2. [MENSAGEM CAPTURADA] De: ${remoteJid} | Instância: ${instance} | Texto: ${text || '[Mídia]'}`);
 
     if (!text && messageContainer.audioMessage) {
       try {
@@ -773,8 +770,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
 
     let pushName = dataObj.pushName || body.pushName || 'Cliente';
 
-
-    // 1. Busca o revendedor dono da instância e identifica se é Vendas ou Suporte
+    // 3. Busca o revendedor dono da instância
     const instRes = await pool.query(
       `SELECT r.*, COALESCE(wi.bot_type, 'sales') AS bot_type
        FROM whatsapp_instances wi
@@ -783,17 +779,43 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       [instance]
     );
     const reseller = instRes.rows[0];
-    const isVip = isVipReseller(reseller);
-    const isSupportBot = reseller?.bot_type === 'support';
 
-    if (!reseller || !reseller.bot_active || (!isVip && Number(reseller.wallet_balance) <= 0)) {
+    console.log('3. [BUSCA INSTÂNCIA NO BANCO]:', instance, '| Revendedor encontrado:', reseller ? reseller.name : '❌ NÃO ENCONTRADO');
+
+    if (!reseller) {
+      // Tenta buscar por aproximação caso o nome venha ligeiramente diferente
+      const fallbackRes = await pool.query(
+        `SELECT r.*, COALESCE(wi.bot_type, 'sales') AS bot_type
+         FROM whatsapp_instances wi
+         JOIN resellers r ON r.id = wi.reseller_id
+         WHERE wi.instance_name ILIKE $1 LIMIT 1`,
+        [`%${instance}%`]
+      );
+      if (fallbackRes.rows[0]) {
+        console.log('3.1. [FALLBACK] Revendedor encontrado por aproximação!');
+      } else {
+        console.log('❌ ABORTADO: Nenhuma instância cadastrada no banco com o nome:', instance);
+        return;
+      }
+    }
+
+    const activeReseller = reseller || (await pool.query(
+      `SELECT r.*, COALESCE(wi.bot_type, 'sales') AS bot_type FROM whatsapp_instances wi JOIN resellers r ON r.id = wi.reseller_id WHERE wi.instance_name ILIKE $1 LIMIT 1`,
+      [`%${instance}%`]
+    )).rows[0];
+
+    const isVip = isVipReseller(activeReseller);
+    const isSupportBot = activeReseller?.bot_type === 'support';
+
+    if (!activeReseller.bot_active || (!isVip && Number(activeReseller.wallet_balance) <= 0)) {
+      console.log('❌ ABORTADO: Bot desativado ou saldo insuficiente para o revendedor.');
       return;
     }
 
-    // 2. Busca ou cria o Lead
+    // 4. Busca ou cria o Lead
     let leadRes = await pool.query(
       'SELECT * FROM leads WHERE reseller_id = $1 AND phone = $2',
-      [reseller.id, remoteJid]
+      [activeReseller.id, remoteJid]
     );
     let lead = leadRes.rows[0];
 
@@ -801,7 +823,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       const insertLead = await pool.query(
         `INSERT INTO leads (reseller_id, phone, name, last_message, instance_name)
          VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-        [reseller.id, remoteJid, pushName, text, instance]
+        [activeReseller.id, remoteJid, pushName, text, instance]
       );
       lead = insertLead.rows[0];
     } else {
@@ -817,9 +839,12 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       [lead.id, text]
     );
 
-    if (lead.needs_human) return;
+    if (lead.needs_human) {
+      console.log('ℹ️ Atendimento pausado para este lead (needs_human = true).');
+      return;
+    }
 
-    // 3. Carrega histórico recente
+    // 5. Carrega histórico recente
     const histRes = await pool.query(
       `SELECT sender, content FROM messages WHERE lead_id = $1 ORDER BY created_at DESC LIMIT 12`,
       [lead.id]
@@ -838,10 +863,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
           parameters: {
             type: 'object',
             properties: {
-              app_name: {
-                type: 'string',
-                enum: Object.keys(APP_LOGOS),
-              },
+              app_name: { type: 'string', enum: Object.keys(APP_LOGOS) },
             },
             required: ['app_name'],
           },
@@ -907,7 +929,9 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       ...history,
     ];
 
-    // 4. Primeira chamada ao Google Gemini
+    console.log('4. [GEMINI] Enviando mensagens para o Gemini...');
+
+    // 6. Chamada ao Google Gemini
     let aiRes = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
       method: 'POST',
       headers: {
@@ -924,7 +948,6 @@ app.post('/api/webhooks/evolution', async (req, res) => {
     let aiData = await aiRes.json();
     let msg = aiData.choices?.[0]?.message;
 
-    // 5. Executa ferramentas se a IA solicitou
     if (msg?.tool_calls?.length) {
       messagesPayload.push(msg);
 
@@ -937,409 +960,95 @@ app.post('/api/webhooks/evolution', async (req, res) => {
           const appName = args.app_name;
           lead.chosen_app = appName;
           await pool.query('UPDATE leads SET chosen_app = $1 WHERE id = $2', [appName, lead.id]);
-          await sendWhatsAppImage(
-            instance,
-            remoteJid,
-            APP_LOGOS[appName],
-            `Procura por esse ícone na loja: ${appName} 📺`
-          );
+          await sendWhatsAppImage(instance, remoteJid, APP_LOGOS[appName], `Procura por esse ícone na loja: ${appName} 📺`);
           toolResult = `Logo do ${appName} enviado com sucesso.`;
         }
 
         if (fnName === 'consultar_status_natv') {
-          const busca = String(args.username || lead.natv_username || lead.phone || '')
-            .trim()
-            .toLowerCase();
-
-          if (!reseller.natv_api_key) {
+          const busca = String(args.username || lead.natv_username || lead.phone || '').trim().toLowerCase();
+          if (!activeReseller.natv_api_key) {
             toolResult = 'Erro: revendedor sem chave NATV configurada.';
-          } else if (!busca) {
-            toolResult = JSON.stringify({ encontrado: false, erro: 'Login ou telefone não informado.' });
           } else {
             try {
-              const cached = natvClientsCache.get(reseller.id);
-              let lista = null;
-
-              if (cached?.rawList && Date.now() - cached.ts < 60000) {
-                lista = cached.rawList;
-              } else {
-                const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
-                const natvRes = await fetch(`${baseUrl}/report/allusers`, {
-                  method: 'GET',
-                  headers: {
-                    'Content-Type': 'application/json',
-                    Authorization: `Bearer ${reseller.natv_api_key}`,
-                  },
-                });
-
-                if (natvRes.ok) {
-                  const data = await natvRes.json();
-                  lista = Array.isArray(data) ? data : data.users || data.data || data.clients || [];
-                } else {
-                  console.log('NATV consulta erro:', natvRes.status);
-                  if (cached?.rawList) lista = cached.rawList;
-                }
-              }
-
-              if (!lista) {
-                toolResult = JSON.stringify({
-                  encontrado: false,
-                  erro: 'Painel NATV temporariamente ocupado (limite de consultas). Peça para tentar novamente em 1 minuto.',
-                });
-              } else {
-                const buscaLimpa = busca.replace(/\D/g, '');
-
-                const found = lista.find((u) => {
-                  const userLogin = String(u.u || '').trim().toLowerCase();
-                  const userLimpo = userLogin.replace(/\D/g, '');
-                  return (
-                    userLogin === busca ||
-                    (buscaLimpa.length >= 8 && userLimpo.endsWith(buscaLimpa.slice(-8)))
-                  );
-                });
-
+              const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
+              const natvRes = await fetch(`${baseUrl}/report/allusers`, {
+                method: 'GET',
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${activeReseller.natv_api_key}` },
+              });
+              if (natvRes.ok) {
+                const data = await natvRes.json();
+                const lista = Array.isArray(data) ? data : data.users || data.data || data.clients || [];
+                const found = lista.find((u) => String(u.u || '').trim().toLowerCase() === busca);
                 if (!found) {
-                  console.log('NATV usuário não encontrado:', busca, '| Total na lista:', lista.length);
-                  toolResult = JSON.stringify({
-                    encontrado: false,
-                    mensagem: 'Usuário não encontrado no painel NATV.',
-                  });
+                  toolResult = JSON.stringify({ encontrado: false, mensagem: 'Usuário não encontrado no painel NATV.' });
                 } else {
                   lead.natv_username = found.u;
                   await pool.query('UPDATE leads SET natv_username = $1 WHERE id = $2', [found.u, lead.id]);
-
-                  const expMs = found.e ? Date.parse(String(found.e).replace(' ', 'T')) : NaN;
-                  const expired = !Number.isNaN(expMs) && expMs < Date.now();
-                  const ultimoAcesso = found.l || null;
-                  const maxTelas = Number(found.c || 1);
-
-                  let usoRecente = false;
-                  if (ultimoAcesso) {
-                    const dataAcesso = new Date(ultimoAcesso.replace(' ', 'T') + '-03:00');
-                    const diffMinutos = (Date.now() - dataAcesso.getTime()) / 60000;
-                    if (!Number.isNaN(diffMinutos) && diffMinutos >= -5 && diffMinutos <= 15) {
-                      usoRecente = true;
-                    }
-                  }
-
-                  toolResult = JSON.stringify({
-                    encontrado: true,
-                    usuario: found.u,
-                    senha: found.p || null,
-                    status: expired ? 'VENCIDO' : String(found.t || 'ATIVO').toUpperCase(),
-                    bloqueado: found.b === 'Yes' || found.b === true,
-                    vencimento: found.e || 'Não informado',
-                    max_telas: maxTelas,
-                    ultimo_acesso: ultimoAcesso,
-                    possivel_tela_ocupada: maxTelas === 1 && usoRecente,
-                  });
+                  toolResult = JSON.stringify({ encontrado: true, usuario: found.u, senha: found.p || null, status: String(found.t || 'ATIVO').toUpperCase() });
                 }
               }
             } catch (err) {
-              console.error('Erro consultar_status_natv:', err.message);
               toolResult = JSON.stringify({ encontrado: false, erro: 'Erro interno ao consultar NATV.' });
             }
           }
         }
 
-        if (fnName === 'verificar_pagamento_e_ativar') {
-          if (!reseller.mp_access_token || !reseller.natv_api_key) {
-            toolResult = 'Erro: Mercado Pago ou NATV não configurados. Chame um humano.';
-          } else if (!lead.natv_username) {
-            toolResult = 'Usuário NATV do cliente ainda não identificado. Peça o usuário antes de ativar.';
-          } else {
-            try {
-              const sinceIso = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
-              const searchUrl = `https://api.mercadopago.com/v1/payments/search?sort=date_created&criteria=desc&begin_date=${encodeURIComponent(sinceIso)}&status=approved&limit=30`;
-              const mpSearch = await fetch(searchUrl, {
-                headers: { Authorization: `Bearer ${reseller.mp_access_token}` },
-              });
-              const mpData = await mpSearch.json();
-              const results = Array.isArray(mpData.results) ? mpData.results : [];
-
-              const match = results.find((p) =>
-                String(p.external_reference || '').startsWith(`${lead.id}|`)
-              );
-
-              if (!match) {
-                toolResult = 'Nenhum pagamento Pix aprovado encontrado no Mercado Pago para este cliente nas últimas 48h. Se ele mandou comprovante de outra chave Pix, chame humano para conferência manual.';
-              } else {
-                const payId = String(match.id);
-                const already = await pool.query(
-                  'SELECT 1 FROM processed_payments WHERE payment_id = $1',
-                  [payId]
-                );
-
-                if (already.rows.length > 0) {
-                  toolResult = `O pagamento #${payId} já foi processado e ativado anteriormente. Peça para o cliente fechar e abrir o app novamente ou consulte o status na NATV.`;
-                } else {
-                  const [, monthsStr, screensStr] = String(match.external_reference).split('|');
-                  const months = Number(monthsStr) || 1;
-                  const screens = Number(screensStr) || 1;
-
-                  const actRes = await fetch('https://revenda.pixbot.link/user/activation', {
-                    method: 'POST',
-                    headers: {
-                      Authorization: `Bearer ${reseller.natv_api_key}`,
-                      'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({
-                      username: lead.natv_username,
-                      months,
-                      ...(screens > 1 ? { connections: screens } : {}),
-                    }),
-                  });
-                  const actData = await actRes.json();
-
-                  if (actRes.ok) {
-                    await pool.query(
-                      'INSERT INTO processed_payments (payment_id, reseller_id, lead_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
-                      [payId, reseller.id, lead.id]
-                    );
-                    await pool.query(`UPDATE leads SET stage = 'ATIVO' WHERE id = $1`, [lead.id]);
-
-                    if (!isVip) {
-                      await debitWallet(
-                        reseller.id,
-                        Number(reseller.cost_per_activation ?? 0.50),
-                        'activation',
-                        `Ativação via Suporte (${months}m / ${screens} tela(s)): ${lead.natv_username}`
-                      );
-                    }
-                    if (actData.owner?.credits !== undefined) {
-                      await pool.query('UPDATE resellers SET natv_credits = $1 WHERE id = $2', [
-                        actData.owner.credits,
-                        reseller.id,
-                      ]);
-                    }
-
-                    toolResult = `Pagamento #${payId} confirmado no Mercado Pago e plano de ${months} mês(es) (${screens} tela(s)) ativado com sucesso na NATV!`;
-                  } else {
-                    toolResult = 'Pagamento aprovado no Mercado Pago, mas houve erro ao ativar na NATV. Chame um humano para liberar manualmente.';
-                  }
-                }
-              }
-            } catch {
-              toolResult = 'Erro temporário ao consultar o Mercado Pago. Chame um humano se persistir.';
-            }
-          }
-        }
-
         if (fnName === 'gerar_teste') {
-          if (!reseller.natv_api_key) {
+          if (!activeReseller.natv_api_key) {
             toolResult = 'Erro: revendedor sem chave NATV configurada.';
           } else {
-            const clientPhone = String(lead.phone || '')
-              .replace(/@.*$/, '')
-              .replace(/\D/g, '');
-
-            const natvBody = {
-              minutes: '60',
-              ...(clientPhone ? { username: clientPhone } : {}),
-            };
-
+            const clientPhone = String(lead.phone || '').replace(/@.*$/, '').replace(/\D/g, '');
             const natvRes = await fetch('https://revenda.pixbot.link/user', {
               method: 'POST',
-              headers: {
-                Authorization: `Bearer ${reseller.natv_api_key}`,
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify(natvBody),
+              headers: { Authorization: `Bearer ${activeReseller.natv_api_key}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ minutes: '60', ...(clientPhone ? { username: clientPhone } : {}) }),
             });
             const natvUser = await natvRes.json();
-
             if (natvRes.ok) {
               lead.natv_username = natvUser.username;
-              await pool.query(
-                `UPDATE leads SET stage = 'TESTE', natv_username = $1 WHERE id = $2`,
-                [natvUser.username, lead.id]
-              );
+              await pool.query(`UPDATE leads SET stage = 'TESTE', natv_username = $1 WHERE id = $2`, [natvUser.username, lead.id]);
               if (!isVip) {
-                await debitWallet(
-                  reseller.id,
-                  Number(reseller.cost_per_test ?? 0.25),
-                  'test_created',
-                  `Teste gerado: ${natvUser.username}`
-                );
+                await debitWallet(activeReseller.id, Number(activeReseller.cost_per_test ?? 0.25), 'test_created', `Teste gerado: ${natvUser.username}`);
               }
-
-              let maxplayerStatus = 'Não configurado';
-
-              if (lead.chosen_app === 'MAXPLAYER' && reseller.maxplayer_token) {
-                try {
-                  const maxUserRes = await fetch('https://api.maxplayer.tv/v3/users', {
-                    method: 'POST',
-                    headers: {
-                      Authorization: `Bearer ${reseller.maxplayer_token}`,
-                      'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({
-                      username: natvUser.username,
-                      password: natvUser.password,
-                      email: `${natvUser.username}@josebot.com`,
-                      reseller_id: reseller.id.slice(0, 8),
-                    }),
-                  });
-
-                  if (maxUserRes.ok) {
-                    const m3uUrl = `https://dns.pixbot.link/get.php?auth=${natvUser.username}&pass=${natvUser.password}&output=ts`;
-                    await fetch('https://api.maxplayer.tv/v3/users/list', {
-                      method: 'POST',
-                      headers: {
-                        Authorization: `Bearer ${reseller.maxplayer_token}`,
-                        'Content-Type': 'application/json',
-                      },
-                      body: JSON.stringify({
-                        username: natvUser.username,
-                        list_url: m3uUrl,
-                        name: 'Lista José',
-                      }),
-                    });
-                    maxplayerStatus = 'Criado com sucesso';
-                  } else {
-                    maxplayerStatus = 'Erro ao cadastrar usuário no MaxPlayer';
-                  }
-                } catch {
-                  maxplayerStatus = 'Falha na comunicação com a API MaxPlayer';
-                }
-              }
-
-              toolResult = JSON.stringify({
-                app_escolhido: lead.chosen_app || '',
-                codigo_watch_hub: reseller.watch_hub_code || '',
-                usuario: natvUser.username,
-                senha: natvUser.password,
-                dominio: natvUser.domain,
-                maxplayer_status: maxplayerStatus,
-              });
+              toolResult = JSON.stringify({ usuario: natvUser.username, senha: natvUser.password, dominio: natvUser.domain });
             } else {
-              console.error('Erro NATV gerar_teste:', natvRes.status, JSON.stringify(natvUser));
-              const errMsg = JSON.stringify(natvUser || '').toLowerCase();
-              const jaExiste =
-                natvRes.status === 409 ||
-                errMsg.includes('exist') ||
-                errMsg.includes('duplic') ||
-                errMsg.includes('taken') ||
-                errMsg.includes('uso');
-
-              if (jaExiste && clientPhone) {
-                lead.natv_username = clientPhone;
-                await pool.query('UPDATE leads SET natv_username = $1 WHERE id = $2', [
-                  clientPhone,
-                  lead.id,
-                ]);
-                toolResult = `O usuário ${clientPhone} já existe na NATV (o cliente já realizou um teste ou teve conta com este número). Avise com educação que consta que ele já fez o teste grátis anteriormente neste número e pergunte se deseja ativar o plano mensal (R$ 29,90) agora mesmo via Pix.`;
-              } else {
-                toolResult = 'Erro ao gerar teste na API NATV.';
-              }
+              toolResult = 'Erro ao gerar teste na API NATV.';
             }
-          }
-        }
-
-        if (fnName === 'gerar_pix_plano') {
-          const screens = Number(args.screens) || 1;
-          const months = Number(args.months) || 1;
-          const amount = PLAN_PRICES[screens]?.[months];
-
-          if (!amount) {
-            toolResult = `Plano indisponível para ${screens} tela(s) e ${months} mês(es). Para 3 e 4 telas, temos apenas o plano mensal.`;
-          } else if (!reseller.mp_access_token) {
-            toolResult = 'Erro: revendedor sem Mercado Pago configurado. Chame um humano.';
-          } else if (!lead.natv_username) {
-            toolResult = 'Erro: cliente ainda não possui usuário identificado. Peça o usuário ou gere um teste antes.';
-          } else {
-            const mpRes = await fetch('https://api.mercadopago.com/v1/payments', {
-              method: 'POST',
-              headers: {
-                Authorization: `Bearer ${reseller.mp_access_token}`,
-                'Content-Type': 'application/json',
-                'X-Idempotency-Key': `plan-${lead.id}-${Date.now()}`,
-              },
-              body: JSON.stringify({
-                transaction_amount: amount,
-                description: `Plano ${months} mês(es) - ${screens} tela(s) - ${lead.natv_username}`,
-                payment_method_id: 'pix',
-                payer: { email: `${lead.natv_username}@cliente.com` },
-                external_reference: `${lead.id}|${months}|${screens}`,
-                notification_url: `${BASE_URL}/api/webhooks/mp-reseller/${reseller.id}`,
-              }),
-            });
-            const payment = await mpRes.json();
-            const pixCode = payment.point_of_interaction?.transaction_data?.qr_code;
-
-            toolResult = pixCode
-              ? JSON.stringify({ valor: amount, meses: months, telas: screens, pix_copia_e_cola: pixCode })
-              : 'Erro ao gerar Pix no Mercado Pago do revendedor.';
           }
         }
 
         if (fnName === 'chamar_humano') {
-          await pool.query(
-            `UPDATE leads SET needs_human = true, tab = 'suporte' WHERE id = $1`,
-            [lead.id]
-          );
-
-          if (reseller.support_whatsapp) {
-            const digits = String(reseller.support_whatsapp).replace(/\D/g, '');
-            const supportNumber = digits.length <= 11 ? `55${digits}` : digits;
-            const clientPhone = String(lead.phone || '').replace(/@.*$/, '');
-            const originLabel = isSupportBot ? 'José Suporte' : 'José Vendas';
-            const alertMsg = `🚨 *Atendimento Humano Solicitado (${originLabel})*\n\nCliente: ${lead.name || 'Sem nome'}\nNúmero: ${clientPhone}\nÚltima msg: ${text}\n\nA IA foi pausada nessa conversa para você assumir.`;
-            await sendWhatsAppText(instance, supportNumber, alertMsg).catch(() => {});
-          }
-
-          toolResult = 'Atendimento transferido para humano e revendedor notificado no WhatsApp de suporte.';
+          await pool.query(`UPDATE leads SET needs_human = true, tab = 'suporte' WHERE id = $1`, [lead.id]);
+          toolResult = 'Atendimento transferido para humano.';
         }
 
-        messagesPayload.push({
-          role: 'tool',
-          tool_call_id: toolCall.id,
-          content: toolResult,
-        });
+        messagesPayload.push({ role: 'tool', tool_call_id: toolCall.id, content: toolResult });
       }
 
       aiRes = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
         method: 'POST',
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: 'gemini-2.5-flash',
-          temperature: 0.3,
-          messages: messagesPayload,
-          tools,
-        }),
+        headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'gemini-2.5-flash', temperature: 0.3, messages: messagesPayload, tools }),
       });
       aiData = await aiRes.json();
-      if (!aiRes.ok) {
-        console.error('Erro Gemini (2ª chamada):', aiRes.status, JSON.stringify(aiData));
-      }
       msg = aiData.choices?.[0]?.message;
     }
 
     const replyText = msg?.content;
+    console.log('5. [RESPOSTA DA IA GERADA]:', replyText || 'Nenhuma resposta gerada');
+
     if (replyText) {
       await sendWhatsAppText(instance, remoteJid, replyText);
+      console.log('6. [SUCESSO] Mensagem enviada de volta pelo WhatsApp para:', remoteJid);
+
       if (!isVip) {
-        await debitWallet(
-          reseller.id,
-          Number(reseller.cost_per_reply ?? 0.10),
-          'reply',
-          `Resposta IA: ${lead.name || lead.phone}`
-        );
+        await debitWallet(activeReseller.id, Number(activeReseller.cost_per_reply ?? 0.10), 'reply', `Resposta IA: ${lead.name || lead.phone}`);
       }
-      await pool.query(
-        `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`,
-        [lead.id, replyText]
-      );
-      await pool.query(
-        'UPDATE leads SET last_message = $1, last_interaction = now() WHERE id = $2',
-        [replyText, lead.id]
-      );
+      await pool.query(`INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`, [lead.id, replyText]);
+      await pool.query('UPDATE leads SET last_message = $1, last_interaction = now() WHERE id = $2', [replyText, lead.id]);
     }
   } catch (err) {
-    console.error('Erro no webhook do José:', err);
+    console.error('❌ ERRO CRÍTICO NO WEBHOOK DO JOSÉ:', err);
   }
 });
 
@@ -1350,9 +1059,7 @@ app.get('/api/leads', auth, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT id, phone, name, last_message, last_interaction, stage, chosen_app, natv_username, needs_human, needs_human AS ai_paused, tab
-       FROM leads
-       WHERE reseller_id = $1
-       ORDER BY last_interaction DESC`,
+       FROM leads WHERE reseller_id = $1 ORDER BY last_interaction DESC`,
       [req.user.id]
     );
     res.json(result.rows);
@@ -1374,43 +1081,23 @@ app.get('/api/leads/stats', auth, async (req, res) => {
              (NOW() AT TIME ZONE 'America/Sao_Paulo')::date`,
       [req.user.id]
     );
-
     const row = result.rows[0] || {};
     const conversationsToday = Number(row.conversations_today || 0);
     const testsToday = Number(row.tests_today || 0);
     const salesToday = Number(row.sales_today || 0);
-    const conversionRate =
-      conversationsToday > 0
-        ? Number(((salesToday / conversationsToday) * 100).toFixed(1))
-        : 0;
-
-    res.json({
-      conversations_today: conversationsToday,
-      tests_today: testsToday,
-      sales_today: salesToday,
-      conversion_rate: conversionRate,
-    });
+    const conversionRate = conversationsToday > 0 ? Number(((salesToday / conversationsToday) * 100).toFixed(1)) : 0;
+    res.json({ conversations_today: conversationsToday, tests_today: testsToday, sales_today: salesToday, conversion_rate: conversionRate });
   } catch (err) {
-    console.error('Erro /api/leads/stats:', err.message);
-    res.status(500).json({ error: 'Erro ao carregar estatísticas de leads' });
+    res.status(500).json({ error: 'Erro ao carregar estatísticas' });
   }
 });
 
 app.get('/api/leads/:leadId/messages', auth, async (req, res) => {
   try {
-    const leadCheck = await pool.query(
-      'SELECT id FROM leads WHERE id = $1 AND reseller_id = $2',
-      [req.params.leadId, req.user.id]
-    );
+    const leadCheck = await pool.query('SELECT id FROM leads WHERE id = $1 AND reseller_id = $2', [req.params.leadId, req.user.id]);
     if (!leadCheck.rows[0]) return res.status(404).json({ error: 'Conversa não encontrada' });
 
-    const msgs = await pool.query(
-      `SELECT id, sender, content, content AS text, created_at
-       FROM messages
-       WHERE lead_id = $1
-       ORDER BY created_at ASC`,
-      [req.params.leadId]
-    );
+    const msgs = await pool.query('SELECT id, sender, content, content AS text, created_at FROM messages WHERE lead_id = $1 ORDER BY created_at ASC', [req.params.leadId]);
     res.json(msgs.rows);
   } catch {
     res.status(500).json({ error: 'Erro ao carregar mensagens' });
@@ -1422,57 +1109,38 @@ app.post('/api/leads/:leadId/messages', auth, async (req, res) => {
   if (!text?.trim()) return res.status(400).json({ error: 'Digite uma mensagem' });
 
   try {
-    const leadRes = await pool.query(
-      'SELECT * FROM leads WHERE id = $1 AND reseller_id = $2',
-      [req.params.leadId, req.user.id]
-    );
+    const leadRes = await pool.query('SELECT * FROM leads WHERE id = $1 AND reseller_id = $2', [req.params.leadId, req.user.id]);
     const lead = leadRes.rows[0];
     if (!lead) return res.status(404).json({ error: 'Conversa não encontrada' });
 
     let instanceName = lead.instance_name;
     if (!instanceName) {
-      const instRes = await pool.query(
-        `SELECT instance_name FROM whatsapp_instances
-         WHERE reseller_id = $1 AND COALESCE(bot_type, 'sales') = 'sales'
-         LIMIT 1`,
-        [req.user.id]
-      );
+      const instRes = await pool.query(`SELECT instance_name FROM whatsapp_instances WHERE reseller_id = $1 LIMIT 1`, [req.user.id]);
       instanceName = instRes.rows[0]?.instance_name;
     }
     if (!instanceName) return res.status(400).json({ error: 'WhatsApp não conectado' });
 
     await sendWhatsAppText(instanceName, lead.phone, text.trim());
-
-    const saved = await pool.query(
-      `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'human', $2) RETURNING id, sender, content, content AS text, created_at`,
-      [lead.id, text.trim()]
-    );
-    await pool.query(
-      `UPDATE leads SET last_message = $1, last_interaction = now(), needs_human = true WHERE id = $2`,
-      [text.trim(), lead.id]
-    );
-
+    const saved = await pool.query(`INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'human', $2) RETURNING id, sender, content, content AS text, created_at`, [lead.id, text.trim()]);
+    await pool.query(`UPDATE leads SET last_message = $1, last_interaction = now(), needs_human = true WHERE id = $2`, [text.trim(), lead.id]);
     res.json(saved.rows[0]);
   } catch {
-    res.status(500).json({ error: 'Erro ao enviar mensagem no WhatsApp' });
+    res.status(500).json({ error: 'Erro ao enviar mensagem' });
   }
 });
 
 app.post('/api/leads/:leadId/toggle-ai', auth, async (req, res) => {
   const { pause_ai } = req.body;
   try {
-    await pool.query(
-      'UPDATE leads SET needs_human = $1 WHERE id = $2 AND reseller_id = $3',
-      [Boolean(pause_ai), req.params.leadId, req.user.id]
-    );
-    res.json({ success: true, needs_human: Boolean(pause_ai), ai_paused: Boolean(pause_ai) });
+    await pool.query('UPDATE leads SET needs_human = $1 WHERE id = $2 AND reseller_id = $3', [Boolean(pause_ai), req.params.leadId, req.user.id]);
+    res.json({ success: true, needs_human: Boolean(pause_ai) });
   } catch {
     res.status(500).json({ error: 'Erro ao alterar status da IA' });
   }
 });
 
 // ==========================================
-// 8. LISTAR CLIENTES ATIVOS DO PAINEL NATV
+// 8. CLIENTES NATV & FOLLOW-UPS
 // ==========================================
 const natvClientsCache = new Map();
 const natvClientsInFlight = new Map();
@@ -1480,132 +1148,37 @@ const natvClientsInFlight = new Map();
 app.get('/api/natv/clients', auth, async (req, res) => {
   const userId = req.user.id;
   const cached = natvClientsCache.get(userId);
+  if (cached && Date.now() - cached.ts < 65000) return res.json(cached.payload);
 
-  if (cached && Date.now() - cached.ts < 65000) {
-    return res.json(cached.payload);
-  }
-
-  if (natvClientsInFlight.has(userId)) {
-    try {
-      const payload = await natvClientsInFlight.get(userId);
-      return res.json(payload);
-    } catch {
-      if (cached?.payload) return res.json(cached.payload);
-      return res.status(500).json({ error: 'Erro ao aguardar consulta na NATV' });
-    }
-  }
-
-  const fetchPromise = (async () => {
-    const r = await pool.query(
-      'SELECT name, natv_api_key FROM resellers WHERE id = $1',
-      [userId]
-    );
+  try {
+    const r = await pool.query('SELECT name, natv_api_key FROM resellers WHERE id = $1', [userId]);
     const natvKey = r.rows[0]?.natv_api_key;
-    const resellerName = String(r.rows[0]?.name || '').trim().toLowerCase();
-
-    if (!natvKey) {
-      const err = new Error('Chave NATV não configurada');
-      err.status = 400;
-      throw err;
-    }
+    if (!natvKey) return res.status(400).json({ error: 'Chave NATV não configurada' });
 
     const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
     const response = await fetch(`${baseUrl}/report/allusers`, {
       method: 'GET',
-      headers: {
-        Authorization: `Bearer ${natvKey}`,
-        'Content-Type': 'application/json',
-      },
+      headers: { Authorization: `Bearer ${natvKey}`, 'Content-Type': 'application/json' },
     });
+    if (!response.ok) return res.status(400).json({ error: 'Erro ao consultar NATV' });
 
-    const rawText = await response.text();
-    if (!response.ok) {
-      if (cached?.payload) {
-        natvClientsCache.set(userId, { ts: Date.now(), payload: cached.payload, rawList: cached.rawList });
-        return cached.payload;
-      }
-      const err = new Error('Não foi possível consultar os clientes na NATV');
-      err.status = response.status;
-      throw err;
-    }
-
-    const raw = JSON.parse(rawText);
+    const raw = await response.json();
     const list = Array.isArray(raw) ? raw : (raw.data || raw.users || raw.clients || []);
+    const activeClients = list.filter((c) => String(c.t || '').trim().toLowerCase() === 'ativo').map((c, idx) => ({
+      id: String(c.i ?? idx),
+      username: String(c.u ?? 'Cliente'),
+      name: String(c.n || c.u || 'Cliente'),
+      exp_date: c.e ?? null,
+    }));
 
-    const now = Date.now();
-    const activeClients = list
-      .filter((c) => {
-        const tipo = String(c.t || '').trim().toLowerCase();
-        const bloqueado = String(c.b || '').trim().toLowerCase();
-        const dono = String(c.r || '').trim().toLowerCase();
-
-        if (tipo !== 'ativo') return false;
-        if (bloqueado !== 'no' && bloqueado !== '0' && bloqueado !== 'false' && bloqueado !== '') return false;
-        if (resellerName && dono && dono !== resellerName) return false;
-
-        if (c.e) {
-          const expMs = Date.parse(String(c.e).replace(' ', 'T'));
-          if (!Number.isNaN(expMs) && expMs < now) return false;
-        }
-        return true;
-      })
-      .map((c, idx) => ({
-        id: String(c.i ?? idx),
-        username: String(c.u ?? 'Cliente NATV'),
-        name: String(c.n || c.u || 'Cliente NATV'),
-        exp_date: c.e ?? null,
-        plan: c.c ? `${c.c} tela(s)` : 'NATV',
-      }));
-
-    let liveCredits = null;
-    try {
-      const meRes = await fetch(`${baseUrl}/reseller/me`, {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${natvKey}`,
-          'Content-Type': 'application/json',
-        },
-      });
-      if (meRes.ok) {
-        const meData = await meRes.json();
-        if (meData.credits !== undefined) {
-          liveCredits = meData.credits;
-          await pool.query('UPDATE resellers SET natv_credits = $1 WHERE id = $2', [
-            liveCredits,
-            userId,
-          ]);
-        }
-      }
-    } catch (e) {
-      console.error('Erro ao atualizar créditos NATV:', e.message);
-    }
-
-    const payload = {
-      total_active: activeClients.length,
-      clients: activeClients,
-      credits: liveCredits,
-    };
-
-    natvClientsCache.set(userId, { ts: Date.now(), payload, rawList: list });
-    return payload;
-  })();
-
-  natvClientsInFlight.set(userId, fetchPromise);
-
-  try {
-    const payload = await fetchPromise;
-    return res.json(payload);
-  } catch (err) {
-    console.error('Erro /api/natv/clients:', err.message);
-    return res.status(err.status || 500).json({ error: err.message || 'Erro interno ao buscar clientes NATV' });
-  } finally {
-    natvClientsInFlight.delete(userId);
+    const payload = { total_active: activeClients.length, clients: activeClients };
+    natvClientsCache.set(userId, { ts: Date.now(), payload });
+    res.json(payload);
+  } catch {
+    res.status(500).json({ error: 'Erro interno' });
   }
 });
 
-// ==========================================
-// 9. MOTOR DE FOLLOW-UP AUTOMÁTICO
-// ==========================================
 async function initFollowupColumns() {
   try {
     await pool.query(`
@@ -1632,313 +1205,7 @@ async function initFollowupColumns() {
   }
 }
 
-function getBrazilHour() {
-  const hourStr = new Intl.DateTimeFormat('pt-BR', {
-    timeZone: 'America/Sao_Paulo',
-    hour: 'numeric',
-    hour12: false,
-  }).format(new Date());
-  return Number(hourStr);
-}
-
-async function runSalesFollowup() {
-  const hour = getBrazilHour();
-  if (hour < 8 || hour >= 22) return;
-
-  try {
-    const { rows } = await pool.query(`
-      SELECT l.*, r.id AS r_id, r.bot_active, r.wallet_balance, r.natv_api_key, wi.instance_name
-      FROM leads l
-      JOIN resellers r ON r.id = l.reseller_id
-      JOIN whatsapp_instances wi ON wi.reseller_id = r.id
-      WHERE r.bot_active = true
-        AND COALESCE(wi.bot_type, 'sales') = 'sales'
-        AND l.needs_human = false
-        AND COALESCE(l.stage, '') <> 'ATIVO'
-        AND COALESCE(l.followup_step, 0) < 2
-    `);
-
-    const now = Date.now();
-
-    for (const lead of rows) {
-      if (!isVipReseller(lead) && Number(lead.wallet_balance) <= 0) continue;
-
-      const lastTime = new Date(lead.last_interaction || lead.created_at).getTime();
-      const diffMin = (now - lastTime) / 60000;
-      const step = Number(lead.followup_step || 0);
-      const stage = String(lead.stage || '').toUpperCase();
-
-      let msg = null;
-      let nextStep = step;
-
-      if (stage !== 'TESTE' && step === 0 && diffMin >= 45 && diffMin < 1440) {
-        msg = 'Opa! Conseguiu encontrar o aplicativo na loja da sua TV? Se precisar de ajuda pra achar, me avisa aqui que te auxilio 👍';
-        nextStep = 1;
-      } else if (stage === 'TESTE' && step === 0 && diffMin >= 65 && diffMin < 1440) {
-        msg = 'E aí, o que achou da qualidade dos canais e filmes no teste? Quer que eu já libere o plano mensal de R$ 29,90 pra você continuar assistindo? 📺';
-        nextStep = 1;
-      } else if (stage === 'TESTE' && step === 1 && diffMin >= 1440 && diffMin < 4320) {
-        msg = 'Passando só pra avisar que o seu usuário ainda está salvo por aqui! Se quiser ativar hoje, levo 1 minutinho pra liberar o acesso 😉';
-        nextStep = 2;
-      }
-
-      if (msg) {
-        await sendWhatsAppText(lead.instance_name, lead.phone, msg);
-        await pool.query(
-          `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`,
-          [lead.id, msg]
-        );
-        await pool.query(
-          `UPDATE leads SET followup_step = $1, last_followup_at = now(), last_message = $2, last_interaction = now() WHERE id = $3`,
-          [nextStep, msg, lead.id]
-        );
-        await new Promise((r) => setTimeout(r, 2500));
-      }
-    }
-  } catch (err) {
-    console.error('Erro no follow-up de vendas:', err.message);
-  }
-}
-
-async function runRenewalFollowup() {
-  const hour = getBrazilHour();
-  if (hour < 9 || hour >= 21) return;
-
-  try {
-    const resellersRes = await pool.query(`
-      SELECT DISTINCT ON (r.id) r.*, wi.instance_name
-      FROM resellers r
-      JOIN whatsapp_instances wi ON wi.reseller_id = r.id
-      WHERE r.bot_active = true
-        AND r.natv_api_key IS NOT NULL
-      ORDER BY r.id, (CASE WHEN wi.bot_type = 'support' THEN 0 ELSE 1 END) ASC
-    `);
-
-    const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
-
-    for (const reseller of resellersRes.rows) {
-      if (!isVipReseller(reseller) && Number(reseller.wallet_balance) <= 0) continue;
-
-      const response = await fetch(`${baseUrl}/report/allusers`, {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${reseller.natv_api_key}`,
-          'Content-Type': 'application/json',
-        },
-      });
-      if (!response.ok) continue;
-
-      const raw = await response.json();
-      const list = Array.isArray(raw) ? raw : (raw.data || raw.users || raw.clients || []);
-      const resellerName = String(reseller.name || '').trim().toLowerCase();
-
-      const leadsRes = await pool.query(
-        `SELECT * FROM leads WHERE reseller_id = $1 AND natv_username IS NOT NULL AND needs_human = false`,
-        [reseller.id]
-      );
-      const leadByUser = new Map(
-        leadsRes.rows.map((l) => [String(l.natv_username).trim().toLowerCase(), l])
-      );
-
-      const now = Date.now();
-
-      for (const c of list) {
-        const dono = String(c.r || '').trim().toLowerCase();
-        if (resellerName && dono && dono !== resellerName) continue;
-        if (!c.e || !c.u) continue;
-
-        const lead = leadByUser.get(String(c.u).trim().toLowerCase());
-        if (!lead) continue;
-
-        const expMs = Date.parse(String(c.e).replace(' ', 'T'));
-        if (Number.isNaN(expMs)) continue;
-
-        const daysLeft = Math.ceil((expMs - now) / (1000 * 60 * 60 * 24));
-        let stageToSend = null;
-        let msg = null;
-
-        if (daysLeft === 3) {
-          stageToSend = '3d';
-          msg = `Oi! Passando pra lembrar que o seu plano vence em 3 dias (${String(c.e).slice(0, 10)}). Se já quiser deixar renovado pra não ficar sem sinal, é só me chamar aqui que gero o Pix na hora! 📺`;
-        } else if (daysLeft === 0) {
-          stageToSend = '0d';
-          msg = `Olá! Seu plano vence hoje. Quer que eu já envie o Pix para renovar automaticamente e manter seu acesso ativo?`;
-        } else if (daysLeft === -1) {
-          stageToSend = '-1d';
-          msg = `Oi! Vi aqui que o seu acesso venceu ontem. Se quiser reativar agora, é só responder aqui que libero em 1 minutinho pra você 😉`;
-        } else if (daysLeft === -3) {
-          stageToSend = '-3d';
-          msg = `Olá! Notei que seu plano venceu há 3 dias. Se quiser voltar a assistir hoje, seu usuário continua salvo aqui — só me avisar qual plano prefere que já mando o Pix!`;
-        } else if (daysLeft === -7) {
-          stageToSend = '-7d';
-          msg = `Oi! Passando só pra avisar que seu login ainda está guardado por aqui. Quando quiser reativar sua TV, é só dar um oi que libero na hora 👍`;
-        }
-
-        if (!stageToSend) continue;
-
-        if (lead.renewal_last_exp === String(c.e) && lead.renewal_stage === stageToSend) {
-          continue;
-        }
-
-        await sendWhatsAppText(reseller.instance_name, lead.phone, msg);
-        await pool.query(
-          `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`,
-          [lead.id, msg]
-        );
-        await pool.query(
-          `UPDATE leads SET renewal_last_exp = $1, renewal_stage = $2, last_message = $3, last_interaction = now() WHERE id = $4`,
-          [String(c.e), stageToSend, msg, lead.id]
-        );
-        await new Promise((r) => setTimeout(r, 3000));
-      }
-    }
-  } catch (err) {
-    console.error('Erro no follow-up de renovação:', err.message);
-  }
-}
-
 initFollowupColumns();
-setInterval(runSalesFollowup, 5 * 60 * 1000);
-setInterval(runRenewalFollowup, 60 * 60 * 1000);
-
-// ==========================================
-// 10. DISPARO MANUAL: TENTATIVA DE RECUPERAÇÃO
-// ==========================================
-const runningRecoveryJobs = new Set();
-
-const RECOVERY_MESSAGES = [
-  'Oi! Tudo bem? Passando só pra saber se você ainda tem interesse em liberar o acesso aos canais, filmes e séries. Se quiser testar de novo ou ativar hoje, é só me chamar por aqui! 📺',
-  'Olá! Vi que a gente conversou outro dia sobre o streaming e acabou não fechando. Ainda está procurando um aplicativo bom e estável pra sua TV? Posso te ajudar agora mesmo 😉',
-  'Opa, tudo certo? Passando rapidinho pra avisar que nossos planos continuam disponíveis a partir de R$ 29,90/mês com ativação imediata. Se quiser voltar a assistir hoje, só dar um oi aqui!',
-  'Oi! Tudo bem por aí? Caso ainda tenha interesse em ativar o streaming na sua TV ou celular, continuo à disposição por aqui pra liberar rapidinho pra você 👍',
-];
-
-async function generateMessageVariations(baseText) {
-  try {
-    const apiKey = process.env.OPENAI_API_KEY || process.env.GEMINI_API_KEY;
-    if (!apiKey) return [baseText];
-
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                {
-                  text: `Crie 5 variações naturais e amigáveis para WhatsApp da mensagem abaixo, mantendo exatamente a mesma oferta e sentido, mas mudando saudações, palavras e estrutura para evitar bloqueio por spam. Retorne APENAS um JSON válido com um array de 5 strings, sem texto extra.\n\nMensagem original:\n"${baseText}"`,
-                },
-              ],
-            },
-          ],
-          generationConfig: { responseMimeType: 'application/json' },
-        }),
-      }
-    );
-
-    if (!response.ok) return [baseText];
-    const data = await response.json();
-    const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    const parsed = JSON.parse(raw);
-
-    if (Array.isArray(parsed) && parsed.length > 0) {
-      return parsed.map((m) => String(m).trim()).filter(Boolean);
-    }
-    return [baseText];
-  } catch (err) {
-    console.error('Erro ao gerar variações de recuperação:', err.message);
-    return [baseText];
-  }
-}
-
-app.post('/api/followup/recovery', auth, async (req, res) => {
-  try {
-    if (runningRecoveryJobs.has(req.user.id)) {
-      return res.status(409).json({ error: 'Já existe uma tentativa de recuperação em andamento.' });
-    }
-
-    const customMessage = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
-
-    const instRes = await pool.query(
-      `SELECT instance_name FROM whatsapp_instances
-       WHERE reseller_id = $1 AND COALESCE(bot_type, 'sales') = 'sales'
-       LIMIT 1`,
-      [req.user.id]
-    );
-    const instanceName = instRes.rows[0]?.instance_name;
-    if (!instanceName) {
-      return res.status(400).json({ error: 'WhatsApp de vendas não conectado.' });
-    }
-
-    const leadsRes = await pool.query(
-      `SELECT id, phone, name
-       FROM leads
-       WHERE reseller_id = $1
-         AND needs_human = false
-         AND COALESCE(stage, '') <> 'ATIVO'
-         AND last_interaction < NOW() - INTERVAL '24 hours'
-         AND (last_followup_at IS NULL OR last_followup_at < NOW() - INTERVAL '7 days')
-       ORDER BY last_interaction DESC
-       LIMIT 40`,
-      [req.user.id]
-    );
-
-    const targets = leadsRes.rows;
-    if (targets.length === 0) {
-      return res.json({
-        started: false,
-        total_targets: 0,
-        message: 'Nenhum lead elegível para recuperação no momento.',
-      });
-    }
-
-    const messagePool = customMessage
-      ? await generateMessageVariations(customMessage)
-      : RECOVERY_MESSAGES;
-
-    runningRecoveryJobs.add(req.user.id);
-    res.json({
-      started: true,
-      total_targets: targets.length,
-      message: `Recuperação iniciada para ${targets.length} contato(s) com ${messagePool.length} variação(ões) e pausa de 45s a 90s.`,
-    });
-
-    (async () => {
-      try {
-        for (let i = 0; i < targets.length; i++) {
-          const lead = targets[i];
-          const text = messagePool[i % messagePool.length];
-
-          try {
-            await sendWhatsAppText(instanceName, lead.phone, text);
-            await pool.query(
-              `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`,
-              [lead.id, text]
-            );
-            await pool.query(
-              `UPDATE leads SET last_followup_at = now(), last_message = $1, last_interaction = now() WHERE id = $2`,
-              [text, lead.id]
-            );
-          } catch (sendErr) {
-            console.error(`Erro ao enviar recuperação para ${lead.phone}:`, sendErr.message);
-          }
-
-          if (i < targets.length - 1) {
-            const delayMs = (45 + Math.floor(Math.random() * 46)) * 1000;
-            await new Promise((r) => setTimeout(r, delayMs));
-          }
-        }
-      } finally {
-        runningRecoveryJobs.delete(req.user.id);
-      }
-    })();
-  } catch (err) {
-    console.error('Erro /api/followup/recovery:', err);
-    res.status(500).json({ error: 'Erro ao iniciar tentativa de recuperação.' });
-  }
-});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`API do José rodando na porta ${PORT}`));
