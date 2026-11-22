@@ -14,7 +14,7 @@ app.use(express.json());
 app.use('/logos', express.static(path.join(__dirname, 'logos')));
 
 // Rota de saúde para o Easypanel não reiniciar o contêiner
-app.get('/', (req, res) => res.json({ status: 'ok', app: 'API do José v3 (Vendas + Suporte)' }));
+app.get('/', (req, res) => res.json({ status: 'ok', app: 'API do José v3.1 (Vendas + Suporte Gestor)' }));
 
 // Conexão com o PostgreSQL da sua VPS
 const pool = new Pool({
@@ -389,6 +389,13 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
   if (!paymentId || !resellerId) return;
 
   try {
+    // Trava antifraude: impede ativar o mesmo pagamento em dobro
+    const already = await pool.query(
+      'SELECT 1 FROM processed_payments WHERE payment_id = $1',
+      [String(paymentId)]
+    );
+    if (already.rows.length > 0) return;
+
     const resRes = await pool.query('SELECT * FROM resellers WHERE id = $1', [resellerId]);
     const reseller = resRes.rows[0];
     if (!reseller?.mp_access_token || !reseller?.natv_api_key) return;
@@ -424,6 +431,10 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
       const actData = await actRes.json();
 
       if (actRes.ok) {
+        await pool.query(
+          'INSERT INTO processed_payments (payment_id, reseller_id, lead_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+          [String(paymentId), reseller.id, lead.id]
+        );
         await pool.query(`UPDATE leads SET stage = 'ATIVO' WHERE id = $1`, [lead.id]);
 
         if (!isVipReseller(reseller)) {
@@ -534,7 +545,7 @@ FERRAMENTAS:
 - Quando o cliente quiser fechar/comprar um plano, chame \`gerar_pix_plano\` passando \`months\` (1, 3, 6 ou 12) e \`screens\` (1, 2, 3 ou 4; padrão 1) e envie o código Pix Copia e Cola retornado avisando que a ativação é automática após o pagamento.
 - Se for cliente relatando travamento, problema de pagamento, pedir humano ou esgotar as opções de app da TV, chame \`chamar_humano\`.`;
 
-const JOSE_SUPPORT_PROMPT = `Você é o José Suporte, assistente técnico de streaming no WhatsApp.
+const JOSE_SUPPORT_PROMPT = `Você é o José Suporte, assistente técnico e gestor de renovações de streaming no WhatsApp.
 Estilo: calmo, prestativo, paciente e objetivo. Mensagens CURTAS (máx. 3 linhas) e UM passo por vez.
 
 FLUXO DE ATENDIMENTO DE SUPORTE:
@@ -547,8 +558,12 @@ FLUXO DE ATENDIMENTO DE SUPORTE:
 3. FOTOS DE ERRO / APP:
    - Analise a imagem enviada. Se o app pedir pagamento/licença, tranquilize dizendo que NÃO precisa pagar nada ali dentro.
    - Se o app deslogou ou travou na tela inicial, oriente a fechar e abrir novamente ou reinstalar.
-4. QUANDO CHAMAR HUMANO (\`chamar_humano\`):
-   - Apenas se o passo a passo técnico não resolver, se for um canal específico fora do ar para reportar à fonte, se o cliente pedir estorno/alteração manual ou insistir em falar com atendente.
+4. CLIENTE DIZ QUE PAGOU E NÃO ATIVOU:
+   - Peça o comprovante (se ele ainda não mandou) e chame \`verificar_pagamento_e_ativar\` para conferir direto no Mercado Pago.
+   - Se o pagamento for confirmado e ativado pela ferramenta, avise o cliente com alegria que o acesso já está liberado.
+   - Se a ferramenta informar que não encontrou pagamento aprovado no Mercado Pago (ex.: o cliente pagou em outra chave Pix), explique que vai encaminhar o comprovante para confirmação no financeiro e chame \`chamar_humano\`.
+5. QUANDO CHAMAR HUMANO (\`chamar_humano\`):
+   - Apenas se o passo a passo técnico não resolver, se for um canal específico fora do ar para reportar à fonte, se for comprovante fora do Mercado Pago, se o cliente pedir estorno/alteração manual ou insistir em falar com atendente.
 
 PLANOS PARA RENOVAÇÃO:
 - 1 tela: Mensal R$ 29,90 | Trimestral R$ 74,90 | Semestral R$ 149,90 | Anual R$ 279,90
@@ -676,7 +691,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       const description = await analyzeMediaWithGemini(
         base64,
         mimeType,
-        'Descreva de forma objetiva o que aparece nesta imagem enviada por um cliente de streaming/IPTV. Se for tela de TV ou celular, identifique o aplicativo, códigos, MAC, mensagens de erro ou dados visíveis. Se for comprovante Pix, informe valor e status.'
+        'Descreva de forma objetiva o que aparece nesta imagem enviada por um cliente de streaming/IPTV. Se for tela de TV ou celular, identifique o aplicativo, códigos, MAC, mensagens de erro ou dados visíveis. Se for comprovante Pix, informe valor, data/hora, recebedor e status.'
       );
       if (description) {
         text = caption
@@ -789,6 +804,14 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       {
         type: 'function',
         function: {
+          name: 'verificar_pagamento_e_ativar',
+          description: 'Verifica no Mercado Pago do revendedor se existe um pagamento Pix aprovado nas últimas 48h para este cliente e ativa automaticamente na NATV se ainda não tiver sido ativado.',
+          parameters: { type: 'object', properties: {} },
+        },
+      },
+      {
+        type: 'function',
+        function: {
           name: 'gerar_pix_plano',
           description: 'Gera o Pix Copia e Cola na conta Mercado Pago do revendedor para ativar ou renovar o plano do cliente.',
           parameters: {
@@ -895,6 +918,89 @@ app.post('/api/webhooks/evolution', async (req, res) => {
               }
             } catch {
               toolResult = 'Erro temporário ao consultar o painel NATV.';
+            }
+          }
+        }
+
+        if (fnName === 'verificar_pagamento_e_ativar') {
+          if (!reseller.mp_access_token || !reseller.natv_api_key) {
+            toolResult = 'Erro: Mercado Pago ou NATV não configurados. Chame um humano.';
+          } else if (!lead.natv_username) {
+            toolResult = 'Usuário NATV do cliente ainda não identificado. Peça o usuário antes de ativar.';
+          } else {
+            try {
+              const sinceIso = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+              const searchUrl = `https://api.mercadopago.com/v1/payments/search?sort=date_created&criteria=desc&begin_date=${encodeURIComponent(sinceIso)}&status=approved&limit=30`;
+              const mpSearch = await fetch(searchUrl, {
+                headers: { Authorization: `Bearer ${reseller.mp_access_token}` },
+              });
+              const mpData = await mpSearch.json();
+              const results = Array.isArray(mpData.results) ? mpData.results : [];
+
+              const match = results.find((p) =>
+                String(p.external_reference || '').startsWith(`${lead.id}|`)
+              );
+
+              if (!match) {
+                toolResult = 'Nenhum pagamento Pix aprovado encontrado no Mercado Pago para este cliente nas últimas 48h. Se ele mandou comprovante de outra chave Pix, chame humano para conferência manual.';
+              } else {
+                const payId = String(match.id);
+                const already = await pool.query(
+                  'SELECT 1 FROM processed_payments WHERE payment_id = $1',
+                  [payId]
+                );
+
+                if (already.rows.length > 0) {
+                  toolResult = `O pagamento #${payId} já foi processado e ativado anteriormente. Peça para o cliente fechar e abrir o app novamente ou consulte o status na NATV.`;
+                } else {
+                  const [, monthsStr, screensStr] = String(match.external_reference).split('|');
+                  const months = Number(monthsStr) || 1;
+                  const screens = Number(screensStr) || 1;
+
+                  const actRes = await fetch('https://revenda.pixbot.link/user/activation', {
+                    method: 'POST',
+                    headers: {
+                      Authorization: `Bearer ${reseller.natv_api_key}`,
+                      'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                      username: lead.natv_username,
+                      months,
+                      ...(screens > 1 ? { connections: screens } : {}),
+                    }),
+                  });
+                  const actData = await actRes.json();
+
+                  if (actRes.ok) {
+                    await pool.query(
+                      'INSERT INTO processed_payments (payment_id, reseller_id, lead_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+                      [payId, reseller.id, lead.id]
+                    );
+                    await pool.query(`UPDATE leads SET stage = 'ATIVO' WHERE id = $1`, [lead.id]);
+
+                    if (!isVip) {
+                      await debitWallet(
+                        reseller.id,
+                        Number(reseller.cost_per_activation ?? 0.50),
+                        'activation',
+                        `Ativação via Suporte (${months}m / ${screens} tela(s)): ${lead.natv_username}`
+                      );
+                    }
+                    if (actData.owner?.credits !== undefined) {
+                      await pool.query('UPDATE resellers SET natv_credits = $1 WHERE id = $2', [
+                        actData.owner.credits,
+                        reseller.id,
+                      ]);
+                    }
+
+                    toolResult = `Pagamento #${payId} confirmado no Mercado Pago e plano de ${months} mês(es) (${screens} tela(s)) ativado com sucesso na NATV!`;
+                  } else {
+                    toolResult = 'Pagamento aprovado no Mercado Pago, mas houve erro ao ativar na NATV. Chame um humano para liberar manualmente.';
+                  }
+                }
+              }
+            } catch {
+              toolResult = 'Erro temporário ao consultar o Mercado Pago. Chame um humano se persistir.';
             }
           }
         }
@@ -1348,7 +1454,7 @@ app.get('/api/natv/clients', auth, async (req, res) => {
 });
 
 // ==========================================
-// 9. MOTOR DE FOLLOW-UP AUTOMÁTICO (VENDAS + RENOVAÇÃO NATV)
+// 9. MOTOR DE FOLLOW-UP AUTOMÁTICO (VENDAS + RENOVAÇÃO NATV PELO SUPORTE)
 // ==========================================
 async function initFollowupColumns() {
   try {
@@ -1362,9 +1468,17 @@ async function initFollowupColumns() {
     `);
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS support_whatsapp TEXT;`);
     await pool.query(`ALTER TABLE whatsapp_instances ADD COLUMN IF NOT EXISTS bot_type TEXT DEFAULT 'sales';`);
-    console.log('Colunas do banco verificadas com sucesso.');
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS processed_payments (
+        payment_id TEXT PRIMARY KEY,
+        reseller_id UUID,
+        lead_id UUID,
+        created_at TIMESTAMP DEFAULT now()
+      );
+    `);
+    console.log('Colunas e tabelas do banco verificadas com sucesso.');
   } catch (err) {
-    console.error('Erro ao criar colunas:', err.message);
+    console.error('Erro ao criar colunas/tabelas:', err.message);
   }
 }
 
@@ -1441,13 +1555,14 @@ async function runRenewalFollowup() {
   if (hour < 9 || hour >= 21) return;
 
   try {
+    // Prioriza a instância de SUPORTE; se não existir, usa a de VENDAS
     const resellersRes = await pool.query(`
-      SELECT r.*, wi.instance_name
+      SELECT DISTINCT ON (r.id) r.*, wi.instance_name
       FROM resellers r
       JOIN whatsapp_instances wi ON wi.reseller_id = r.id
       WHERE r.bot_active = true
         AND r.natv_api_key IS NOT NULL
-        AND COALESCE(wi.bot_type, 'sales') = 'sales'
+      ORDER BY r.id, (CASE WHEN wi.bot_type = 'support' THEN 0 ELSE 1 END) ASC
     `);
 
     const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
@@ -1502,6 +1617,12 @@ async function runRenewalFollowup() {
         } else if (daysLeft === -1) {
           stageToSend = '-1d';
           msg = `Oi! Vi aqui que o seu acesso venceu ontem. Se quiser reativar agora, é só responder aqui que libero em 1 minutinho pra você 😉`;
+        } else if (daysLeft === -3) {
+          stageToSend = '-3d';
+          msg = `Olá! Notei que seu plano venceu há 3 dias. Se quiser voltar a assistir hoje, seu usuário continua salvo aqui — só me avisar qual plano prefere que já mando o Pix!`;
+        } else if (daysLeft === -7) {
+          stageToSend = '-7d';
+          msg = `Oi! Passando só pra avisar que seu login ainda está guardado por aqui. Quando quiser reativar sua TV, é só dar um oi que libero na hora 👍`;
         }
 
         if (!stageToSend) continue;
