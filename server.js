@@ -1181,11 +1181,11 @@ app.post('/api/webhooks/evolution', async (req, res) => {
           }
         }
 
-        if (fnName === 'gerar_teste') {
+                if (fnName === 'gerar_teste') {
           if (!reseller.natv_api_key) {
             toolResult = 'Erro: revendedor sem chave NATV configurada.';
           } else {
-            const natvRes = await             const clientPhone = String(lead.phone || '')
+            const clientPhone = String(lead.phone || '')
               .replace(/@.*$/, '')
               .replace(/\D/g, '');
 
@@ -1202,12 +1202,6 @@ app.post('/api/webhooks/evolution', async (req, res) => {
               },
               body: JSON.stringify(natvBody),
             });
-            const natvUser = await natvRes.json();
-
-            if (!natvRes.ok) {
-              console.error('Erro NATV gerar_teste:', natvRes.status, JSON.stringify(natvUser));
-            }
-
             const natvUser = await natvRes.json();
 
             if (natvRes.ok) {
@@ -1275,7 +1269,25 @@ app.post('/api/webhooks/evolution', async (req, res) => {
                 maxplayer_status: maxplayerStatus,
               });
             } else {
-              toolResult = 'Erro ao gerar teste na API NATV.';
+              console.error('Erro NATV gerar_teste:', natvRes.status, JSON.stringify(natvUser));
+              const errMsg = JSON.stringify(natvUser || '').toLowerCase();
+              const jaExiste =
+                natvRes.status === 409 ||
+                errMsg.includes('exist') ||
+                errMsg.includes('duplic') ||
+                errMsg.includes('taken') ||
+                errMsg.includes('uso');
+
+              if (jaExiste && clientPhone) {
+                lead.natv_username = clientPhone;
+                await pool.query('UPDATE leads SET natv_username = $1 WHERE id = $2', [
+                  clientPhone,
+                  lead.id,
+                ]);
+                toolResult = `O usuário ${clientPhone} já existe na NATV (o cliente já realizou um teste ou teve conta com este número). Avise com educação que consta que ele já fez o teste grátis anteriormente neste número e pergunte se deseja ativar o plano mensal (R$ 29,90) agora mesmo via Pix.`;
+              } else {
+                toolResult = 'Erro ao gerar teste na API NATV.';
+              }
             }
           }
         }
