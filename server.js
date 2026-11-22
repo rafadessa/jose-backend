@@ -978,6 +978,8 @@ app.post('/api/webhooks/evolution', async (req, res) => {
                       headers: { Authorization: `Bearer ${reseller.natv_api_key}` },
                     });
                     if (onlineRes.ok) {
+                     console.log('NATV ONLINE STATUS:', onlineRes.status, await onlineRes.clone().text());
+
                       const onlineRaw = await onlineRes.json();
                       const onlineList = Array.isArray(onlineRaw)
                         ? onlineRaw
