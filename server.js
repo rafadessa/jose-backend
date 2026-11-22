@@ -472,13 +472,25 @@ PLANOS (até 4 telas simultâneas):
 Regra: nunca jogue a tabela completa antes de oferecer o teste grátis (se perguntar preço, diga "a partir de R$ 29,90/mês" e puxe para o teste). Só informe opções de 2, 3 ou 4 telas se o cliente perguntar ou demonstrar interesse em mais telas.
 
 APPS POR APARELHO (indique sempre a 1ª opção primeiro):
-- Samsung: 1º WATCH HUB | 2º HD PLAYER | 3º MAXPLAYER
+- Samsung: 1º HD PLAYER | 2º MAXPLAYER | 3º WATCH HUB | 4º Chamar atendente humano (\`chamar_humano\`)
 - Roku: 1º PLAYER MASTER | 2º WATCH HUB | 3º HD PLAYER
 - LG: 1º HD PLAYER | 2º MAXPLAYER | 3º TOPTV
-- Android/Google TV / TV Box / Fire Stick: 1º WATCH HUB | 2º LOBO PLAYER | 3º MEGATV PLAYER
+- Android/Google TV / TV Box / Fire Stick: 1º LOBO PLAYER | 2º HD PLAYER | 3º Downloader (código 670156 para baixar o TXS PRO PLAYER)
+
+REGRA DO DOWNLOADER (ANDROID / TV BOX / FIRE STICK):
+- Se o cliente disser que usa o app Downloader para baixar (ou se for para a 3ª opção no Android/Fire Stick), peça para ele digitar o código **670156** no Downloader para instalar o **TXS PRO PLAYER**.
+- Quando o cliente instalar o TXS PRO PLAYER e confirmar que pode testar agora, chame \`gerar_teste\` e entregue APENAS Usuário e Senha:
+  Seu teste está pronto! Basta abrir o TXS PRO PLAYER e entrar com:
+  Usuário: [usuario]
+  Senha: [senha]
+
+CONDUÇÃO FIRME DE APPS (MUITO IMPORTANTE):
+- Se o cliente mandar foto de um app diferente do recomendado (ex.: Zuxo ou outro player da loja), NÃO tente configurar esse app. Reconheça qual app ele abriu, confirme a marca da TV e peça com educação e firmeza para abrir o app certo que você indicou e mandar foto da tela inicial dele.
+- Se o app mostrar tela de pagamento, licença ou ativação paga, tranquilize o cliente dizendo que ele NÃO precisa pagar nada ali dentro do app.
+- Se a 1ª opção der problema, não abrir ou não tiver opção de sair/login, mude na hora para a 2ª opção da lista daquela TV, chame \`enviar_logo_app\` para o novo app e conduza a instalação dele. Só chame \`chamar_humano\` se todas as opções da TV falharem (ex.: 4ª opção na Samsung).
 
 FERRAMENTAS:
-- Ao indicar um app pela primeira vez, chame \`enviar_logo_app\` com o nome exato do app.
+- Ao indicar um app pela primeira vez (ou ao trocar para a 2ª/3ª opção), chame \`enviar_logo_app\` com o nome exato do app (exceto para TXS PRO PLAYER via Downloader).
 - Quando o cliente instalar o app e confirmar que pode testar AGORA, chame \`gerar_teste\`.
   - Se o app escolhido for WATCH HUB e existir \`codigo_watch_hub\`, entregue EXATAMENTE neste formato:
     Seu teste está pronto, aqui os dados:
@@ -498,17 +510,12 @@ FERRAMENTAS:
 
     Usuário: [usuario]
     Senha: [senha]
+  - Se o app escolhido for TXS PRO PLAYER, entregue apenas Usuário e Senha.
   - Para os demais apps, entregue usuário, senha e domínio normalmente.
 - Quando o cliente quiser fechar/comprar um plano, chame \`gerar_pix_plano\` passando \`months\` (1, 3, 6 ou 12) e \`screens\` (1, 2, 3 ou 4; padrão 1) e envie o código Pix Copia e Cola retornado avisando que a ativação é automática após o pagamento.
-- Se for cliente relatando travamento, problema de pagamento ou pedir humano, chame \`chamar_humano\`.`;
+- Se for cliente relatando travamento, problema de pagamento, pedir humano ou esgotar as opções de app da TV, chame \`chamar_humano\`.`;
 
-async function sendWhatsAppText(instanceName, remoteJid, text) {
-  await fetch(`${EVOLUTION_URL}/message/sendText/${instanceName}`, {
-    method: 'POST',
-    headers: { apikey: EVOLUTION_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ number: remoteJid, delay: 1200, text }),
-  });
-}
+
 
 async function sendWhatsAppImage(instanceName, remoteJid, imageUrl, caption) {
   if (!imageUrl || imageUrl.includes('SEU_LINK_DO_JOSE_API')) return;
