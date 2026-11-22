@@ -718,32 +718,42 @@ app.post('/api/webhooks/evolution', async (req, res) => {
 
   try {
     console.log('1. [WEBHOOK] Requisição recebida da Evolution API');
-    const { event, instance, data } = req.body;
     
-    // Aceita tanto messages.upsert quanto qualquer evento de mensagem recebida
-const eventName = event || req.body.type;
-if ((!eventName || !eventName.toLowerCase().includes('message')) || !data || data.key?.fromMe) {
-  console.log('1.1. [WEBHOOK] Ignorado. Evento recebido:', eventName);
-  return;
-}
+    // Flexibilidade total para pegar dados de qualquer versão da Evolution API
+    const body = req.body || {};
+    const event = body.event || body.type;
+    const instance = body.instance;
+    const dataObj = body.data || body;
 
-
-    const remoteJid = data.key?.remoteJid;
-    if (!remoteJid || remoteJid.includes('@g.us')) {
-      console.log('1.2. [WEBHOOK] Ignorado (mensagem de grupo ou JID inválido):', remoteJid);
+    // Se for evento de atualização de contato/chat/conexão, ignora limpidamente
+    if (event && (event.includes('contact') || event.includes('chat') || event.includes('connection') || event.includes('presence'))) {
       return;
     }
 
+    // Extração segura do remetente e da mensagem em qualquer estrutura da Evolution
+    const key = dataObj.key || dataObj.data?.key;
+    const remoteJid = key?.remoteJid || dataObj.remoteJid;
+    const fromMe = key?.fromMe || dataObj.fromMe;
+
+    if (!remoteJid || remoteJid.includes('@g.us') || fromMe) {
+      return;
+    }
+
+    const messageContainer = dataObj.message || dataObj.data?.message || {};
+    
     let text =
-      data.message?.conversation ||
-      data.message?.extendedTextMessage?.text ||
+      messageContainer.conversation ||
+      messageContainer.extendedTextMessage?.text ||
+      dataObj.text ||
       '';
 
-    if (!text && data.message?.audioMessage) {
+    console.log(`2. [MENSAGEM CAPTURADA] De: ${remoteJid} | Texto: ${text || '[Mídia ou outro tipo]'}`);
+
+    if (!text && messageContainer.audioMessage) {
       try {
-        const base64 = await getEvolutionMediaBase64(instance, data);
+        const base64 = await getEvolutionMediaBase64(instance, dataObj);
         if (base64) {
-          const mimeType = (data.message.audioMessage.mimetype || 'audio/ogg').split(';')[0];
+          const mimeType = (messageContainer.audioMessage.mimetype || 'audio/ogg').split(';')[0];
           const transcript = await analyzeMediaWithGemini(
             base64,
             mimeType,
@@ -754,34 +764,15 @@ if ((!eventName || !eventName.toLowerCase().includes('message')) || !data || dat
           }
         }
       } catch (err) {
-        console.error('Erro ao processar áudio no webhook:', err.message);
+        console.error('Erro ao processar áudio:', err.message);
       }
-      if (!text) {
-        text = '[O cliente enviou um áudio, mas não foi possível transcrever. Peça para ele digitar em texto por favor.]';
-      }
-    }
-
-    if (!text && data.message?.imageMessage) {
-      const base64 = await getEvolutionMediaBase64(instance, data);
-      const mimeType = (data.message.imageMessage.mimetype || 'image/jpeg').split(';')[0];
-      const caption = data.message.imageMessage.caption || '';
-      const description = await analyzeMediaWithGemini(
-        base64,
-        mimeType,
-        'Descreva de forma objetiva o que aparece nesta imagem enviada por um cliente de streaming/IPTV. Se for tela de TV ou celular, identifique o aplicativo, códigos, MAC, mensagens de erro ou dados visíveis. Se for comprovante Pix, informe valor, data/hora, recebedor e status.'
-      );
-      if (description) {
-        text = caption
-          ? `${caption}\n[Imagem enviada pelo cliente]: ${description}`
-          : `[Imagem enviada pelo cliente]: ${description}`;
-      } else if (caption) {
-        text = caption;
-      }
+      if (!text) text = '[O cliente enviou um áudio.]';
     }
 
     if (!text) return;
 
-    let pushName = data.pushName || 'Cliente';
+    let pushName = dataObj.pushName || body.pushName || 'Cliente';
+
 
     // 1. Busca o revendedor dono da instância e identifica se é Vendas ou Suporte
     const instRes = await pool.query(
