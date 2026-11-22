@@ -366,13 +366,22 @@ app.get('/api/whatsapp/status', auth, async (req, res) => {
 // ==========================================
 // 4. RECARGA DA CARTEIRA DO JOSÉ (SEU MERCADO PAGO)
 // ==========================================
+
 app.post('/api/wallet/recharge', auth, async (req, res) => {
   const { amount } = req.body;
   if (!amount || amount < 5) {
     return res.status(400).json({ error: 'Valor mínimo de recarga é R$ 5,00' });
   }
+  if (!MP_ACCESS_TOKEN) {
+    return res.status(500).json({ error: 'MERCADO_PAGO_ACCESS_TOKEN não configurado no Easypanel.' });
+  }
 
   try {
+    // Garante um e-mail com domínio válido para o Mercado Pago aceitar
+    const payerEmail = req.user.email?.endsWith('.jose')
+      ? req.user.email.replace(/\.jose$/, '.com')
+      : (req.user.email || 'cliente@josebot.com');
+
     const mpRes = await fetch('https://api.mercadopago.com/v1/payments', {
       method: 'POST',
       headers: {
@@ -382,22 +391,31 @@ app.post('/api/wallet/recharge', auth, async (req, res) => {
       },
       body: JSON.stringify({
         transaction_amount: Number(amount),
-        description: `Recarga Carteira José - ${req.user.email}`,
+        description: `Recarga Carteira José - ${payerEmail}`,
         payment_method_id: 'pix',
-        payer: { email: req.user.email },
+        payer: { email: payerEmail },
         external_reference: req.user.id,
+        notification_url: `${BASE_URL}/api/webhooks/mercadopago`,
       }),
     });
 
     const payment = await mpRes.json();
-    const pixData = payment.point_of_interaction?.transaction_data;
 
+    if (!mpRes.ok) {
+      console.error('❌ [ERRO MERCADO PAGO RECARGA]:', mpRes.status, JSON.stringify(payment));
+      return res.status(400).json({
+        error: payment.message || payment.cause?.[0]?.description || 'Mercado Pago recusou a criação do Pix.',
+      });
+    }
+
+    const pixData = payment.point_of_interaction?.transaction_data;
     res.json({
       payment_id: payment.id,
       pix_copia_e_cola: pixData?.qr_code,
       qr_code_base64: pixData?.qr_code_base64,
     });
-  } catch {
+  } catch (err) {
+    console.error('Erro ao gerar Pix de recarga:', err);
     res.status(500).json({ error: 'Erro ao gerar cobrança Pix' });
   }
 });
