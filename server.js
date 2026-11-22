@@ -1061,7 +1061,7 @@ app.post('/api/leads/:leadId/toggle-ai', auth, async (req, res) => {
 });
 
 // ==========================================
-// 8. LISTAR CLIENTES ATIVOS DO PAINEL NATV (COM FILA ÚNICA + BACKUP ANTI-429)
+// 8. LISTAR CLIENTES ATIVOS DO PAINEL NATV (COM FILA ÚNICA + BACKUP ANTI-429 + CRÉDITOS)
 // ==========================================
 const natvClientsCache = new Map();
 const natvClientsInFlight = new Map();
@@ -1112,7 +1112,6 @@ app.get('/api/natv/clients', auth, async (req, res) => {
     const rawText = await response.text();
     if (!response.ok) {
       console.log('NATV /report/allusers erro:', response.status, rawText.slice(0, 300));
-      // Se tomou 429 ou erro temporário, devolve o último cache válido em vez de zerar o painel
       if (cached?.payload) {
         natvClientsCache.set(userId, { ts: Date.now(), payload: cached.payload });
         return cached.payload;
@@ -1127,7 +1126,30 @@ app.get('/api/natv/clients', auth, async (req, res) => {
 
     const now = Date.now();
     const activeClients = list
-        // Consulta também o saldo atualizado de créditos na NATV
+      .filter((c) => {
+        const tipo = String(c.t || '').trim().toLowerCase();
+        const bloqueado = String(c.b || '').trim().toLowerCase();
+        const dono = String(c.r || '').trim().toLowerCase();
+
+        if (tipo !== 'ativo') return false;
+        if (bloqueado !== 'no' && bloqueado !== '0' && bloqueado !== 'false' && bloqueado !== '') return false;
+        if (resellerName && dono && dono !== resellerName) return false;
+
+        if (c.e) {
+          const expMs = Date.parse(String(c.e).replace(' ', 'T'));
+          if (!Number.isNaN(expMs) && expMs < now) return false;
+        }
+        return true;
+      })
+      .map((c, idx) => ({
+        id: String(c.i ?? idx),
+        username: String(c.u ?? 'Cliente NATV'),
+        name: String(c.n || c.u || 'Cliente NATV'),
+        exp_date: c.e ?? null,
+        plan: c.c ? `${c.c} tela(s)` : 'NATV',
+      }));
+
+    // Consulta também o saldo atualizado de créditos na NATV
     let liveCredits = null;
     try {
       const meRes = await fetch(`${baseUrl}/reseller/me`, {
@@ -1157,34 +1179,6 @@ app.get('/api/natv/clients', auth, async (req, res) => {
       credits: liveCredits,
     };
 
-      .filter((c) => {
-        const tipo = String(c.t || '').trim().toLowerCase();
-        const bloqueado = String(c.b || '').trim().toLowerCase();
-        const dono = String(c.r || '').trim().toLowerCase();
-
-        if (tipo !== 'ativo') return false;
-        if (bloqueado !== 'no' && bloqueado !== '0' && bloqueado !== 'false' && bloqueado !== '') return false;
-        if (resellerName && dono && dono !== resellerName) return false;
-
-        if (c.e) {
-          const expMs = Date.parse(String(c.e).replace(' ', 'T'));
-          if (!Number.isNaN(expMs) && expMs < now) return false;
-        }
-        return true;
-      })
-      .map((c, idx) => ({
-        id: String(c.i ?? idx),
-        username: String(c.u ?? 'Cliente NATV'),
-        name: String(c.n || c.u || 'Cliente NATV'),
-        exp_date: c.e ?? null,
-        plan: c.c ? `${c.c} tela(s)` : 'NATV',
-      }));
-
-    const payload = {
-      total_active: activeClients.length,
-      clients: activeClients,
-    };
-
     natvClientsCache.set(userId, { ts: Date.now(), payload });
     return payload;
   })();
@@ -1201,6 +1195,7 @@ app.get('/api/natv/clients', auth, async (req, res) => {
     natvClientsInFlight.delete(userId);
   }
 });
+
 
 // ==========================================
 // 9. MOTOR DE FOLLOW-UP AUTOMÁTICO (VENDAS + RENOVAÇÃO NATV)
