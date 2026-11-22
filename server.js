@@ -720,10 +720,13 @@ app.post('/api/webhooks/evolution', async (req, res) => {
     console.log('1. [WEBHOOK] Requisição recebida da Evolution API');
     const { event, instance, data } = req.body;
     
-    if (event !== 'messages.upsert' || !data || data.key?.fromMe) {
-      console.log('1.1. [WEBHOOK] Ignorado (evento não é messages.upsert, sem dados ou mensagem própria)');
-      return;
-    }
+    // Aceita tanto messages.upsert quanto qualquer evento de mensagem recebida
+const eventName = event || req.body.type;
+if ((!eventName || !eventName.toLowerCase().includes('message')) || !data || data.key?.fromMe) {
+  console.log('1.1. [WEBHOOK] Ignorado. Evento recebido:', eventName);
+  return;
+}
+
 
     const remoteJid = data.key?.remoteJid;
     if (!remoteJid || remoteJid.includes('@g.us')) {
