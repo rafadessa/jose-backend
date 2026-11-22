@@ -713,12 +713,13 @@ async function analyzeMediaWithGemini(base64, mimeType, promptText) {
   }
 }
 
+// Trava em memória contra webhooks duplicados simultâneos (Race Condition)
+const processedMessages = new Set();
+
 app.post('/api/webhooks/evolution', async (req, res) => {
   res.sendStatus(200);
 
   try {
-    console.log('1. [WEBHOOK] Requisição recebida da Evolution API');
-    
     const body = req.body || {};
     const event = body.event || body.type;
     const instance = body.instance;
@@ -736,8 +737,16 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       return;
     }
 
+    // 1. TRAVA IMEDIATA ANTES DE QUALQUER AWAIT (Bloqueia 100% das duplicidades)
+    const msgId = key?.id || `${remoteJid}:${Date.now()}`;
+    if (processedMessages.has(msgId)) {
+      console.log('⚠️ [DUPLICIDADE BLOQUEADA NA ENTRADA] ID:', msgId);
+      return;
+    }
+    processedMessages.add(msgId);
+    setTimeout(() => processedMessages.delete(msgId), 60000);
+
     const messageContainer = dataObj.message || dataObj.data?.message || {};
-    
     let text =
       messageContainer.conversation ||
       messageContainer.extendedTextMessage?.text ||
@@ -756,9 +765,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
             mimeType,
             'Transcreva exatamente o que o cliente falou neste áudio em português. Retorne apenas a transcrição, sem comentários.'
           );
-          if (transcript) {
-            text = `[Áudio transcrito]: ${transcript}`;
-          }
+          if (transcript) text = `[Áudio transcrito]: ${transcript}`;
         }
       } catch (err) {
         console.error('Erro ao processar áudio:', err.message);
@@ -768,9 +775,9 @@ app.post('/api/webhooks/evolution', async (req, res) => {
 
     if (!text) return;
 
-    let pushName = dataObj.pushName || body.pushName || 'Cliente';
+    const pushName = dataObj.pushName || body.pushName || 'Cliente';
 
-    // 3. Busca o revendedor dono da instância
+    // 2. Busca o revendedor
     const instRes = await pool.query(
       `SELECT r.*, COALESCE(wi.bot_type, 'sales') AS bot_type
        FROM whatsapp_instances wi
@@ -778,40 +785,21 @@ app.post('/api/webhooks/evolution', async (req, res) => {
        WHERE wi.instance_name = $1`,
       [instance]
     );
-    const reseller = instRes.rows[0];
-
-    console.log('3. [BUSCA INSTÂNCIA NO BANCO]:', instance, '| Revendedor encontrado:', reseller ? reseller.name : '❌ NÃO ENCONTRADO');
-
-    if (!reseller) {
-      const fallbackRes = await pool.query(
-        `SELECT r.*, COALESCE(wi.bot_type, 'sales') AS bot_type
-         FROM whatsapp_instances wi
-         JOIN resellers r ON r.id = wi.reseller_id
-         WHERE wi.instance_name ILIKE $1 LIMIT 1`,
-        [`%${instance}%`]
-      );
-      if (fallbackRes.rows[0]) {
-        console.log('3.1. [FALLBACK] Revendedor encontrado por aproximação!');
-      } else {
-        console.log('❌ ABORTADO: Nenhuma instância cadastrada no banco com o nome:', instance);
-        return;
-      }
+    const activeReseller = instRes.rows[0];
+    if (!activeReseller) {
+      console.log('❌ ABORTADO: Instância não encontrada:', instance);
+      return;
     }
-
-    const activeReseller = reseller || (await pool.query(
-      `SELECT r.*, COALESCE(wi.bot_type, 'sales') AS bot_type FROM whatsapp_instances wi JOIN resellers r ON r.id = wi.reseller_id WHERE wi.instance_name ILIKE $1 LIMIT 1`,
-      [`%${instance}%`]
-    )).rows[0];
 
     const isVip = isVipReseller(activeReseller);
     const isSupportBot = activeReseller?.bot_type === 'support';
 
     if (!activeReseller.bot_active || (!isVip && Number(activeReseller.wallet_balance) <= 0)) {
-      console.log('❌ ABORTADO: Bot desativado ou saldo insuficiente para o revendedor.');
+      console.log('❌ ABORTADO: Bot desativado ou sem saldo.');
       return;
     }
 
-    // 4. Busca ou cria o Lead
+    // 3. Busca ou cria Lead
     let leadRes = await pool.query(
       'SELECT * FROM leads WHERE reseller_id = $1 AND phone = $2',
       [activeReseller.id, remoteJid]
@@ -838,91 +826,67 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       [lead.id, text]
     );
 
-    if (lead.needs_human) {
-      console.log('ℹ️ Atendimento pausado para este lead (needs_human = true).');
-      return;
-    }
+    if (lead.needs_human) return;
 
-    // 5. Carrega histórico recente
+    // 4. Carrega histórico e mescla mensagens consecutivas do mesmo remetente (obrigatório na API nativa do Gemini)
     const histRes = await pool.query(
       `SELECT sender, content FROM messages WHERE lead_id = $1 ORDER BY created_at DESC LIMIT 12`,
       [lead.id]
     );
-    const history = histRes.rows.reverse().map((m) => ({
-      role: m.sender === 'client' ? 'user' : 'assistant',
-      content: m.content,
-    }));
+    const rawHistory = histRes.rows.reverse();
+    const contents = [];
 
-    console.log('4. [GEMINI] Enviando mensagens para o Gemini (Endpoint Nativo)...');
+    for (const m of rawHistory) {
+      const role = m.sender === 'client' ? 'user' : 'model';
+      if (contents.length > 0 && contents[contents.length - 1].role === role) {
+        contents[contents.length - 1].parts[0].text += `\n${m.content}`;
+      } else {
+        contents.push({ role, parts: [{ text: m.content }] });
+      }
+    }
+    if (contents.length > 0 && contents[0].role === 'model') {
+      contents.shift();
+    }
 
-    // 6. Chamada ao Google Gemini (Endpoint Nativo /v1beta/models/gemini-2.5-flash:generateContent)
-    const contents = history.map((h) => ({
-      role: h.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: h.content }],
-    }));
-    contents.push({ role: 'user', parts: [{ text: text }] });
-
-    const systemInstruction = {
-      parts: [{ text: isSupportBot ? JOSE_SUPPORT_PROMPT : JOSE_SYSTEM_PROMPT }]
-    };
-
-    let aiRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${OPENAI_API_KEY}`,
+    // 5. Chamada ao Gemini
+    const apiKey = process.env.OPENAI_API_KEY || process.env.GEMINI_API_KEY;
+    const aiRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          systemInstruction,
-          contents,
-          generationConfig: {
-            temperature: 0.3,
+          systemInstruction: {
+            parts: [{ text: isSupportBot ? JOSE_SUPPORT_PROMPT : JOSE_SYSTEM_PROMPT }],
           },
+          contents,
+          generationConfig: { temperature: 0.3 },
         }),
       }
     );
 
-    let aiData = await aiRes.json();
-    let replyText = aiData?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null;
+    const aiData = await aiRes.json();
 
-    if (!replyText) {
-      console.log('⚠️ Aviso: Gemini nativo retornou vazio. Resposta bruta:', JSON.stringify(aiData));
-      const lowerText = text.toLowerCase();
-      if (lowerText.includes('trav') || lowerText.includes('caiu') || lowerText.includes('erro') || lowerText.includes('trava')) {
-        replyText = 'Entendi que está travando. Me informe o seu usuário ou login na NATV para eu consultar o status do plano.';
-      } else {
-        replyText = isSupportBot 
-          ? 'Olá! Como posso ajudar no seu suporte técnico hoje?' 
-          : 'Olá! Sou o José. Como posso te ajudar hoje com os nossos planos de streaming?';
-      }
+    if (!aiRes.ok) {
+      console.error('❌ [ERRO API GEMINI]:', aiRes.status, JSON.stringify(aiData));
+      return;
     }
 
-    console.log('5. [RESPOSTA DA IA GERADA]:', replyText);
+    const replyText = aiData?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+    console.log('5. [RESPOSTA DA IA]:', replyText || 'VAZIA');
 
     if (replyText) {
-      // Trava de segurança para evitar duplicidade de envio idêntico num intervalo curto
-      const lastMsgRes = await pool.query(
-        `SELECT content, created_at FROM messages WHERE lead_id = $1 ORDER BY created_at DESC LIMIT 1`,
-        [lead.id]
-      );
-      const lastMsg = lastMsgRes.rows[0];
-      const nowTime = Date.now();
-      const lastTime = lastMsg ? new Date(lastMsg.created_at).getTime() : 0;
+      await sendWhatsAppText(instance, remoteJid, replyText);
+      console.log('6. [ENVIADO COM SUCESSO]');
 
-      if (lastMsg && lastMsg.content === replyText && (nowTime - lastTime) < 5000) {
-        console.log('⚠️ [DUPLICIDADE BLOQUEADA] Mensagem idêntica enviada há menos de 5 segundos. Ignorando.');
-      } else {
-        await sendWhatsAppText(instance, remoteJid, replyText);
-        console.log('6. [SUCESSO] Mensagem enviada de volta pelo WhatsApp para:', remoteJid);
-
-        if (!isVip) {
-          await debitWallet(activeReseller.id, Number(activeReseller.cost_per_reply ?? 0.10), 'reply', `Resposta IA: ${lead.name || lead.phone}`);
-        }
-        await pool.query(`INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`, [lead.id, replyText]);
-        await pool.query('UPDATE leads SET last_message = $1, last_interaction = now() WHERE id = $2', [replyText, lead.id]);
+      if (!isVip) {
+        await debitWallet(activeReseller.id, Number(activeReseller.cost_per_reply ?? 0.10), 'reply', `Resposta IA: ${lead.name || lead.phone}`);
       }
+      await pool.query(`INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`, [lead.id, replyText]);
+      await pool.query('UPDATE leads SET last_message = $1, last_interaction = now() WHERE id = $2', [replyText, lead.id]);
     }
   } catch (err) {
-    console.error('❌ ERRO CRÍTICO NO WEBHOOK DO JOSÉ:', err);
+    console.error('❌ ERRO CRÍTICO NO WEBHOOK:', err);
   }
 });
 
