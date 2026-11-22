@@ -929,13 +929,24 @@ app.post('/api/webhooks/evolution', async (req, res) => {
           }
         }
 
-        if (fnName === 'chamar_humano') {
+                if (fnName === 'chamar_humano') {
           await pool.query(
             `UPDATE leads SET needs_human = true, tab = 'suporte' WHERE id = $1`,
             [lead.id]
           );
-          toolResult = 'Atendimento transferido para humano.';
+
+          // Envia alerta para o WhatsApp de suporte cadastrado pelo revendedor
+          if (reseller.support_whatsapp) {
+            const digits = String(reseller.support_whatsapp).replace(/\D/g, '');
+            const supportNumber = digits.length <= 11 ? `55${digits}` : digits;
+            const clientPhone = String(lead.phone || '').replace(/@.*$/, '');
+            const alertMsg = `🚨 *Atendimento Humano Solicitado*\n\nCliente: ${lead.name || 'Sem nome'}\nNúmero: ${clientPhone}\nÚltima msg: ${text}\n\nA IA foi pausada nessa conversa para você assumir.`;
+            await sendWhatsAppText(instance, supportNumber, alertMsg).catch(() => {});
+          }
+
+          toolResult = 'Atendimento transferido para humano e revendedor notificado no WhatsApp de suporte.';
         }
+
 
         messagesPayload.push({
           role: 'tool',
