@@ -934,28 +934,79 @@ app.post('/api/webhooks/evolution', async (req, res) => {
           toolResult = `Logo do ${appName} enviado com sucesso.`;
         }
 
-        if (fnName === 'consultar_status_natv') {
-          const targetUser = String(args.username || lead.natv_username || '').trim().toLowerCase();
-          if (!targetUser) {
-            toolResult = 'Usuário não informado. Peça o login/usuário ao cliente.';
-          } else if (!reseller.natv_api_key) {
-            toolResult = 'Erro: chave NATV não configurada.';
-          } else {
-            try {
-              const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
-              const cached = natvClientsCache.get(reseller.id);
-              let list = [];
-              if (cached?.rawList) {
-                list = cached.rawList;
-              } else {
-                const rNatv = await fetch(`${baseUrl}/report/allusers`, {
-                  headers: { Authorization: `Bearer ${reseller.natv_api_key}` },
-                });
-                if (rNatv.ok) {
-                  const raw = await rNatv.json();
-                  list = Array.isArray(raw) ? raw : (raw.data || raw.users || raw.clients || []);
-                }
-              }
+        if (toolName === 'consultar_status_natv') {
+  const busca = String(args.username || lead.natv_username || lead.phone || '')
+    .trim()
+    .toLowerCase();
+
+  if (!busca) {
+    return JSON.stringify({ encontrado: false, erro: 'Login ou telefone não informado.' });
+  }
+
+  try {
+    const natvRes = await fetch('https://revenda.pixbot.link/report/allusers', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${reseller.natv_token}`,
+      },
+      body: JSON.stringify({}),
+    });
+
+    if (!natvRes.ok) {
+      return JSON.stringify({ encontrado: false, erro: 'Falha ao consultar o painel NATV.' });
+    }
+
+    const data = await natvRes.json();
+    const lista = Array.isArray(data) ? data : data.users || data.data || [];
+    const buscaLimpa = busca.replace(/\D/g, '');
+
+    const found = lista.find((u) => {
+      const userLogin = String(u.u || '').trim().toLowerCase();
+      const userLimpo = userLogin.replace(/\D/g, '');
+      return (
+        userLogin === busca ||
+        (buscaLimpa.length >= 8 && userLimpo.endsWith(buscaLimpa.slice(-8)))
+      );
+    });
+
+    if (!found) {
+      return JSON.stringify({
+        encontrado: false,
+        mensagem: 'Usuário não encontrado no painel NATV.',
+      });
+    }
+
+    const ultimoAcesso = found.l || null;
+    const maxTelas = Number(found.c || 1);
+
+    // Detecta se houve acesso nos últimos 15 minutos (fuso Brasília -03:00)
+    let usoRecente = false;
+    if (ultimoAcesso) {
+      const dataAcesso = new Date(ultimoAcesso.replace(' ', 'T') + '-03:00');
+      const diffMinutos = (Date.now() - dataAcesso.getTime()) / 60000;
+      if (!Number.isNaN(diffMinutos) && diffMinutos >= -5 && diffMinutos <= 15) {
+        usoRecente = true;
+      }
+    }
+
+    return JSON.stringify({
+      encontrado: true,
+      usuario: found.u,
+      senha: found.p || null,
+      status: found.t || 'Desconhecido',
+      bloqueado: found.b === 'Yes' || found.b === true,
+      vencimento: found.e || null,
+      max_telas: maxTelas,
+      ultimo_acesso: ultimoAcesso,
+      possivel_tela_ocupada: maxTelas === 1 && usoRecente,
+    });
+  } catch (err) {
+    console.error('Erro consultar_status_natv:', err.message);
+    return JSON.stringify({ encontrado: false, erro: 'Erro interno ao consultar NATV.' });
+  }
+}
+
 
               const found = list.find((c) => String(c.u || '').trim().toLowerCase() === targetUser);
               if (!found) {
