@@ -682,6 +682,22 @@ app.post('/api/webhooks/evolution', async (req, res) => {
     );
     let lead = leadRes.rows[0];
 
+        if (!lead) {
+      const insertLead = await pool.query(
+        `INSERT INTO leads (reseller_id, phone, name, last_message, instance_name)
+         VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+        [reseller.id, remoteJid, pushName, text, instance]
+      );
+      lead = insertLead.rows[0];
+    } else {
+      await pool.query(
+        'UPDATE leads SET last_message = $1, last_interaction = now(), followup_step = 0, instance_name = $2 WHERE id = $3',
+        [text, instance, lead.id]
+      );
+      lead.instance_name = instance;
+    }
+
+    
     if (!lead) {
       const insertLead = await pool.query(
         `INSERT INTO leads (reseller_id, phone, name, last_message)
