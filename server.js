@@ -14,7 +14,7 @@ app.use(express.json());
 app.use('/logos', express.static(path.join(__dirname, 'logos')));
 
 // Rota de saúde para o Easypanel não reiniciar o contêiner
-app.get('/', (req, res) => res.json({ status: 'ok', app: 'API do José v2' }));
+app.get('/', (req, res) => res.json({ status: 'ok', app: 'API do José v3 (Vendas + Suporte)' }));
 
 // Conexão com o PostgreSQL da sua VPS
 const pool = new Pool({
@@ -27,7 +27,6 @@ const EVOLUTION_KEY = process.env.EVOLUTION_API_KEY;
 const MP_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN; // Seu MP (recarga da carteira do José)
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // Chave do Google AI Studio (Gemini)
 
-// Configure BASE_URL no Easypanel ou troque o link abaixo pelo domínio real da sua jose-api
 const BASE_URL = (process.env.BASE_URL || 'https://bot-streaming-jose-api.celuyv.easypanel.host').replace(/\/$/, '');
 
 // Chaves NATV VIP (não exigem saldo na carteira do José e não sofrem débito)
@@ -100,6 +99,7 @@ app.post('/api/auth/login', async (req, res) => {
         watch_hub_code: user.watch_hub_code || '',
         has_maxplayer_token: Boolean(user.maxplayer_token),
         has_mp_token: Boolean(user.mp_access_token),
+        support_whatsapp: user.support_whatsapp || '',
         is_vip: isVipReseller(user),
       },
     });
@@ -108,7 +108,6 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// Login direto usando apenas a Chave de API NATV
 app.post('/api/auth/natv-login', async (req, res) => {
   const { natv_api_key } = req.body;
   if (!natv_api_key) {
@@ -118,7 +117,6 @@ app.post('/api/auth/natv-login', async (req, res) => {
   try {
     const cleanKey = natv_api_key.trim();
 
-    // 1. Valida a chave direto na NATV e puxa nome + créditos
     const response = await fetch('https://revenda.pixbot.link/reseller/me', {
       method: 'GET',
       headers: {
@@ -136,7 +134,6 @@ app.post('/api/auth/natv-login', async (req, res) => {
     const natvName = natvData.username || natvData.name || `revenda_${natvData.id || Date.now()}`;
     const fakeEmail = `${natvName.toLowerCase().replace(/[^a-z0-9]/g, '')}@natv.jose`;
 
-    // 2. Busca se já existe no banco; se não existir, cria automaticamente
     let result = await pool.query('SELECT * FROM resellers WHERE natv_api_key = $1', [cleanKey]);
     let user = result.rows[0];
 
@@ -172,6 +169,7 @@ app.post('/api/auth/natv-login', async (req, res) => {
         watch_hub_code: user.watch_hub_code || '',
         has_maxplayer_token: Boolean(user.maxplayer_token),
         has_mp_token: Boolean(user.mp_access_token),
+        support_whatsapp: user.support_whatsapp || '',
         is_vip: isVipReseller(user),
       },
     });
@@ -182,7 +180,7 @@ app.post('/api/auth/natv-login', async (req, res) => {
 });
 
 // ==========================================
-// 2. INTEGRAÇÕES DO REVENDEDOR (NATV, WATCH HUB, MAXPLAYER, MERCADO PAGO)
+// 2. INTEGRAÇÕES DO REVENDEDOR
 // ==========================================
 app.post('/api/natv/validate', auth, async (req, res) => {
   const { natv_api_key } = req.body;
@@ -265,12 +263,15 @@ app.post('/api/reseller/support-whatsapp', auth, async (req, res) => {
   }
 });
 
-
 // ==========================================
-// 3. CONECTAR WHATSAPP (GERAR QR CODE)
+// 3. CONECTAR WHATSAPP (VENDAS E SUPORTE)
 // ==========================================
 app.post('/api/whatsapp/connect', auth, async (req, res) => {
-  const instanceName = `jose_${req.user.id.slice(0, 8)}`;
+  const botType = req.body?.type === 'support' ? 'support' : 'sales';
+  const instanceName =
+    botType === 'support'
+      ? `jose_sup_${req.user.id.slice(0, 8)}`
+      : `jose_${req.user.id.slice(0, 8)}`;
 
   try {
     await fetch(`${EVOLUTION_URL}/instance/create`, {
@@ -295,14 +296,14 @@ app.post('/api/whatsapp/connect', auth, async (req, res) => {
     const qrBase64 = qrData.base64 || qrData.qrcode?.base64 || null;
 
     await pool.query(
-      `INSERT INTO whatsapp_instances (reseller_id, instance_name, status, qr_code_base64)
-       VALUES ($1, $2, 'qr_pending', $3)
+      `INSERT INTO whatsapp_instances (reseller_id, instance_name, status, qr_code_base64, bot_type)
+       VALUES ($1, $2, 'qr_pending', $3, $4)
        ON CONFLICT (instance_name)
-       DO UPDATE SET status = 'qr_pending', qr_code_base64 = $3, updated_at = now()`,
-      [req.user.id, instanceName, qrBase64]
+       DO UPDATE SET status = 'qr_pending', qr_code_base64 = $3, bot_type = $4, updated_at = now()`,
+      [req.user.id, instanceName, qrBase64, botType]
     );
 
-    res.json({ instanceName, qr_code_base64: qrBase64 });
+    res.json({ instanceName, bot_type: botType, qr_code_base64: qrBase64 });
   } catch {
     res.status(500).json({ error: 'Erro ao gerar QR Code na Evolution API' });
   }
@@ -404,9 +405,8 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
 
       const leadRes = await pool.query('SELECT * FROM leads WHERE id = $1', [leadId]);
       const lead = leadRes.rows[0];
-      if (!lead?.natv_username || lead.stage === 'ATIVO') return;
+      if (!lead?.natv_username) return;
 
-      // Ativa/renova o usuário na NATV (desconta os créditos do revendedor)
       const actBody = {
         username: lead.natv_username,
         months,
@@ -442,11 +442,16 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
           ]);
         }
 
-        const instRes = await pool.query(
-          'SELECT instance_name FROM whatsapp_instances WHERE reseller_id = $1 LIMIT 1',
-          [reseller.id]
-        );
-        const instanceName = instRes.rows[0]?.instance_name;
+        let instanceName = lead.instance_name;
+        if (!instanceName) {
+          const instRes = await pool.query(
+            `SELECT instance_name FROM whatsapp_instances
+             WHERE reseller_id = $1 AND COALESCE(bot_type, 'sales') = 'sales'
+             LIMIT 1`,
+            [reseller.id]
+          );
+          instanceName = instRes.rows[0]?.instance_name;
+        }
         if (instanceName) {
           await sendWhatsAppText(
             instanceName,
@@ -462,7 +467,7 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
 });
 
 // ==========================================
-// 6. MOTOR DO JOSÉ (GEMINI AI + LOGOS + ÁUDIO/FOTO + CARTEIRA + NATV + MAXPLAYER + PIX)
+// 6. MOTOR DO JOSÉ (VENDAS + SUPORTE + ÁUDIO/FOTO + NATV + MAXPLAYER + PIX)
 // ==========================================
 const APP_LOGOS = {
   'WATCH HUB': `${BASE_URL}/logos/watch-hub.png`,
@@ -529,7 +534,34 @@ FERRAMENTAS:
 - Quando o cliente quiser fechar/comprar um plano, chame \`gerar_pix_plano\` passando \`months\` (1, 3, 6 ou 12) e \`screens\` (1, 2, 3 ou 4; padrão 1) e envie o código Pix Copia e Cola retornado avisando que a ativação é automática após o pagamento.
 - Se for cliente relatando travamento, problema de pagamento, pedir humano ou esgotar as opções de app da TV, chame \`chamar_humano\`.`;
 
+const JOSE_SUPPORT_PROMPT = `Você é o José Suporte, assistente técnico de streaming no WhatsApp.
+Estilo: calmo, prestativo, paciente e objetivo. Mensagens CURTAS (máx. 3 linhas) e UM passo por vez.
 
+FLUXO DE ATENDIMENTO DE SUPORTE:
+1. PRIMEIRO PASSO (VERIFICAÇÃO): Se o cliente disser que caiu, não entra, deu erro de login ou está sem sinal, peça o usuário dele (se ainda não souber) e chame \`consultar_status_natv\` para checar se o plano está ativo, bloqueado ou vencido.
+   - Se estiver VENCIDO: avise a data de vencimento com educação e ofereça renovar na hora via Pix (usando \`gerar_pix_plano\`).
+2. TRAVAMENTO / TELA PRETA / CARREGANDO (com plano ativo):
+   - Passo 1: Peça para tirar a TV/TV Box e o roteador da tomada por 2 minutos, ligar de novo e testar.
+   - Passo 2: Pergunte se está travando em todos os canais ou apenas em um canal específico.
+   - Passo 3: Se continuar em todos, peça para testar no 4G do celular (para ver se é bloqueio da operadora de internet) ou mandar foto da tela de erro.
+3. FOTOS DE ERRO / APP:
+   - Analise a imagem enviada. Se o app pedir pagamento/licença, tranquilize dizendo que NÃO precisa pagar nada ali dentro.
+   - Se o app deslogou ou travou na tela inicial, oriente a fechar e abrir novamente ou reinstalar.
+4. QUANDO CHAMAR HUMANO (\`chamar_humano\`):
+   - Apenas se o passo a passo técnico não resolver, se for um canal específico fora do ar para reportar à fonte, se o cliente pedir estorno/alteração manual ou insistir em falar com atendente.
+
+PLANOS PARA RENOVAÇÃO:
+- 1 tela: Mensal R$ 29,90 | Trimestral R$ 74,90 | Semestral R$ 149,90 | Anual R$ 279,90
+- 2 telas: Mensal R$ 50,00 | Trimestral R$ 149,90 | Semestral R$ 299,90 | Anual R$ 499,90
+- 3 telas: Mensal R$ 70,00 | 4 telas: Mensal R$ 90,00`;
+
+async function sendWhatsAppText(instanceName, remoteJid, text) {
+  await fetch(`${EVOLUTION_URL}/message/sendText/${instanceName}`, {
+    method: 'POST',
+    headers: { apikey: EVOLUTION_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ number: remoteJid, delay: 1200, text }),
+  });
+}
 
 async function sendWhatsAppImage(instanceName, remoteJid, imageUrl, caption) {
   if (!imageUrl || imageUrl.includes('SEU_LINK_DO_JOSE_API')) return;
@@ -624,7 +656,6 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       data.message?.extendedTextMessage?.text ||
       '';
 
-    // Se o cliente mandou ÁUDIO, transcreve com o Gemini
     if (!text && data.message?.audioMessage) {
       const base64 = await getEvolutionMediaBase64(instance, data);
       const mimeType = (data.message.audioMessage.mimetype || 'audio/ogg').split(';')[0];
@@ -638,7 +669,6 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       }
     }
 
-    // Se o cliente mandou FOTO, analisa com o Gemini (tela de TV, app, erro ou comprovante)
     if (!text && data.message?.imageMessage) {
       const base64 = await getEvolutionMediaBase64(instance, data);
       const mimeType = (data.message.imageMessage.mimetype || 'image/jpeg').split(';')[0];
@@ -661,15 +691,17 @@ app.post('/api/webhooks/evolution', async (req, res) => {
 
     const pushName = data.pushName || 'Cliente';
 
-    // 1. Busca o revendedor dono da instância
+    // 1. Busca o revendedor dono da instância e identifica se é Vendas ou Suporte
     const instRes = await pool.query(
-      `SELECT r.* FROM whatsapp_instances wi
+      `SELECT r.*, COALESCE(wi.bot_type, 'sales') AS bot_type
+       FROM whatsapp_instances wi
        JOIN resellers r ON r.id = wi.reseller_id
        WHERE wi.instance_name = $1`,
       [instance]
     );
     const reseller = instRes.rows[0];
     const isVip = isVipReseller(reseller);
+    const isSupportBot = reseller?.bot_type === 'support';
 
     if (!reseller || !reseller.bot_active || (!isVip && Number(reseller.wallet_balance) <= 0)) {
       return;
@@ -682,7 +714,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
     );
     let lead = leadRes.rows[0];
 
-        if (!lead) {
+    if (!lead) {
       const insertLead = await pool.query(
         `INSERT INTO leads (reseller_id, phone, name, last_message, instance_name)
          VALUES ($1, $2, $3, $4, $5) RETURNING *`,
@@ -695,21 +727,6 @@ app.post('/api/webhooks/evolution', async (req, res) => {
         [text, instance, lead.id]
       );
       lead.instance_name = instance;
-    }
-
-    
-    if (!lead) {
-      const insertLead = await pool.query(
-        `INSERT INTO leads (reseller_id, phone, name, last_message)
-         VALUES ($1, $2, $3, $4) RETURNING *`,
-        [reseller.id, remoteJid, pushName, text]
-      );
-      lead = insertLead.rows[0];
-    } else {
-      await pool.query(
-        'UPDATE leads SET last_message = $1, last_interaction = now(), followup_step = 0 WHERE id = $2',
-        [text, lead.id]
-      );
     }
 
     await pool.query(
@@ -758,8 +775,22 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       {
         type: 'function',
         function: {
+          name: 'consultar_status_natv',
+          description: 'Consulta na NATV se o usuário do cliente está ativo, vencido ou bloqueado e qual a data de vencimento.',
+          parameters: {
+            type: 'object',
+            properties: {
+              username: { type: 'string', description: 'Nome de usuário do cliente na NATV.' },
+            },
+            required: ['username'],
+          },
+        },
+      },
+      {
+        type: 'function',
+        function: {
           name: 'gerar_pix_plano',
-          description: 'Gera o Pix Copia e Cola na conta Mercado Pago do revendedor para ativar o plano do cliente.',
+          description: 'Gera o Pix Copia e Cola na conta Mercado Pago do revendedor para ativar ou renovar o plano do cliente.',
           parameters: {
             type: 'object',
             properties: {
@@ -774,14 +805,14 @@ app.post('/api/webhooks/evolution', async (req, res) => {
         type: 'function',
         function: {
           name: 'chamar_humano',
-          description: 'Pausa a IA e alerta o revendedor para assumir o atendimento.',
+          description: 'Pausa a IA e alerta o revendedor no WhatsApp de suporte para assumir o atendimento.',
           parameters: { type: 'object', properties: {} },
         },
       },
     ];
 
     const messagesPayload = [
-      { role: 'system', content: JOSE_SYSTEM_PROMPT },
+      { role: 'system', content: isSupportBot ? JOSE_SUPPORT_PROMPT : JOSE_SYSTEM_PROMPT },
       ...history,
     ];
 
@@ -822,6 +853,50 @@ app.post('/api/webhooks/evolution', async (req, res) => {
             `Procura por esse ícone na loja: ${appName} 📺`
           );
           toolResult = `Logo do ${appName} enviado com sucesso.`;
+        }
+
+        if (fnName === 'consultar_status_natv') {
+          const targetUser = String(args.username || lead.natv_username || '').trim().toLowerCase();
+          if (!targetUser) {
+            toolResult = 'Usuário não informado. Peça o login/usuário ao cliente.';
+          } else if (!reseller.natv_api_key) {
+            toolResult = 'Erro: chave NATV não configurada.';
+          } else {
+            try {
+              const cached = natvClientsCache.get(reseller.id);
+              let list = [];
+              if (cached?.rawList) {
+                list = cached.rawList;
+              } else {
+                const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
+                const rNatv = await fetch(`${baseUrl}/report/allusers`, {
+                  headers: { Authorization: `Bearer ${reseller.natv_api_key}` },
+                });
+                if (rNatv.ok) {
+                  const raw = await rNatv.json();
+                  list = Array.isArray(raw) ? raw : (raw.data || raw.users || raw.clients || []);
+                }
+              }
+              const found = list.find((c) => String(c.u || '').trim().toLowerCase() === targetUser);
+              if (!found) {
+                toolResult = `Usuário "${targetUser}" não encontrado no painel NATV.`;
+              } else {
+                lead.natv_username = found.u;
+                await pool.query('UPDATE leads SET natv_username = $1 WHERE id = $2', [found.u, lead.id]);
+                const expMs = found.e ? Date.parse(String(found.e).replace(' ', 'T')) : NaN;
+                const expired = !Number.isNaN(expMs) && expMs < Date.now();
+                toolResult = JSON.stringify({
+                  usuario: found.u,
+                  status: expired ? 'VENCIDO' : String(found.t || 'ativo').toUpperCase(),
+                  bloqueado: found.b || 'no',
+                  vencimento: found.e || 'Não informado',
+                  telas: found.c || 1,
+                });
+              }
+            } catch {
+              toolResult = 'Erro temporário ao consultar o painel NATV.';
+            }
+          }
         }
 
         if (fnName === 'gerar_teste') {
@@ -918,7 +993,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
           } else if (!reseller.mp_access_token) {
             toolResult = 'Erro: revendedor sem Mercado Pago configurado. Chame um humano.';
           } else if (!lead.natv_username) {
-            toolResult = 'Erro: cliente ainda não possui usuário de teste gerado.';
+            toolResult = 'Erro: cliente ainda não possui usuário identificado. Peça o usuário ou gere um teste antes.';
           } else {
             const mpRes = await fetch('https://api.mercadopago.com/v1/payments', {
               method: 'POST',
@@ -945,24 +1020,23 @@ app.post('/api/webhooks/evolution', async (req, res) => {
           }
         }
 
-                if (fnName === 'chamar_humano') {
+        if (fnName === 'chamar_humano') {
           await pool.query(
             `UPDATE leads SET needs_human = true, tab = 'suporte' WHERE id = $1`,
             [lead.id]
           );
 
-          // Envia alerta para o WhatsApp de suporte cadastrado pelo revendedor
           if (reseller.support_whatsapp) {
             const digits = String(reseller.support_whatsapp).replace(/\D/g, '');
             const supportNumber = digits.length <= 11 ? `55${digits}` : digits;
             const clientPhone = String(lead.phone || '').replace(/@.*$/, '');
-            const alertMsg = `🚨 *Atendimento Humano Solicitado*\n\nCliente: ${lead.name || 'Sem nome'}\nNúmero: ${clientPhone}\nÚltima msg: ${text}\n\nA IA foi pausada nessa conversa para você assumir.`;
+            const originLabel = isSupportBot ? 'José Suporte' : 'José Vendas';
+            const alertMsg = `🚨 *Atendimento Humano Solicitado (${originLabel})*\n\nCliente: ${lead.name || 'Sem nome'}\nNúmero: ${clientPhone}\nÚltima msg: ${text}\n\nA IA foi pausada nessa conversa para você assumir.`;
             await sendWhatsAppText(instance, supportNumber, alertMsg).catch(() => {});
           }
 
           toolResult = 'Atendimento transferido para humano e revendedor notificado no WhatsApp de suporte.';
         }
-
 
         messagesPayload.push({
           role: 'tool',
@@ -971,7 +1045,6 @@ app.post('/api/webhooks/evolution', async (req, res) => {
         });
       }
 
-      // Segunda chamada para a IA montar a resposta final ao cliente
       aiRes = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
         method: 'POST',
         headers: {
@@ -1014,10 +1087,8 @@ app.post('/api/webhooks/evolution', async (req, res) => {
 });
 
 // ==========================================
-// 7. CHAT AO VIVO NO PAINEL (VER E RESPONDER WHATSAPP)
+// 7. CHAT AO VIVO E ESTATÍSTICAS DE LEADS
 // ==========================================
-
-// 1. Lista todas as conversas (leads) do revendedor
 app.get('/api/leads', auth, async (req, res) => {
   try {
     const result = await pool.query(
@@ -1033,7 +1104,6 @@ app.get('/api/leads', auth, async (req, res) => {
   }
 });
 
-// 1.1 Estatísticas diárias de leads (Conversas hoje, Testes, Vendas e Conversão)
 app.get('/api/leads/stats', auth, async (req, res) => {
   try {
     const result = await pool.query(
@@ -1069,8 +1139,6 @@ app.get('/api/leads/stats', auth, async (req, res) => {
   }
 });
 
-
-// 2. Carrega o histórico de mensagens de um cliente específico
 app.get('/api/leads/:leadId/messages', auth, async (req, res) => {
   try {
     const leadCheck = await pool.query(
@@ -1092,7 +1160,6 @@ app.get('/api/leads/:leadId/messages', auth, async (req, res) => {
   }
 });
 
-// 3. Envia uma resposta manual do revendedor direto pro WhatsApp do cliente
 app.post('/api/leads/:leadId/messages', auth, async (req, res) => {
   const { text } = req.body;
   if (!text?.trim()) return res.status(400).json({ error: 'Digite uma mensagem' });
@@ -1105,17 +1172,20 @@ app.post('/api/leads/:leadId/messages', auth, async (req, res) => {
     const lead = leadRes.rows[0];
     if (!lead) return res.status(404).json({ error: 'Conversa não encontrada' });
 
-    const instRes = await pool.query(
-      'SELECT instance_name FROM whatsapp_instances WHERE reseller_id = $1 LIMIT 1',
-      [req.user.id]
-    );
-    const instanceName = instRes.rows[0]?.instance_name;
+    let instanceName = lead.instance_name;
+    if (!instanceName) {
+      const instRes = await pool.query(
+        `SELECT instance_name FROM whatsapp_instances
+         WHERE reseller_id = $1 AND COALESCE(bot_type, 'sales') = 'sales'
+         LIMIT 1`,
+        [req.user.id]
+      );
+      instanceName = instRes.rows[0]?.instance_name;
+    }
     if (!instanceName) return res.status(400).json({ error: 'WhatsApp não conectado' });
 
-    // Envia no WhatsApp via Evolution API
     await sendWhatsAppText(instanceName, lead.phone, text.trim());
 
-    // Salva no banco como mensagem humana e pausa a IA nessa conversa para não atravessar
     const saved = await pool.query(
       `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'human', $2) RETURNING *`,
       [lead.id, text.trim()]
@@ -1131,7 +1201,6 @@ app.post('/api/leads/:leadId/messages', auth, async (req, res) => {
   }
 });
 
-// 4. Pausar ou reativar a IA do José em uma conversa específica
 app.post('/api/leads/:leadId/toggle-ai', auth, async (req, res) => {
   const { pause_ai } = req.body;
   try {
@@ -1146,7 +1215,7 @@ app.post('/api/leads/:leadId/toggle-ai', auth, async (req, res) => {
 });
 
 // ==========================================
-// 8. LISTAR CLIENTES ATIVOS DO PAINEL NATV (COM FILA ÚNICA + BACKUP ANTI-429 + CRÉDITOS)
+// 8. LISTAR CLIENTES ATIVOS DO PAINEL NATV (FILA ÚNICA + BACKUP ANTI-429 + CRÉDITOS)
 // ==========================================
 const natvClientsCache = new Map();
 const natvClientsInFlight = new Map();
@@ -1155,12 +1224,10 @@ app.get('/api/natv/clients', auth, async (req, res) => {
   const userId = req.user.id;
   const cached = natvClientsCache.get(userId);
 
-  // 1. Se o cache tem menos de 65s, devolve direto sem chamar a NATV
   if (cached && Date.now() - cached.ts < 65000) {
     return res.json(cached.payload);
   }
 
-  // 2. Se já existe uma consulta rodando para este revendedor, aguarda a mesma
   if (natvClientsInFlight.has(userId)) {
     try {
       const payload = await natvClientsInFlight.get(userId);
@@ -1198,7 +1265,7 @@ app.get('/api/natv/clients', auth, async (req, res) => {
     if (!response.ok) {
       console.log('NATV /report/allusers erro:', response.status, rawText.slice(0, 300));
       if (cached?.payload) {
-        natvClientsCache.set(userId, { ts: Date.now(), payload: cached.payload });
+        natvClientsCache.set(userId, { ts: Date.now(), payload: cached.payload, rawList: cached.rawList });
         return cached.payload;
       }
       const err = new Error('Não foi possível consultar os clientes na NATV');
@@ -1234,7 +1301,6 @@ app.get('/api/natv/clients', auth, async (req, res) => {
         plan: c.c ? `${c.c} tela(s)` : 'NATV',
       }));
 
-    // Consulta também o saldo atualizado de créditos na NATV
     let liveCredits = null;
     try {
       const meRes = await fetch(`${baseUrl}/reseller/me`, {
@@ -1264,7 +1330,7 @@ app.get('/api/natv/clients', auth, async (req, res) => {
       credits: liveCredits,
     };
 
-    natvClientsCache.set(userId, { ts: Date.now(), payload });
+    natvClientsCache.set(userId, { ts: Date.now(), payload, rawList: list });
     return payload;
   })();
 
@@ -1281,28 +1347,25 @@ app.get('/api/natv/clients', auth, async (req, res) => {
   }
 });
 
-
 // ==========================================
 // 9. MOTOR DE FOLLOW-UP AUTOMÁTICO (VENDAS + RENOVAÇÃO NATV)
 // ==========================================
 async function initFollowupColumns() {
   try {
-    await pool.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS instance_name TEXT;`);
-
-    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS support_whatsapp TEXT;`);
     await pool.query(`
       ALTER TABLE leads
       ADD COLUMN IF NOT EXISTS followup_step INTEGER DEFAULT 0,
       ADD COLUMN IF NOT EXISTS last_followup_at TIMESTAMP,
       ADD COLUMN IF NOT EXISTS renewal_last_exp TEXT,
-      ADD COLUMN IF NOT EXISTS renewal_stage TEXT;
+      ADD COLUMN IF NOT EXISTS renewal_stage TEXT,
+      ADD COLUMN IF NOT EXISTS instance_name TEXT;
     `);
-    console.log('Colunas de follow-up verificadas com sucesso.');
+    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS support_whatsapp TEXT;`);
+    await pool.query(`ALTER TABLE whatsapp_instances ADD COLUMN IF NOT EXISTS bot_type TEXT DEFAULT 'sales';`);
+    console.log('Colunas do banco verificadas com sucesso.');
   } catch (err) {
-    console.error('Erro ao criar colunas de follow-up:', err.message);
+    console.error('Erro ao criar colunas:', err.message);
   }
-  
-
 }
 
 function getBrazilHour() {
@@ -1314,10 +1377,9 @@ function getBrazilHour() {
   return Number(hourStr);
 }
 
-// 9.1 FOLLOW-UP DE VENDAS (Pré-teste 45m | Pós-teste 65m | Recuperação 24h)
 async function runSalesFollowup() {
   const hour = getBrazilHour();
-  if (hour < 8 || hour >= 22) return; // Só envia entre 08h e 22h (horário de Brasília)
+  if (hour < 8 || hour >= 22) return;
 
   try {
     const { rows } = await pool.query(`
@@ -1326,6 +1388,7 @@ async function runSalesFollowup() {
       JOIN resellers r ON r.id = l.reseller_id
       JOIN whatsapp_instances wi ON wi.reseller_id = r.id
       WHERE r.bot_active = true
+        AND COALESCE(wi.bot_type, 'sales') = 'sales'
         AND l.needs_human = false
         AND COALESCE(l.stage, '') <> 'ATIVO'
         AND COALESCE(l.followup_step, 0) < 2
@@ -1344,18 +1407,13 @@ async function runSalesFollowup() {
       let msg = null;
       let nextStep = step;
 
-      // Caso 1: Abandonou antes de gerar o teste (45 min sem resposta)
       if (stage !== 'TESTE' && step === 0 && diffMin >= 45 && diffMin < 1440) {
         msg = 'Opa! Conseguiu encontrar o aplicativo na loja da sua TV? Se precisar de ajuda pra achar, me avisa aqui que te auxilio 👍';
         nextStep = 1;
-      }
-      // Caso 2: Acabou o teste grátis de 1h (65 min após o teste)
-      else if (stage === 'TESTE' && step === 0 && diffMin >= 65 && diffMin < 1440) {
+      } else if (stage === 'TESTE' && step === 0 && diffMin >= 65 && diffMin < 1440) {
         msg = 'E aí, o que achou da qualidade dos canais e filmes no teste? Quer que eu já libere o plano mensal de R$ 29,90 pra você continuar assistindo? 📺';
         nextStep = 1;
-      }
-      // Caso 3: Recuperação 24h depois do teste
-      else if (stage === 'TESTE' && step === 1 && diffMin >= 1440 && diffMin < 4320) {
+      } else if (stage === 'TESTE' && step === 1 && diffMin >= 1440 && diffMin < 4320) {
         msg = 'Passando só pra avisar que o seu usuário ainda está salvo por aqui! Se quiser ativar hoje, levo 1 minutinho pra liberar o acesso 😉';
         nextStep = 2;
       }
@@ -1370,7 +1428,6 @@ async function runSalesFollowup() {
           `UPDATE leads SET followup_step = $1, last_followup_at = now(), last_message = $2, last_interaction = now() WHERE id = $3`,
           [nextStep, msg, lead.id]
         );
-        // Pequena pausa entre envios para evitar bloqueio no WhatsApp
         await new Promise((r) => setTimeout(r, 2500));
       }
     }
@@ -1379,17 +1436,18 @@ async function runSalesFollowup() {
   }
 }
 
-// 9.2 FOLLOW-UP DE RENOVAÇÃO (3 dias antes | No dia | 1 dia após vencer)
 async function runRenewalFollowup() {
   const hour = getBrazilHour();
-  if (hour < 9 || hour >= 21) return; // Só envia entre 09h e 21h
+  if (hour < 9 || hour >= 21) return;
 
   try {
     const resellersRes = await pool.query(`
       SELECT r.*, wi.instance_name
       FROM resellers r
       JOIN whatsapp_instances wi ON wi.reseller_id = r.id
-      WHERE r.bot_active = true AND r.natv_api_key IS NOT NULL
+      WHERE r.bot_active = true
+        AND r.natv_api_key IS NOT NULL
+        AND COALESCE(wi.bot_type, 'sales') = 'sales'
     `);
 
     const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
@@ -1410,7 +1468,6 @@ async function runRenewalFollowup() {
       const list = Array.isArray(raw) ? raw : (raw.data || raw.users || raw.clients || []);
       const resellerName = String(reseller.name || '').trim().toLowerCase();
 
-      // Busca leads com natv_username vinculado a este revendedor
       const leadsRes = await pool.query(
         `SELECT * FROM leads WHERE reseller_id = $1 AND natv_username IS NOT NULL AND needs_human = false`,
         [reseller.id]
@@ -1449,7 +1506,6 @@ async function runRenewalFollowup() {
 
         if (!stageToSend) continue;
 
-        // Evita reenviar o mesmo aviso para a mesma data de vencimento
         if (lead.renewal_last_exp === String(c.e) && lead.renewal_stage === stageToSend) {
           continue;
         }
@@ -1471,10 +1527,9 @@ async function runRenewalFollowup() {
   }
 }
 
-// Inicia as colunas e agenda os disparos automáticos
 initFollowupColumns();
-setInterval(runSalesFollowup, 5 * 60 * 1000);     // Vendas: checa a cada 5 minutos
-setInterval(runRenewalFollowup, 60 * 60 * 1000);  // Renovação: checa a cada 1 hora
+setInterval(runSalesFollowup, 5 * 60 * 1000);
+setInterval(runRenewalFollowup, 60 * 60 * 1000);
 
 // ==========================================
 // 10. DISPARO MANUAL: TENTATIVA DE RECUPERAÇÃO (ANTI-BLOQUEIO COM IA)
@@ -1537,12 +1592,14 @@ app.post('/api/followup/recovery', auth, async (req, res) => {
     const customMessage = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
 
     const instRes = await pool.query(
-      'SELECT instance_name FROM whatsapp_instances WHERE reseller_id = $1 LIMIT 1',
+      `SELECT instance_name FROM whatsapp_instances
+       WHERE reseller_id = $1 AND COALESCE(bot_type, 'sales') = 'sales'
+       LIMIT 1`,
       [req.user.id]
     );
     const instanceName = instRes.rows[0]?.instance_name;
     if (!instanceName) {
-      return res.status(400).json({ error: 'WhatsApp não conectado.' });
+      return res.status(400).json({ error: 'WhatsApp de vendas não conectado.' });
     }
 
     const leadsRes = await pool.query(
@@ -1567,7 +1624,6 @@ app.post('/api/followup/recovery', auth, async (req, res) => {
       });
     }
 
-    // Se o revendedor escreveu uma mensagem, a IA gera 5 variações dela antes de disparar
     const messagePool = customMessage
       ? await generateMessageVariations(customMessage)
       : RECOVERY_MESSAGES;
