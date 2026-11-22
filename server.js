@@ -1088,7 +1088,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
                     ultimo_acesso: ultimoAcesso,
                     possivel_tela_ocupada: maxTelas === 1 && usoRecente,
                   });
-                }
+                
               }
             } catch (err) {
               console.error('Erro consultar_status_natv:', err.message);
