@@ -14,7 +14,7 @@ app.use(express.json());
 app.use('/logos', express.static(path.join(__dirname, 'logos')));
 
 // Rota de saúde para o Easypanel não reiniciar o contêiner
-app.get('/', (req, res) => res.json({ status: 'ok', app: 'API do José v3.1 (Vendas + Suporte Gestor)' }));
+app.get('/', (req, res) => res.json({ status: 'ok', app: 'API do José v3.2 (Vendas + Suporte Gestor + Webhook Auto)' }));
 
 // Conexão com o PostgreSQL da sua VPS
 const pool = new Pool({
@@ -264,7 +264,7 @@ app.post('/api/reseller/support-whatsapp', auth, async (req, res) => {
 });
 
 // ==========================================
-// 3. CONECTAR WHATSAPP (VENDAS E SUPORTE)
+// 3. CONECTAR WHATSAPP (VENDAS E SUPORTE + WEBHOOK AUTOMÁTICO)
 // ==========================================
 app.post('/api/whatsapp/connect', auth, async (req, res) => {
   const botType = req.body?.type === 'support' ? 'support' : 'sales';
@@ -272,6 +272,14 @@ app.post('/api/whatsapp/connect', auth, async (req, res) => {
     botType === 'support'
       ? `jose_sup_${req.user.id.slice(0, 8)}`
       : `jose_${req.user.id.slice(0, 8)}`;
+
+  const webhookConfig = {
+    enabled: true,
+    url: `${BASE_URL}/api/webhooks/evolution`,
+    webhookByEvents: false,
+    webhookBase64: false,
+    events: ['MESSAGES_UPSERT'],
+  };
 
   try {
     await fetch(`${EVOLUTION_URL}/instance/create`, {
@@ -284,8 +292,19 @@ app.post('/api/whatsapp/connect', auth, async (req, res) => {
         instanceName,
         qrcode: true,
         integration: 'WHATSAPP-BAILEYS',
+        webhook: webhookConfig,
       }),
     });
+
+    // Garante o Webhook mesmo se a instância já existia antes
+    await fetch(`${EVOLUTION_URL}/webhook/set/${instanceName}`, {
+      method: 'POST',
+      headers: {
+        apikey: EVOLUTION_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ webhook: webhookConfig }),
+    }).catch((err) => console.error('Aviso ao configurar webhook automático:', err.message));
 
     const qrRes = await fetch(`${EVOLUTION_URL}/instance/connect/${instanceName}`, {
       method: 'GET',
@@ -549,10 +568,11 @@ const JOSE_SUPPORT_PROMPT = `Você é o José Suporte, assistente técnico e ges
 Estilo: calmo, prestativo, paciente e objetivo. Mensagens CURTAS (máx. 3 linhas) e UM passo por vez.
 
 FLUXO DE ATENDIMENTO DE SUPORTE:
-1. PRIMEIRO PASSO (VERIFICAÇÃO): Se o cliente disser que caiu, não entra, deu erro de login ou está sem sinal, peça o usuário dele (se ainda não souber) e chame \`consultar_status_natv\` para checar se o plano está ativo, bloqueado ou vencido.
+1. PRIMEIRO PASSO (VERIFICAÇÃO NA NATV): Se o cliente disser que caiu, não funciona o reprodutor, não entra, deu erro de login ou está sem sinal, peça o usuário dele (se ainda não souber) e chame \`consultar_status_natv\` para checar se o plano está ativo, bloqueado, vencido ou já ONLINE em outra tela.
    - Se estiver VENCIDO: avise a data de vencimento com educação e ofereça renovar na hora via Pix (usando \`gerar_pix_plano\`).
-2. TRAVAMENTO / TELA PRETA / CARREGANDO (com plano ativo):
-   - Passo 1: Peça para tirar a TV/TV Box e o roteador da tomada por 2 minutos, ligar de novo e testar.
+   - Se \`online_agora\` for true e \`conexoes_ativas >= telas_contratadas\` (ex.: plano de 1 tela já sendo usado em outro aparelho): avise com educação que o login já está conectado assistindo em outro aparelho agora! Como o plano dele é de 1 tela, peça para fechar o app na outra TV/celular primeiro para liberar este aparelho — e avise que, se quiser assistir em duas telas ao mesmo tempo, ele pode migrar para o plano de 2 telas (R$ 50,00/mês).
+2. TRAVAMENTO / TELA PRETA / CARREGANDO (com plano ativo e livre):
+   - Passo 1: Se for plano de 1 tela e não foi possível confirmar online no painel, pergunte rapidamente se ninguém está usando o login em outra TV/celular; em seguida peça para tirar a TV/TV Box e o roteador da tomada por 2 minutos, ligar de novo e testar.
    - Passo 2: Pergunte se está travando em todos os canais ou apenas em um canal específico.
    - Passo 3: Se continuar em todos, peça para testar no 4G do celular (para ver se é bloqueio da operadora de internet) ou mandar foto da tela de erro.
 3. FOTOS DE ERRO / APP:
@@ -565,7 +585,7 @@ FLUXO DE ATENDIMENTO DE SUPORTE:
 5. QUANDO CHAMAR HUMANO (\`chamar_humano\`):
    - Apenas se o passo a passo técnico não resolver, se for um canal específico fora do ar para reportar à fonte, se for comprovante fora do Mercado Pago, se o cliente pedir estorno/alteração manual ou insistir em falar com atendente.
 
-PLANOS PARA RENOVAÇÃO:
+PLANOS PARA RENOVAÇÃO / UPGRADE:
 - 1 tela: Mensal R$ 29,90 | Trimestral R$ 74,90 | Semestral R$ 149,90 | Anual R$ 279,90
 - 2 telas: Mensal R$ 50,00 | Trimestral R$ 149,90 | Semestral R$ 299,90 | Anual R$ 499,90
 - 3 telas: Mensal R$ 70,00 | 4 telas: Mensal R$ 90,00`;
@@ -791,7 +811,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
         type: 'function',
         function: {
           name: 'consultar_status_natv',
-          description: 'Consulta na NATV se o usuário do cliente está ativo, vencido ou bloqueado e qual a data de vencimento.',
+          description: 'Consulta na NATV se o usuário do cliente está ativo, vencido, bloqueado, quantas telas tem contratadas e se já está online assistindo em outro aparelho agora.',
           parameters: {
             type: 'object',
             properties: {
@@ -886,12 +906,12 @@ app.post('/api/webhooks/evolution', async (req, res) => {
             toolResult = 'Erro: chave NATV não configurada.';
           } else {
             try {
+              const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
               const cached = natvClientsCache.get(reseller.id);
               let list = [];
               if (cached?.rawList) {
                 list = cached.rawList;
               } else {
-                const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
                 const rNatv = await fetch(`${baseUrl}/report/allusers`, {
                   headers: { Authorization: `Bearer ${reseller.natv_api_key}` },
                 });
@@ -900,6 +920,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
                   list = Array.isArray(raw) ? raw : (raw.data || raw.users || raw.clients || []);
                 }
               }
+
               const found = list.find((c) => String(c.u || '').trim().toLowerCase() === targetUser);
               if (!found) {
                 toolResult = `Usuário "${targetUser}" não encontrado no painel NATV.`;
@@ -908,12 +929,48 @@ app.post('/api/webhooks/evolution', async (req, res) => {
                 await pool.query('UPDATE leads SET natv_username = $1 WHERE id = $2', [found.u, lead.id]);
                 const expMs = found.e ? Date.parse(String(found.e).replace(' ', 'T')) : NaN;
                 const expired = !Number.isNaN(expMs) && expMs < Date.now();
+                const telasContratadas = Number(found.c || 1);
+
+                // Verifica se o usuário está online assistindo em outra tela agora
+                let conexoesAtivas = Number(found.o ?? found.online ?? found.active_connections ?? 0) || 0;
+                let onlineAgora = conexoesAtivas > 0;
+                let assistindoAgora = found.watching || found.stream || '';
+
+                if (!onlineAgora) {
+                  try {
+                    const onlineRes = await fetch(`${baseUrl}/report/online`, {
+                      headers: { Authorization: `Bearer ${reseller.natv_api_key}` },
+                    });
+                    if (onlineRes.ok) {
+                      const onlineRaw = await onlineRes.json();
+                      const onlineList = Array.isArray(onlineRaw)
+                        ? onlineRaw
+                        : (onlineRaw.data || onlineRaw.users || onlineRaw.online || []);
+                      const matches = onlineList.filter(
+                        (item) =>
+                          String(item.u || item.username || item.user || '').trim().toLowerCase() ===
+                          targetUser
+                      );
+                      if (matches.length > 0) {
+                        onlineAgora = true;
+                        conexoesAtivas = matches.length;
+                        assistindoAgora = matches[0].stream || matches[0].channel || matches[0].c || '';
+                      }
+                    }
+                  } catch {
+                    // ignora caso a rota /report/online não esteja disponível
+                  }
+                }
+
                 toolResult = JSON.stringify({
                   usuario: found.u,
                   status: expired ? 'VENCIDO' : String(found.t || 'ativo').toUpperCase(),
                   bloqueado: found.b || 'no',
                   vencimento: found.e || 'Não informado',
-                  telas: found.c || 1,
+                  telas_contratadas: telasContratadas,
+                  online_agora: onlineAgora,
+                  conexoes_ativas: conexoesAtivas,
+                  ...(assistindoAgora ? { assistindo_agora: assistindoAgora } : {}),
                 });
               }
             } catch {
