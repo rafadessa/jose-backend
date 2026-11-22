@@ -1185,14 +1185,29 @@ app.post('/api/webhooks/evolution', async (req, res) => {
           if (!reseller.natv_api_key) {
             toolResult = 'Erro: revendedor sem chave NATV configurada.';
           } else {
+            const natvRes = await             const clientPhone = String(lead.phone || '')
+              .replace(/@.*$/, '')
+              .replace(/\D/g, '');
+
+            const natvBody = {
+              minutes: '60',
+              ...(clientPhone ? { username: clientPhone } : {}),
+            };
+
             const natvRes = await fetch('https://revenda.pixbot.link/user', {
               method: 'POST',
               headers: {
                 Authorization: `Bearer ${reseller.natv_api_key}`,
                 'Content-Type': 'application/json',
               },
-              body: JSON.stringify({ minutes: '60' }),
+              body: JSON.stringify(natvBody),
             });
+            const natvUser = await natvRes.json();
+
+            if (!natvRes.ok) {
+              console.error('Erro NATV gerar_teste:', natvRes.status, JSON.stringify(natvUser));
+            }
+
             const natvUser = await natvRes.json();
 
             if (natvRes.ok) {
