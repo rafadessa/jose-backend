@@ -1290,7 +1290,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
               }
             }
           }
-        }
+        
 
         if (fnName === 'gerar_pix_plano') {
           const screens = Number(args.screens) || 1;
