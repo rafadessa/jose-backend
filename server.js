@@ -1017,6 +1017,43 @@ app.get('/api/leads', auth, async (req, res) => {
   }
 });
 
+// 1.1 Estatísticas diárias de leads (Conversas hoje, Testes, Vendas e Conversão)
+app.get('/api/leads/stats', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT
+         COUNT(*) AS conversations_today,
+         COUNT(*) FILTER (WHERE stage IN ('TESTE', 'ATIVO') OR natv_username IS NOT NULL) AS tests_today,
+         COUNT(*) FILTER (WHERE stage = 'ATIVO') AS sales_today
+       FROM leads
+       WHERE reseller_id = $1
+         AND (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo')::date =
+             (NOW() AT TIME ZONE 'America/Sao_Paulo')::date`,
+      [req.user.id]
+    );
+
+    const row = result.rows[0] || {};
+    const conversationsToday = Number(row.conversations_today || 0);
+    const testsToday = Number(row.tests_today || 0);
+    const salesToday = Number(row.sales_today || 0);
+    const conversionRate =
+      conversationsToday > 0
+        ? Number(((salesToday / conversationsToday) * 100).toFixed(1))
+        : 0;
+
+    res.json({
+      conversations_today: conversationsToday,
+      tests_today: testsToday,
+      sales_today: salesToday,
+      conversion_rate: conversionRate,
+    });
+  } catch (err) {
+    console.error('Erro /api/leads/stats:', err.message);
+    res.status(500).json({ error: 'Erro ao carregar estatísticas de leads' });
+  }
+});
+
+
 // 2. Carrega o histórico de mensagens de um cliente específico
 app.get('/api/leads/:leadId/messages', auth, async (req, res) => {
   try {
