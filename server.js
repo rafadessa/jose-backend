@@ -719,22 +719,31 @@ app.post('/api/webhooks/evolution', async (req, res) => {
   res.sendStatus(200);
 
   try {
-    const { event, instance, data } = req.body;
-    if (event !== 'messages.upsert' || !data || data.key?.fromMe) return;
+    console.log('--- WEBHOOK EVOLUTION RECEBIDO ---');
+    console.log(JSON.stringify(req.body, null, 2));
 
-    const remoteJid = data.key?.remoteJid;
-    if (!remoteJid || remoteJid.includes('@g.us')) return;
+    const event = req.body.event || req.body.type;
+    const instance = req.body.instance;
+    const data = req.body.data || req.body;
+
+    // Aceita tanto 'messages.upsert' quanto qualquer evento que traga mensagens
+    const messageData = data?.message || data?.data?.message;
+    const remoteJid = data?.key?.remoteJid || data?.data?.key?.remoteJid;
+    const fromMe = data?.key?.fromMe || data?.data?.key?.fromMe;
+
+    if (!remoteJid || remoteJid.includes('@g.us') || fromMe) return;
 
     let text =
-      data.message?.conversation ||
-      data.message?.extendedTextMessage?.text ||
+      messageData?.conversation ||
+      messageData?.extendedTextMessage?.text ||
+      data?.message?.conversation ||
       '';
 
-        if (!text && data.message?.audioMessage) {
+    if (!text && messageData?.audioMessage) {
       try {
         const base64 = await getEvolutionMediaBase64(instance, data);
         if (base64) {
-          const mimeType = (data.message.audioMessage.mimetype || 'audio/ogg').split(';')[0];
+          const mimeType = (messageData.audioMessage.mimetype || 'audio/ogg').split(';')[0];
           const transcript = await analyzeMediaWithGemini(
             base64,
             mimeType,
@@ -747,11 +756,17 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       } catch (err) {
         console.error('Erro ao processar áudio no webhook:', err.message);
       }
-      // Fallback caso o áudio falhe para o bot não ficar mudo
       if (!text) {
-        text = '[O cliente enviou um áudio, mas não foi possível transcrever. Peça para ele digitar em texto por favor.]';
+        text = '[O cliente enviou um áudio, mas não foi possível transcrever.]';
       }
     }
+
+    if (!text) return;
+
+    const pushName = data.pushName || data?.data?.pushName || 'Cliente';
+
+    // Restante da sua lógica de busca de revendedor, lead e chamada ao Gemini...
+
 
 
     if (!text && data.message?.imageMessage) {
