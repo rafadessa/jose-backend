@@ -298,7 +298,6 @@ app.post('/api/whatsapp/connect', auth, async (req, res) => {
       }),
     });
 
-    // Garante o Webhook na Evolution v2.3.x mesmo se a instância já existia
     const whRes = await fetch(`${EVOLUTION_URL}/webhook/set/${instanceName}`, {
       method: 'POST',
       headers: {
@@ -444,7 +443,6 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
   if (!paymentId || !resellerId) return;
 
   try {
-    // Trava antifraude: impede ativar o mesmo pagamento em dobro
     const already = await pool.query(
       'SELECT 1 FROM processed_payments WHERE payment_id = $1',
       [String(paymentId)]
@@ -738,46 +736,27 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       data.message?.extendedTextMessage?.text ||
       '';
 
-    console.log(`2. [MENSAGEM] Texto extraído de ${remoteJid}:`, text);
-
-    if (!text) {
-      console.log('2.1. [AVISO] Mensagem vazia ou mídia não tratada nesta etapa.');
-      return;
+    if (!text && data.message?.audioMessage) {
+      try {
+        const base64 = await getEvolutionMediaBase64(instance, data);
+        if (base64) {
+          const mimeType = (data.message.audioMessage.mimetype || 'audio/ogg').split(';')[0];
+          const transcript = await analyzeMediaWithGemini(
+            base64,
+            mimeType,
+            'Transcreva exatamente o que o cliente falou neste áudio em português. Retorne apenas a transcrição, sem comentários.'
+          );
+          if (transcript) {
+            text = `[Áudio transcrito]: ${transcript}`;
+          }
+        }
+      } catch (err) {
+        console.error('Erro ao processar áudio no webhook:', err.message);
+      }
+      if (!text) {
+        text = '[O cliente enviou um áudio, mas não foi possível transcrever. Peça para ele digitar em texto por favor.]';
+      }
     }
-
-    // Busca o revendedor
-    const instRes = await pool.query(
-      `SELECT r.*, COALESCE(wi.bot_type, 'sales') AS bot_type
-       FROM whatsapp_instances wi
-       JOIN resellers r ON r.id = wi.reseller_id
-       WHERE wi.instance_name = $1`,
-      [instance]
-    );
-    const reseller = instRes.rows[0];
-
-    if (!reseller) {
-      console.log('3. [ERRO] Revendedor não encontrado para a instância:', instance);
-      return;
-    }
-
-    if (!reseller.bot_active) {
-      console.log('3.1. [BLOQUEIO] Bot está desativado para este revendedor.');
-      return;
-    }
-
-    console.log('4. [SUCESSO] Revendedor validado. Iniciando chamada à IA...');
-
-    // O restante da sua lógica de IA continua aqui...
-
-  } catch (err) {
-    console.error('ERRO CRÍTICO NO WEBHOOK:', err);
-  }
-});
-
-
-    // Restante da sua lógica de busca de revendedor, lead e chamada ao Gemini...
-
-
 
     if (!text && data.message?.imageMessage) {
       const base64 = await getEvolutionMediaBase64(instance, data);
@@ -799,8 +778,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
 
     if (!text) return;
 
-     pushName = data.pushName || 'Cliente';
-
+    let pushName = data.pushName || 'Cliente';
 
     // 1. Busca o revendedor dono da instância e identifica se é Vendas ou Suporte
     const instRes = await pool.query(
@@ -1500,7 +1478,7 @@ app.post('/api/leads/:leadId/toggle-ai', auth, async (req, res) => {
 });
 
 // ==========================================
-// 8. LISTAR CLIENTES ATIVOS DO PAINEL NATV (FILA ÚNICA + BACKUP ANTI-429 + CRÉDITOS)
+// 8. LISTAR CLIENTES ATIVOS DO PAINEL NATV
 // ==========================================
 const natvClientsCache = new Map();
 const natvClientsInFlight = new Map();
@@ -1548,7 +1526,6 @@ app.get('/api/natv/clients', auth, async (req, res) => {
 
     const rawText = await response.text();
     if (!response.ok) {
-      console.log('NATV /report/allusers erro:', response.status, rawText.slice(0, 300));
       if (cached?.payload) {
         natvClientsCache.set(userId, { ts: Date.now(), payload: cached.payload, rawList: cached.rawList });
         return cached.payload;
@@ -1633,7 +1610,7 @@ app.get('/api/natv/clients', auth, async (req, res) => {
 });
 
 // ==========================================
-// 9. MOTOR DE FOLLOW-UP AUTOMÁTICO (VENDAS + RENOVAÇÃO NATV PELO SUPORTE)
+// 9. MOTOR DE FOLLOW-UP AUTOMÁTICO
 // ==========================================
 async function initFollowupColumns() {
   try {
@@ -1734,7 +1711,6 @@ async function runRenewalFollowup() {
   if (hour < 9 || hour >= 21) return;
 
   try {
-    // Prioriza a instância de SUPORTE; se não existir, usa a de VENDAS
     const resellersRes = await pool.query(`
       SELECT DISTINCT ON (r.id) r.*, wi.instance_name
       FROM resellers r
@@ -1832,7 +1808,7 @@ setInterval(runSalesFollowup, 5 * 60 * 1000);
 setInterval(runRenewalFollowup, 60 * 60 * 1000);
 
 // ==========================================
-// 10. DISPARO MANUAL: TENTATIVA DE RECUPERAÇÃO (ANTI-BLOQUEIO COM IA)
+// 10. DISPARO MANUAL: TENTATIVA DE RECUPERAÇÃO
 // ==========================================
 const runningRecoveryJobs = new Set();
 
@@ -1960,7 +1936,6 @@ app.post('/api/followup/recovery', auth, async (req, res) => {
             await new Promise((r) => setTimeout(r, delayMs));
           }
         }
-        console.log(`Recuperação finalizada para revendedor ${req.user.id} (${targets.length} envios).`);
       } finally {
         runningRecoveryJobs.delete(req.user.id);
       }
