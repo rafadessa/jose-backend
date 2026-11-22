@@ -730,18 +730,29 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       data.message?.extendedTextMessage?.text ||
       '';
 
-    if (!text && data.message?.audioMessage) {
-      const base64 = await getEvolutionMediaBase64(instance, data);
-      const mimeType = (data.message.audioMessage.mimetype || 'audio/ogg').split(';')[0];
-      const transcript = await analyzeMediaWithGemini(
-        base64,
-        mimeType,
-        'Transcreva exatamente o que o cliente falou neste áudio em português. Retorne apenas a transcrição, sem comentários.'
-      );
-      if (transcript) {
-        text = `[Áudio transcrito]: ${transcript}`;
+        if (!text && data.message?.audioMessage) {
+      try {
+        const base64 = await getEvolutionMediaBase64(instance, data);
+        if (base64) {
+          const mimeType = (data.message.audioMessage.mimetype || 'audio/ogg').split(';')[0];
+          const transcript = await analyzeMediaWithGemini(
+            base64,
+            mimeType,
+            'Transcreva exatamente o que o cliente falou neste áudio em português. Retorne apenas a transcrição, sem comentários.'
+          );
+          if (transcript) {
+            text = `[Áudio transcrito]: ${transcript}`;
+          }
+        }
+      } catch (err) {
+        console.error('Erro ao processar áudio no webhook:', err.message);
+      }
+      // Fallback caso o áudio falhe para o bot não ficar mudo
+      if (!text) {
+        text = '[O cliente enviou um áudio, mas não foi possível transcrever. Peça para ele digitar em texto por favor.]';
       }
     }
+
 
     if (!text && data.message?.imageMessage) {
       const base64 = await getEvolutionMediaBase64(instance, data);
