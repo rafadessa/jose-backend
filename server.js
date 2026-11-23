@@ -749,6 +749,41 @@ async function analyzeMediaWithGemini(base64, mimeType, promptText) {
 
 // Trava em memória contra webhooks duplicados simultâneos (Race Condition)
 const processedMessages = new Set();
+async function callGeminiWithFallback(apiKey, messagesPayload, tools) {
+  const models = ['gemini-2.5-flash', 'gemini-2.5-flash-lite'];
+
+  for (const model of models) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const res = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          temperature: 0.3,
+          messages: messagesPayload,
+          tools,
+        }),
+      });
+
+      const data = await res.json();
+      if (res.ok) return { ok: true, status: res.status, data };
+
+      // Se for sobrecarga temporária (503) ou limite (429), espera 1.5s e tenta novamente / troca de modelo
+      if (res.status === 503 || res.status === 429) {
+        console.warn(`⚠️ [GEMINI ${res.status}] Modelo ${model} ocupado (tentativa ${attempt}).`);
+        await new Promise((r) => setTimeout(r, 1500));
+        continue;
+      }
+
+      return { ok: false, status: res.status, data };
+    }
+  }
+
+  return { ok: false, status: 503, data: { error: 'Todos os modelos Gemini estão temporariamente indisponíveis.' } };
+}
 
 app.post('/api/webhooks/evolution', async (req, res) => {
   res.sendStatus(200);
@@ -950,25 +985,13 @@ app.post('/api/webhooks/evolution', async (req, res) => {
     const apiKey = process.env.OPENAI_API_KEY || process.env.GEMINI_API_KEY;
 
     // 5. Primeira chamada ao Gemini com ferramentas
-    let aiRes = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'gemini-2.5-flash',
-        temperature: 0.3,
-        messages: messagesPayload,
-        tools,
-      }),
-    });
+let aiRes = await callGeminiWithFallback(apiKey, messagesPayload, tools);
+let aiData = aiRes.data;
+if (!aiRes.ok) {
+  console.error('❌ [ERRO API GEMINI]:', aiRes.status, JSON.stringify(aiData));
+  return;
+}
 
-    let aiData = await aiRes.json();
-    if (!aiRes.ok) {
-      console.error('❌ [ERRO API GEMINI]:', aiRes.status, JSON.stringify(aiData));
-      return;
-    }
 
     let msg = aiData.choices?.[0]?.message;
 
