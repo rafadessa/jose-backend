@@ -1245,42 +1245,27 @@ app.post('/api/webhooks/evolution', async (req, res) => {
         messagesPayload.push({ role: 'tool', tool_call_id: toolCall.id, content: toolResult });
       }
 
-      // 7. Segunda chamada ao Gemini com fallback
-      aiRes = await callGeminiWithFallback(apiKey, messagesPayload, tools);
-      aiData = aiRes.data;
-      if (!aiRes.ok) {
-        console.error('❌ [ERRO API GEMINI - PASSO 7]:', aiRes.status, JSON.stringify(aiData));
-      }
-      msg = aiData.choices?.[0]?.message;
-    }
+              if (fnName === 'enviar_logo_app') {
+          const appName = String(args.app_name || '').trim();
+          const resellerApps = Object.values(getResellerApps(activeReseller)).flat();
+          const customMatch = resellerApps.find((a) => a.name.toUpperCase() === appName.toUpperCase());
+          const logoUrl = customMatch?.logo || APP_LOGOS[appName.toUpperCase()] || '';
 
-    let replyText = msg?.content?.trim();
+          lead.chosen_app = appName;
+          await pool.query('UPDATE leads SET chosen_app = $1 WHERE id = $2', [appName, lead.id]);
 
-    // Se a IA enviou o logo mas devolveu texto vazio, garante continuidade para o cliente
-    if (!replyText && sentLogoApp) {
-      replyText = `Te enviei o ícone do ${sentLogoApp} acima 👆 Pode procurar ele na loja da sua TV, instalar e me mandar uma foto da tela inicial dele?`;
-    }
+          if (logoUrl) {
+            await sendWhatsAppImage(instance, remoteJid, logoUrl, `Procura por esse ícone na loja: ${appName} 📺`);
+            await pool.query(
+              `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`,
+              [lead.id, `[Logo enviado: ${appName}]`]
+            );
+            toolResult = `Logo do ${appName} enviado com sucesso. Agora responda ao cliente em texto curto pedindo para instalar o ${appName} na loja da TV e mandar foto da tela inicial quando abrir.`;
+          } else {
+            toolResult = `App ${appName} registrado (sem imagem de logo). Agora responda ao cliente em texto curto orientando a instalar o ${appName} e avisar quando abrir.`;
+          }
+        }
 
-    if (!replyText) {
-      console.log('5. [RESPOSTA DA IA]: VAZIA | RAW:', JSON.stringify(aiData));
-    } else {
-      console.log('5. [RESPOSTA DA IA]:', replyText);
-    }
-
-    if (replyText) {
-      await sendWhatsAppText(instance, remoteJid, replyText);
-      console.log('6. [ENVIADO COM SUCESSO]');
-
-      if (!isVip) {
-        await debitWallet(activeReseller.id, Number(activeReseller.cost_per_reply ?? 0.10), 'reply', `Resposta IA: ${lead.name || lead.phone}`);
-      }
-      await pool.query(`INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`, [lead.id, replyText]);
-      await pool.query('UPDATE leads SET last_message = $1, last_interaction = now() WHERE id = $2', [replyText, lead.id]);
-    }
-  } catch (err) {
-    console.error('❌ ERRO CRÍTICO NO WEBHOOK:', err);
-  }
-});
 
 // ==========================================
 // 7. CHAT AO VIVO E ESTATÍSTICAS DE LEADS
