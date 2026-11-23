@@ -1557,8 +1557,14 @@ app.get('/api/novidades/vod', auth, async (req, res) => {
       return res.status(502).json({ error: `Servidor NATV respondeu erro (${vodRes.status}).` });
     }
 
-    const vodRaw = vodRes.ok ? await vodRes.json() : [];
-    const seriesRaw = seriesRes.ok ? await seriesRes.json() : [];
+        const vodText = await vodRes.text();
+    const seriesText = await seriesRes.text();
+    console.log('🔎 [XTREAM DEBUG] Host:', host, '| VOD status:', vodRes.status, '| Amostra:', vodText.slice(0, 200));
+
+    let vodRaw = [];
+    let seriesRaw = [];
+    try { vodRaw = JSON.parse(vodText); } catch {}
+    try { seriesRaw = JSON.parse(seriesText); } catch {}
 
     const filmes = (Array.isArray(vodRaw) ? vodRaw : [])
       .sort((a, b) => Number(b.added || 0) - Number(a.added || 0))
