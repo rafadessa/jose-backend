@@ -1694,7 +1694,7 @@ async function initClientLinksTable() {
 }
 initClientLinksTable();
 
-let natvUsersCache = { data: null, updatedAt: 0 };
+
 // Cache de 5 minutos por revendedor para evitar erro 429 da NATV
 const natvUsersCache = new Map();
 
