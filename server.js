@@ -1261,6 +1261,7 @@ app.get('/api/natv/clients', auth, async (req, res) => {
   try {
     const r = await pool.query('SELECT name, natv_api_key FROM resellers WHERE id = $1', [userId]);
     const natvKey = r.rows[0]?.natv_api_key;
+    const resellerName = String(r.rows[0]?.name || '').trim().toLowerCase();
     if (!natvKey) return res.status(400).json({ error: 'Chave NATV não configurada' });
 
     const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
@@ -1272,12 +1273,20 @@ app.get('/api/natv/clients', auth, async (req, res) => {
 
     const raw = await response.json();
     const list = Array.isArray(raw) ? raw : (raw.data || raw.users || raw.clients || []);
-    const activeClients = list.filter((c) => String(c.t || '').trim().toLowerCase() === 'ativo').map((c, idx) => ({
-      id: String(c.i ?? idx),
-      username: String(c.u ?? 'Cliente'),
-      name: String(c.n || c.u || 'Cliente'),
-      exp_date: c.e ?? null,
-    }));
+
+    const activeClients = list
+      .filter((c) => {
+        const isAtivo = String(c.t || '').trim().toLowerCase() === 'ativo';
+        const dono = String(c.r || '').trim().toLowerCase();
+        const isMeu = !resellerName || !dono || dono === resellerName;
+        return isAtivo && isMeu;
+      })
+      .map((c, idx) => ({
+        id: String(c.i ?? idx),
+        username: String(c.u ?? 'Cliente'),
+        name: String(c.n || c.u || 'Cliente'),
+        exp_date: c.e ?? null,
+      }));
 
     const payload = { total_active: activeClients.length, clients: activeClients };
     natvClientsCache.set(userId, { ts: Date.now(), payload });
@@ -1286,6 +1295,7 @@ app.get('/api/natv/clients', auth, async (req, res) => {
     res.status(500).json({ error: 'Erro interno' });
   }
 });
+
 
 async function initFollowupColumns() {
   try {
