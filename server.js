@@ -1694,6 +1694,10 @@ async function initClientLinksTable() {
 }
 initClientLinksTable();
 
+let natvUsersCache = { data: null, updatedAt: 0 };
+// Cache de 5 minutos por revendedor para evitar erro 429 da NATV
+const natvUsersCache = new Map();
+
 // Rota para sincronizar e cruzar automaticamente os usuários da NATV com o WhatsApp
 app.post('/api/gestor/sincronizar', auth, async (req, res) => {
   const userId = req.user.id;
@@ -1703,20 +1707,39 @@ app.post('/api/gestor/sincronizar', auth, async (req, res) => {
     const resellerName = String(r.rows[0]?.name || '').trim().toLowerCase();
     if (!natvKey) return res.status(400).json({ error: 'Chave NATV não configurada' });
 
-        const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
-    const response = await fetch(`${baseUrl}/report/allusers`, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${natvKey}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      },
-    });
-    if (!response.ok) {
-      const errText = await response.text().catch(() => '');
-      console.error('Erro NATV sincronizar:', response.status, errText);
-      return res.status(400).json({ error: `Erro ao consultar NATV (${response.status})` });
+    const now = Date.now();
+    const cached = natvUsersCache.get(userId);
+    let list = null;
+
+    if (cached && now - cached.updatedAt < 5 * 60 * 1000) {
+      list = cached.data;
+    } else {
+      const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
+      const response = await fetch(`${baseUrl}/report/allusers`, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${natvKey}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        },
+      });
+
+      if (response.status === 429) {
+        return res.status(429).json({
+          error: 'A NATV limitou as consultas momentaneamente. Aguarde 1 minuto e tente novamente.',
+        });
+      }
+
+      if (!response.ok) {
+        const errText = await response.text().catch(() => '');
+        console.error('Erro NATV sincronizar:', response.status, errText);
+        return res.status(400).json({ error: `Erro ao consultar NATV (${response.status})` });
+      }
+
+      const raw = await response.json();
+      list = Array.isArray(raw) ? raw : raw.data || raw.users || [];
+      natvUsersCache.set(userId, { data: list, updatedAt: now });
     }
 
     // Filtra apenas os ativos do próprio revendedor
@@ -1773,6 +1796,7 @@ app.post('/api/gestor/sincronizar', auth, async (req, res) => {
     res.status(500).json({ error: 'Erro interno ao sincronizar gestor' });
   }
 });
+
 
 // Rota para listar os clientes e seus status de vínculo no painel
 app.get('/api/gestor/clientes', auth, async (req, res) => {
