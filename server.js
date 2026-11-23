@@ -11,13 +11,12 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-
 // Serve os logos hospedados na pasta /logos do repositório
 app.use('/logos', express.static(path.join(__dirname, 'logos')));
 
 // Rota de saúde para o Easypanel não reiniciar o contêiner
 app.get('/', (req, res) =>
-  res.json({ status: 'ok', app: 'API do José v3.3 (Vendas + Suporte Gestor + Status + Webhook Auto)' })
+  res.json({ status: 'ok', app: 'API do José v3.4 (Apps Dinâmicos + Fallback Gemini + Gestor)' })
 );
 
 // Conexão com o PostgreSQL da sua VPS
@@ -50,6 +49,43 @@ const PLAN_PRICES = {
   3: { 1: 70.0 },
   4: { 1: 90.0 },
 };
+
+// Configuração padrão de apps por aparelho (usada se o revendedor não personalizou)
+const DEFAULT_APPS_CONFIG = {
+  samsung: [
+    { name: 'HD PLAYER', logo: `${BASE_URL}/logos/hd-player.png`, instructions: '' },
+    { name: 'MAXPLAYER', logo: `${BASE_URL}/logos/maxplayer.png`, instructions: '' },
+    { name: 'WATCH HUB', logo: `${BASE_URL}/logos/watch-hub.png`, instructions: '' },
+  ],
+  roku: [
+    { name: 'PLAYER MASTER', logo: `${BASE_URL}/logos/player-master.png`, instructions: '' },
+    { name: 'WATCH HUB', logo: `${BASE_URL}/logos/watch-hub.png`, instructions: '' },
+    { name: 'HD PLAYER', logo: `${BASE_URL}/logos/hd-player.png`, instructions: '' },
+  ],
+  lg: [
+    { name: 'HD PLAYER', logo: `${BASE_URL}/logos/hd-player.png`, instructions: '' },
+    { name: 'MAXPLAYER', logo: `${BASE_URL}/logos/maxplayer.png`, instructions: '' },
+    { name: 'TOPTV', logo: `${BASE_URL}/logos/toptv.png`, instructions: '' },
+  ],
+  android: [
+    { name: 'LOBO PLAYER', logo: `${BASE_URL}/logos/lobo-player.png`, instructions: '' },
+    { name: 'HD PLAYER', logo: `${BASE_URL}/logos/hd-player.png`, instructions: '' },
+    { name: 'TXS PRO PLAYER', logo: '', instructions: 'Via app Downloader usando o código 670156' },
+  ],
+};
+
+function getResellerApps(reseller) {
+  const cfg = reseller?.custom_apps;
+  if (cfg && typeof cfg === 'object') {
+    return {
+      samsung: Array.isArray(cfg.samsung) && cfg.samsung.length ? cfg.samsung : DEFAULT_APPS_CONFIG.samsung,
+      roku: Array.isArray(cfg.roku) && cfg.roku.length ? cfg.roku : DEFAULT_APPS_CONFIG.roku,
+      lg: Array.isArray(cfg.lg) && cfg.lg.length ? cfg.lg : DEFAULT_APPS_CONFIG.lg,
+      android: Array.isArray(cfg.android) && cfg.android.length ? cfg.android : DEFAULT_APPS_CONFIG.android,
+    };
+  }
+  return DEFAULT_APPS_CONFIG;
+}
 
 // Middleware de Autenticação
 function auth(req, res, next) {
@@ -267,42 +303,6 @@ app.post('/api/reseller/support-whatsapp', auth, async (req, res) => {
   }
 });
 
-const DEFAULT_APPS_CONFIG = {
-  samsung: [
-    { name: 'HD PLAYER', logo: `${BASE_URL}/logos/hd-player.png`, instructions: '' },
-    { name: 'MAXPLAYER', logo: `${BASE_URL}/logos/maxplayer.png`, instructions: '' },
-    { name: 'WATCH HUB', logo: `${BASE_URL}/logos/watch-hub.png`, instructions: '' },
-  ],
-  roku: [
-    { name: 'PLAYER MASTER', logo: `${BASE_URL}/logos/player-master.png`, instructions: '' },
-    { name: 'WATCH HUB', logo: `${BASE_URL}/logos/watch-hub.png`, instructions: '' },
-    { name: 'HD PLAYER', logo: `${BASE_URL}/logos/hd-player.png`, instructions: '' },
-  ],
-  lg: [
-    { name: 'HD PLAYER', logo: `${BASE_URL}/logos/hd-player.png`, instructions: '' },
-    { name: 'MAXPLAYER', logo: `${BASE_URL}/logos/maxplayer.png`, instructions: '' },
-    { name: 'TOPTV', logo: `${BASE_URL}/logos/toptv.png`, instructions: '' },
-  ],
-  android: [
-    { name: 'LOBO PLAYER', logo: `${BASE_URL}/logos/lobo-player.png`, instructions: '' },
-    { name: 'HD PLAYER', logo: `${BASE_URL}/logos/hd-player.png`, instructions: '' },
-    { name: 'TXS PRO PLAYER', logo: '', instructions: 'Via app Downloader usando o código 670156' },
-  ],
-};
-
-function getResellerApps(reseller) {
-  const cfg = reseller?.custom_apps;
-  if (cfg && typeof cfg === 'object') {
-    return {
-      samsung: Array.isArray(cfg.samsung) && cfg.samsung.length ? cfg.samsung : DEFAULT_APPS_CONFIG.samsung,
-      roku: Array.isArray(cfg.roku) && cfg.roku.length ? cfg.roku : DEFAULT_APPS_CONFIG.roku,
-      lg: Array.isArray(cfg.lg) && cfg.lg.length ? cfg.lg : DEFAULT_APPS_CONFIG.lg,
-      android: Array.isArray(cfg.android) && cfg.android.length ? cfg.android : DEFAULT_APPS_CONFIG.android,
-    };
-  }
-  return DEFAULT_APPS_CONFIG;
-}
-
 app.get('/api/reseller/apps', auth, async (req, res) => {
   try {
     const r = await pool.query('SELECT custom_apps FROM resellers WHERE id = $1', [req.user.id]);
@@ -324,7 +324,6 @@ app.post('/api/reseller/apps', auth, async (req, res) => {
     res.status(500).json({ error: 'Erro ao salvar aplicativos' });
   }
 });
-
 
 // ==========================================
 // 3. CONECTAR WHATSAPP (VENDAS E SUPORTE + WEBHOOK AUTO + STATUS)
@@ -427,7 +426,6 @@ app.get('/api/whatsapp/status', auth, async (req, res) => {
 // ==========================================
 // 4. RECARGA DA CARTEIRA DO JOSÉ (SEU MERCADO PAGO)
 // ==========================================
-
 app.post('/api/wallet/recharge', auth, async (req, res) => {
   const { amount } = req.body;
   if (!amount || amount < 5) {
@@ -438,7 +436,6 @@ app.post('/api/wallet/recharge', auth, async (req, res) => {
   }
 
   try {
-    // Garante um e-mail com domínio válido para o Mercado Pago aceitar
     const payerEmail = req.user.email?.endsWith('.jose')
       ? req.user.email.replace(/\.jose$/, '.com')
       : (req.user.email || 'cliente@josebot.com');
@@ -677,6 +674,26 @@ FERRAMENTAS:
 - Quando o cliente quiser fechar/comprar um plano, chame \`gerar_pix_plano\` passando \`months\` (1, 3, 6 ou 12) e \`screens\` (1, 2, 3 ou 4; padrão 1) e envie o código Pix Copia e Cola retornado avisando que a ativação é automática após o pagamento.
 - Se for cliente relatando travamento, problema de pagamento, pedir humano ou esgotar as opções de app da TV, chame \`chamar_humano\`.`;
 
+function buildSalesPrompt(reseller) {
+  const apps = getResellerApps(reseller);
+
+  const formatLine = (list) =>
+    list
+      .map((app, i) => `${i + 1}º ${app.name}${app.instructions ? ` (${app.instructions})` : ''}`)
+      .join(' | ');
+
+  const dynamicAppsBlock = `APPS POR APARELHO (indique sempre a 1ª opção primeiro, seguindo exatamente esta ordem):
+- Samsung: ${formatLine(apps.samsung)} | Última opção: Chamar atendente humano (\`chamar_humano\`)
+- Roku: ${formatLine(apps.roku)}
+- LG: ${formatLine(apps.lg)}
+- Android/Google TV / TV Box / Fire Stick: ${formatLine(apps.android)}`;
+
+  return JOSE_SYSTEM_PROMPT.replace(
+    /APPS POR APARELHO[\s\S]*?(?=\n\nREGRA DO DOWNLOADER)/,
+    dynamicAppsBlock
+  );
+}
+
 const JOSE_SUPPORT_PROMPT = `Você é o José Suporte, assistente técnico e gestor de renovações de streaming no WhatsApp.
 Estilo: calmo, prestativo, paciente e objetivo. Mensagens CURTAS (máx. 3 linhas) e UM passo por vez.
 
@@ -806,8 +823,6 @@ async function analyzeMediaWithGemini(base64, mimeType, promptText) {
   }
 }
 
-// Trava em memória contra webhooks duplicados simultâneos (Race Condition)
-const processedMessages = new Set();
 async function callGeminiWithFallback(apiKey, messagesPayload, tools) {
   const models = ['gemini-2.5-flash', 'gemini-2.5-flash-lite'];
 
@@ -830,7 +845,6 @@ async function callGeminiWithFallback(apiKey, messagesPayload, tools) {
       const data = await res.json();
       if (res.ok) return { ok: true, status: res.status, data };
 
-      // Se for sobrecarga temporária (503) ou limite (429), espera 1.5s e tenta novamente / troca de modelo
       if (res.status === 503 || res.status === 429) {
         console.warn(`⚠️ [GEMINI ${res.status}] Modelo ${model} ocupado (tentativa ${attempt}).`);
         await new Promise((r) => setTimeout(r, 1500));
@@ -843,6 +857,9 @@ async function callGeminiWithFallback(apiKey, messagesPayload, tools) {
 
   return { ok: false, status: 503, data: { error: 'Todos os modelos Gemini estão temporariamente indisponíveis.' } };
 }
+
+// Trava em memória contra webhooks duplicados simultâneos (Race Condition)
+const processedMessages = new Set();
 
 app.post('/api/webhooks/evolution', async (req, res) => {
   res.sendStatus(200);
@@ -865,7 +882,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       return;
     }
 
-    // 1. TRAVA IMEDIATA ANTES DE QUALQUER AWAIT (Bloqueia 100% das duplicidades)
+    // 1. TRAVA IMEDIATA ANTES DE QUALQUER AWAIT
     const msgId = key?.id || `${remoteJid}:${Date.now()}`;
     if (processedMessages.has(msgId)) {
       console.log('⚠️ [DUPLICIDADE BLOQUEADA NA ENTRADA] ID:', msgId);
@@ -956,7 +973,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
 
     if (lead.needs_human) return;
 
-        // 4. Carrega histórico recente
+    // 4. Carrega histórico recente
     const histRes = await pool.query(
       `SELECT sender, content FROM messages WHERE lead_id = $1 ORDER BY created_at DESC LIMIT 12`,
       [lead.id]
@@ -975,7 +992,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
           parameters: {
             type: 'object',
             properties: {
-              app_name: { type: 'string', enum: Object.keys(APP_LOGOS) },
+              app_name: { type: 'string', description: 'Nome exato do aplicativo recomendado.' },
             },
             required: ['app_name'],
           },
@@ -1037,20 +1054,19 @@ app.post('/api/webhooks/evolution', async (req, res) => {
     ];
 
     const messagesPayload = [
-      { role: 'system', content: isSupportBot ? JOSE_SUPPORT_PROMPT : JOSE_SYSTEM_PROMPT },
+      { role: 'system', content: isSupportBot ? JOSE_SUPPORT_PROMPT : buildSalesPrompt(activeReseller) },
       ...history,
     ];
 
     const apiKey = process.env.OPENAI_API_KEY || process.env.GEMINI_API_KEY;
 
-    // 5. Primeira chamada ao Gemini com ferramentas
-let aiRes = await callGeminiWithFallback(apiKey, messagesPayload, tools);
-let aiData = aiRes.data;
-if (!aiRes.ok) {
-  console.error('❌ [ERRO API GEMINI]:', aiRes.status, JSON.stringify(aiData));
-  return;
-}
-
+    // 5. Primeira chamada ao Gemini com fallback
+    let aiRes = await callGeminiWithFallback(apiKey, messagesPayload, tools);
+    let aiData = aiRes.data;
+    if (!aiRes.ok) {
+      console.error('❌ [ERRO API GEMINI]:', aiRes.status, JSON.stringify(aiData));
+      return;
+    }
 
     let msg = aiData.choices?.[0]?.message;
 
@@ -1064,11 +1080,20 @@ if (!aiRes.ok) {
         let toolResult = 'ok';
 
         if (fnName === 'enviar_logo_app') {
-          const appName = args.app_name;
+          const appName = String(args.app_name || '').trim();
+          const resellerApps = Object.values(getResellerApps(activeReseller)).flat();
+          const customMatch = resellerApps.find((a) => a.name.toUpperCase() === appName.toUpperCase());
+          const logoUrl = customMatch?.logo || APP_LOGOS[appName.toUpperCase()] || '';
+
           lead.chosen_app = appName;
           await pool.query('UPDATE leads SET chosen_app = $1 WHERE id = $2', [appName, lead.id]);
-          await sendWhatsAppImage(instance, remoteJid, APP_LOGOS[appName], `Procura por esse ícone na loja: ${appName} 📺`);
-          toolResult = `Logo do ${appName} enviado com sucesso.`;
+
+          if (logoUrl) {
+            await sendWhatsAppImage(instance, remoteJid, logoUrl, `Procura por esse ícone na loja: ${appName} 📺`);
+            toolResult = `Logo do ${appName} enviado com sucesso.`;
+          } else {
+            toolResult = `App ${appName} registrado (sem imagem de logo configurada, continue o atendimento normalmente).`;
+          }
         }
 
         if (fnName === 'consultar_status_natv') {
@@ -1208,21 +1233,9 @@ if (!aiRes.ok) {
         messagesPayload.push({ role: 'tool', tool_call_id: toolCall.id, content: toolResult });
       }
 
-      // 7. Segunda chamada ao Gemini com o resultado da ferramenta
-      aiRes = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: 'gemini-2.5-flash',
-          temperature: 0.3,
-          messages: messagesPayload,
-          tools,
-        }),
-      });
-      aiData = await aiRes.json();
+      // 7. Segunda chamada ao Gemini com fallback
+      aiRes = await callGeminiWithFallback(apiKey, messagesPayload, tools);
+      aiData = aiRes.data;
       msg = aiData.choices?.[0]?.message;
     }
 
@@ -1335,7 +1348,6 @@ app.post('/api/leads/:leadId/toggle-ai', auth, async (req, res) => {
 // 8. CLIENTES NATV & FOLLOW-UPS
 // ==========================================
 const natvClientsCache = new Map();
-const natvClientsInFlight = new Map();
 
 app.get('/api/natv/clients', auth, async (req, res) => {
   const userId = req.user.id;
@@ -1380,7 +1392,6 @@ app.get('/api/natv/clients', auth, async (req, res) => {
   }
 });
 
-
 async function initFollowupColumns() {
   try {
     await pool.query(`
@@ -1391,9 +1402,8 @@ async function initFollowupColumns() {
       ADD COLUMN IF NOT EXISTS renewal_stage TEXT,
       ADD COLUMN IF NOT EXISTS instance_name TEXT;
     `);
-   await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS custom_apps JSONB;`);
-
-     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS support_whatsapp TEXT;`);
+    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS support_whatsapp TEXT;`);
+    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS custom_apps JSONB;`);
     await pool.query(`ALTER TABLE whatsapp_instances ADD COLUMN IF NOT EXISTS bot_type TEXT DEFAULT 'sales';`);
     await pool.query(`
       CREATE TABLE IF NOT EXISTS processed_payments (
@@ -1558,16 +1568,13 @@ async function runRenewalFollowup() {
         const userKey = String(c.u).trim().toLowerCase();
         let lead = leadByUser.get(userKey);
 
-        // Se o cliente ainda não está no banco, tenta criar automaticamente usando o número do login NATV
         if (!lead) {
           const digits = String(c.u).replace(/\D/g, '');
-          // Só cria se o usuário parecer um telefone válido (10 a 13 dígitos)
           if (digits.length < 10 || digits.length > 13) continue;
 
           const phoneWithDdi = digits.length <= 11 ? `55${digits}` : digits;
           const remoteJid = `${phoneWithDdi}@s.whatsapp.net`;
 
-          // Verifica se já existe lead por telefone para não duplicar
           const existingByPhone = await pool.query(
             `SELECT * FROM leads WHERE reseller_id = $1 AND phone = $2 LIMIT 1`,
             [reseller.id, remoteJid]
@@ -1631,11 +1638,10 @@ app.get('/api/novidades/vod', auth, async (req, res) => {
 
   try {
     const base = `${host}/player_api.php?username=${encodeURIComponent(user)}&password=${encodeURIComponent(pass)}`;
-        const headers = {
+    const headers = {
       'User-Agent': 'IPTVSmartersPlayer',
       'Accept': '*/*',
     };
-
 
     const [vodRes, seriesRes] = await Promise.all([
       fetch(`${base}&action=get_vod_streams`, { headers }),
@@ -1647,7 +1653,7 @@ app.get('/api/novidades/vod', auth, async (req, res) => {
       return res.status(502).json({ error: `Servidor NATV respondeu erro (${vodRes.status}).` });
     }
 
-        const vodText = await vodRes.text();
+    const vodText = await vodRes.text();
     const seriesText = await seriesRes.text();
     console.log('🔎 [XTREAM DEBUG] Host:', host, '| VOD status:', vodRes.status, '| Amostra:', vodText.slice(0, 200));
 
@@ -1686,7 +1692,6 @@ app.get('/api/novidades/vod', auth, async (req, res) => {
     res.status(500).json({ error: 'Erro ao consultar servidor NATV.' });
   }
 });
-
 
 app.get('/api/novidades/jogos', auth, async (req, res) => {
   if (gamesCache.data && Date.now() - gamesCache.ts < 15 * 60 * 1000) {
@@ -1759,39 +1764,33 @@ app.get('/api/novidades/jogos', auth, async (req, res) => {
 // ==========================================
 // 11. GESTOR INTELIGENTE DE CLIENTES & VÍNCULO WHATSAPP
 // ==========================================
-
-// Garante a tabela de vínculos no banco
 async function initClientLinksTable() {
   try {
     await pool.query(`
-  CREATE TABLE IF NOT EXISTS client_links (
-    id SERIAL PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    natv_username TEXT NOT NULL,
-    whatsapp_jns TEXT,
-    status TEXT DEFAULT 'PENDENTE',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(user_id, natv_username)
-  );
-`);
+      CREATE TABLE IF NOT EXISTS client_links (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        natv_username TEXT NOT NULL,
+        whatsapp_jns TEXT,
+        status TEXT DEFAULT 'PENDENTE',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, natv_username)
+      );
+    `);
 
-await pool.query(`
-  ALTER TABLE client_links
-  ALTER COLUMN user_id TYPE TEXT USING user_id::text;
-`);
-
+    await pool.query(`
+      ALTER TABLE client_links
+      ALTER COLUMN user_id TYPE TEXT USING user_id::text;
+    `);
   } catch (err) {
     console.error('Erro ao criar tabela client_links:', err);
   }
 }
 initClientLinksTable();
 
+const gestorNatvCache = new Map();
 
-// Cache de 5 minutos por revendedor para evitar erro 429 da NATV
-const natvUsersCache = new Map();
-
-// Rota para sincronizar e cruzar automaticamente os usuários da NATV com o WhatsApp
 app.post('/api/gestor/sincronizar', auth, async (req, res) => {
   const userId = req.user.id;
   try {
@@ -1801,7 +1800,7 @@ app.post('/api/gestor/sincronizar', auth, async (req, res) => {
     if (!natvKey) return res.status(400).json({ error: 'Chave NATV não configurada' });
 
     const now = Date.now();
-    const cached = natvUsersCache.get(userId);
+    const cached = gestorNatvCache.get(userId);
     let list = null;
 
     if (cached && now - cached.updatedAt < 5 * 60 * 1000) {
@@ -1832,10 +1831,9 @@ app.post('/api/gestor/sincronizar', auth, async (req, res) => {
 
       const raw = await response.json();
       list = Array.isArray(raw) ? raw : raw.data || raw.users || [];
-      natvUsersCache.set(userId, { data: list, updatedAt: now });
+      gestorNatvCache.set(userId, { data: list, updatedAt: now });
     }
 
-    // Filtra apenas os ativos do próprio revendedor
     const activeClients = list.filter((c) => {
       const isAtivo = String(c.t || '').trim().toLowerCase() === 'ativo';
       const dono = String(c.r || '').trim().toLowerCase();
@@ -1850,7 +1848,6 @@ app.post('/api/gestor/sincronizar', auth, async (req, res) => {
       const username = String(client.u || '').trim();
       if (!username) continue;
 
-      // Verifica se o username é um número de telefone válido (ex: só dígitos com 10 a 13 caracteres)
       const cleanNums = username.replace(/\D/g, '');
       const isPhoneUser = cleanNums.length >= 10 && cleanNums.length <= 13;
 
@@ -1858,7 +1855,6 @@ app.post('/api/gestor/sincronizar', auth, async (req, res) => {
       let statusLink = 'PENDENTE';
 
       if (isPhoneUser) {
-        // Formata para o padrão do WhatsApp (ex: 55 + número)
         const formattedPhone = cleanNums.startsWith('55') ? cleanNums : `55${cleanNums}`;
         whatsappJid = `${formattedPhone}@s.whatsapp.net`;
         statusLink = 'AUTOMATICO';
@@ -1867,11 +1863,10 @@ app.post('/api/gestor/sincronizar', auth, async (req, res) => {
         pendentes++;
       }
 
-      // Salva ou atualiza no banco local do gestor
       await pool.query(`
         INSERT INTO client_links (user_id, natv_username, whatsapp_jns, status)
         VALUES ($1, $2, $3, $4)
-        ON CONFLICT (user_id, natv_username) 
+        ON CONFLICT (user_id, natv_username)
         DO UPDATE SET whatsapp_jns = EXCLUDED.whatsapp_jns, status = EXCLUDED.status, updated_at = CURRENT_TIMESTAMP
       `, [userId, username, whatsappJid, statusLink]);
     }
@@ -1883,22 +1878,19 @@ app.post('/api/gestor/sincronizar', auth, async (req, res) => {
       pendentes_ajuste: pendentes,
       message: `Sincronização concluída! ${vinculadosAuto} clientes associados pelo número de WhatsApp.`
     });
-
   } catch (err) {
     console.error('Erro na sincronização do gestor:', err);
     res.status(500).json({ error: 'Erro interno ao sincronizar gestor' });
   }
 });
 
-
-// Rota para listar os clientes e seus status de vínculo no painel
 app.get('/api/gestor/clientes', auth, async (req, res) => {
   const userId = req.user.id;
   try {
     const result = await pool.query(`
-      SELECT natv_username, whatsapp_jns, status, updated_at 
-      FROM client_links 
-      WHERE user_id = $1 
+      SELECT natv_username, whatsapp_jns, status, updated_at
+      FROM client_links
+      WHERE user_id = $1
       ORDER BY status DESC, updated_at DESC
     `, [userId]);
     res.json({ clientes: result.rows });
@@ -1907,7 +1899,6 @@ app.get('/api/gestor/clientes', auth, async (req, res) => {
   }
 });
 
-// Rota para o revendedor ajustar manualmente o WhatsApp de um usuário pendente pelo painel
 app.post('/api/gestor/vincular', auth, async (req, res) => {
   const userId = req.user.id;
   const { natv_username, whatsapp } = req.body;
@@ -1922,7 +1913,7 @@ app.post('/api/gestor/vincular', auth, async (req, res) => {
     await pool.query(`
       INSERT INTO client_links (user_id, natv_username, whatsapp_jns, status)
       VALUES ($1, $2, $3, 'MANUAL')
-      ON CONFLICT (user_id, natv_username) 
+      ON CONFLICT (user_id, natv_username)
       DO UPDATE SET whatsapp_jns = EXCLUDED.whatsapp_jns, status = 'MANUAL', updated_at = CURRENT_TIMESTAMP
     `, [userId, natv_username, whatsappJid]);
 
@@ -1931,8 +1922,6 @@ app.post('/api/gestor/vincular', auth, async (req, res) => {
     res.status(500).json({ error: 'Erro ao atualizar vínculo' });
   }
 });
-
-
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`API do José rodando na porta ${PORT}`));
