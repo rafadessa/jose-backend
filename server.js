@@ -1545,7 +1545,11 @@ app.get('/api/novidades/vod', auth, async (req, res) => {
 
   try {
     const base = `${host}/player_api.php?username=${encodeURIComponent(user)}&password=${encodeURIComponent(pass)}`;
-    const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
+        const headers = {
+      'User-Agent': 'IPTVSmartersPlayer',
+      'Accept': '*/*',
+    };
+
 
     const [vodRes, seriesRes] = await Promise.all([
       fetch(`${base}&action=get_vod_streams`, { headers }),
