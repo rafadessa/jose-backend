@@ -784,8 +784,22 @@ PLANOS PARA RENOVAÇÃO / UPGRADE:
 - 3 telas: Mensal R$ ${formatBRL(prices[3][1])} | 4 telas: Mensal R$ ${formatBRL(prices[4][1])}`;
 }
 
-// Registro de mensagens enviadas pelo próprio bot (para detectar intervenção humana pelo celular)
+// Registro de envios do bot (evita que o eco da Evolution pause a IA)
 const botSentIds = new Set();
+const botSendingWindow = new Map();
+
+function markBotSending(remoteJid) {
+  if (!remoteJid) return;
+  const clean = String(remoteJid).replace(/@.*$/, '');
+  botSendingWindow.set(clean, Date.now());
+}
+
+function isBotEcho(remoteJid, msgId) {
+  if (msgId && botSentIds.has(msgId)) return true;
+  const clean = String(remoteJid || '').replace(/@.*$/, '');
+  const lastSent = botSendingWindow.get(clean);
+  return Boolean(lastSent && Date.now() - lastSent < 10000); // 10s de janela
+}
 
 function trackBotSentId(id) {
   if (!id) return;
@@ -794,6 +808,7 @@ function trackBotSentId(id) {
 }
 
 async function sendWhatsAppText(instanceName, remoteJid, text) {
+  markBotSending(remoteJid); // Marca ANTES de chamar a Evolution
   try {
     const res = await fetch(`${EVOLUTION_URL}/message/sendText/${instanceName}`, {
       method: 'POST',
@@ -812,6 +827,7 @@ async function sendWhatsAppText(instanceName, remoteJid, text) {
 
 async function sendWhatsAppImage(instanceName, remoteJid, imageUrl, caption) {
   if (!imageUrl || imageUrl.includes('SEU_LINK_DO_JOSE_API')) return;
+  markBotSending(remoteJid); // Marca ANTES de chamar a Evolution
 
   const isJpg = /\.jpe?g(\?|$)/i.test(imageUrl);
   const isWebp = /\.webp(\?|$)/i.test(imageUrl);
