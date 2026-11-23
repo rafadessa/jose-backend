@@ -1703,15 +1703,21 @@ app.post('/api/gestor/sincronizar', auth, async (req, res) => {
     const resellerName = String(r.rows[0]?.name || '').trim().toLowerCase();
     if (!natvKey) return res.status(400).json({ error: 'Chave NATV não configurada' });
 
-    const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
+        const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
     const response = await fetch(`${baseUrl}/report/allusers`, {
       method: 'GET',
-      headers: { Authorization: `Bearer ${natvKey}`, 'Content-Type': 'application/json' },
+      headers: {
+        Authorization: `Bearer ${natvKey}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      },
     });
-    if (!response.ok) return res.status(400).json({ error: 'Erro ao consultar NATV' });
-
-    const raw = await response.json();
-    const list = Array.isArray(raw) ? raw : (raw.data || raw.users || raw.clients || []);
+    if (!response.ok) {
+      const errText = await response.text().catch(() => '');
+      console.error('Erro NATV sincronizar:', response.status, errText);
+      return res.status(400).json({ error: `Erro ao consultar NATV (${response.status})` });
+    }
 
     // Filtra apenas os ativos do próprio revendedor
     const activeClients = list.filter((c) => {
