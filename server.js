@@ -16,7 +16,7 @@ app.use('/logos', express.static(path.join(__dirname, 'logos')));
 
 // Rota de saúde para o Easypanel não reiniciar o contêiner
 app.get('/', (req, res) =>
-  res.json({ status: 'ok', app: 'API do José v3.4 (Apps Dinâmicos + Fallback Gemini + Gestor)' })
+  res.json({ status: 'ok', app: 'API do José v3.5 (Apps Dinâmicos + Adulto +18 + Fix Logo + Fallback Gemini)' })
 );
 
 // Conexão com o PostgreSQL da sua VPS
@@ -1075,6 +1075,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
     }
 
     let msg = aiData.choices?.[0]?.message;
+    let sentLogoApp = null;
 
     // 6. Executa ferramentas se a IA solicitou
     if (msg?.tool_calls?.length) {
@@ -1092,13 +1093,18 @@ app.post('/api/webhooks/evolution', async (req, res) => {
           const logoUrl = customMatch?.logo || APP_LOGOS[appName.toUpperCase()] || '';
 
           lead.chosen_app = appName;
+          sentLogoApp = appName;
           await pool.query('UPDATE leads SET chosen_app = $1 WHERE id = $2', [appName, lead.id]);
 
           if (logoUrl) {
             await sendWhatsAppImage(instance, remoteJid, logoUrl, `Procura por esse ícone na loja: ${appName} 📺`);
-            toolResult = `Logo do ${appName} enviado com sucesso.`;
+            await pool.query(
+              `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`,
+              [lead.id, `[Logo enviado: ${appName}]`]
+            );
+            toolResult = `Logo do ${appName} enviado com sucesso. Agora responda ao cliente em texto curto pedindo para instalar o ${appName} na loja da TV e mandar foto da tela inicial quando abrir.`;
           } else {
-            toolResult = `App ${appName} registrado (sem imagem de logo configurada, continue o atendimento normalmente).`;
+            toolResult = `App ${appName} registrado (sem imagem de logo). Agora responda ao cliente em texto curto orientando a instalar o ${appName} e avisar quando abrir.`;
           }
         }
 
@@ -1242,11 +1248,24 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       // 7. Segunda chamada ao Gemini com fallback
       aiRes = await callGeminiWithFallback(apiKey, messagesPayload, tools);
       aiData = aiRes.data;
+      if (!aiRes.ok) {
+        console.error('❌ [ERRO API GEMINI - PASSO 7]:', aiRes.status, JSON.stringify(aiData));
+      }
       msg = aiData.choices?.[0]?.message;
     }
 
-    const replyText = msg?.content?.trim();
-    console.log('5. [RESPOSTA DA IA]:', replyText || 'VAZIA');
+    let replyText = msg?.content?.trim();
+
+    // Se a IA enviou o logo mas devolveu texto vazio, garante continuidade para o cliente
+    if (!replyText && sentLogoApp) {
+      replyText = `Te enviei o ícone do ${sentLogoApp} acima 👆 Pode procurar ele na loja da sua TV, instalar e me mandar uma foto da tela inicial dele?`;
+    }
+
+    if (!replyText) {
+      console.log('5. [RESPOSTA DA IA]: VAZIA | RAW:', JSON.stringify(aiData));
+    } else {
+      console.log('5. [RESPOSTA DA IA]:', replyText);
+    }
 
     if (replyText) {
       await sendWhatsAppText(instance, remoteJid, replyText);
