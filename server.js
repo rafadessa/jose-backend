@@ -667,6 +667,7 @@ APPS POR APARELHO (indique sempre a 1ª opção primeiro, seguindo exatamente es
 - Roku: ${formatLine(apps.roku)}
 - LG: ${formatLine(apps.lg)}
 - Android/Google TV / TV Box / Fire Stick: ${formatLine(apps.android)}
+- iPhone / iPad (iOS): 1º WATCH HUB (chame `enviar_logo_app` para WATCH HUB e, ao gerar o teste, entregue com o `codigo_watch_hub`, Usuário e Senha)
 
 REGRA DO DOWNLOADER (ANDROID / TV BOX / FIRE STICK):
 - Se o cliente disser que usa o app Downloader para baixar (ou se for para a 3ª opção no Android/Fire Stick), peça para ele digitar o código **670156** no Downloader para instalar o **TXS PRO PLAYER**.
