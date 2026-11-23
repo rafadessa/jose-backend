@@ -267,6 +267,65 @@ app.post('/api/reseller/support-whatsapp', auth, async (req, res) => {
   }
 });
 
+const DEFAULT_APPS_CONFIG = {
+  samsung: [
+    { name: 'HD PLAYER', logo: `${BASE_URL}/logos/hd-player.png`, instructions: '' },
+    { name: 'MAXPLAYER', logo: `${BASE_URL}/logos/maxplayer.png`, instructions: '' },
+    { name: 'WATCH HUB', logo: `${BASE_URL}/logos/watch-hub.png`, instructions: '' },
+  ],
+  roku: [
+    { name: 'PLAYER MASTER', logo: `${BASE_URL}/logos/player-master.png`, instructions: '' },
+    { name: 'WATCH HUB', logo: `${BASE_URL}/logos/watch-hub.png`, instructions: '' },
+    { name: 'HD PLAYER', logo: `${BASE_URL}/logos/hd-player.png`, instructions: '' },
+  ],
+  lg: [
+    { name: 'HD PLAYER', logo: `${BASE_URL}/logos/hd-player.png`, instructions: '' },
+    { name: 'MAXPLAYER', logo: `${BASE_URL}/logos/maxplayer.png`, instructions: '' },
+    { name: 'TOPTV', logo: `${BASE_URL}/logos/toptv.png`, instructions: '' },
+  ],
+  android: [
+    { name: 'LOBO PLAYER', logo: `${BASE_URL}/logos/lobo-player.png`, instructions: '' },
+    { name: 'HD PLAYER', logo: `${BASE_URL}/logos/hd-player.png`, instructions: '' },
+    { name: 'TXS PRO PLAYER', logo: '', instructions: 'Via app Downloader usando o código 670156' },
+  ],
+};
+
+function getResellerApps(reseller) {
+  const cfg = reseller?.custom_apps;
+  if (cfg && typeof cfg === 'object') {
+    return {
+      samsung: Array.isArray(cfg.samsung) && cfg.samsung.length ? cfg.samsung : DEFAULT_APPS_CONFIG.samsung,
+      roku: Array.isArray(cfg.roku) && cfg.roku.length ? cfg.roku : DEFAULT_APPS_CONFIG.roku,
+      lg: Array.isArray(cfg.lg) && cfg.lg.length ? cfg.lg : DEFAULT_APPS_CONFIG.lg,
+      android: Array.isArray(cfg.android) && cfg.android.length ? cfg.android : DEFAULT_APPS_CONFIG.android,
+    };
+  }
+  return DEFAULT_APPS_CONFIG;
+}
+
+app.get('/api/reseller/apps', auth, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT custom_apps FROM resellers WHERE id = $1', [req.user.id]);
+    res.json({ apps: getResellerApps(r.rows[0]) });
+  } catch {
+    res.status(500).json({ error: 'Erro ao carregar aplicativos' });
+  }
+});
+
+app.post('/api/reseller/apps', auth, async (req, res) => {
+  const { apps } = req.body;
+  if (!apps || typeof apps !== 'object') {
+    return res.status(400).json({ error: 'Configuração de apps inválida' });
+  }
+  try {
+    await pool.query('UPDATE resellers SET custom_apps = $1 WHERE id = $2', [JSON.stringify(apps), req.user.id]);
+    res.json({ success: true, apps });
+  } catch {
+    res.status(500).json({ error: 'Erro ao salvar aplicativos' });
+  }
+});
+
+
 // ==========================================
 // 3. CONECTAR WHATSAPP (VENDAS E SUPORTE + WEBHOOK AUTO + STATUS)
 // ==========================================
@@ -1332,7 +1391,9 @@ async function initFollowupColumns() {
       ADD COLUMN IF NOT EXISTS renewal_stage TEXT,
       ADD COLUMN IF NOT EXISTS instance_name TEXT;
     `);
-    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS support_whatsapp TEXT;`);
+   await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS custom_apps JSONB;`);
+
+     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS support_whatsapp TEXT;`);
     await pool.query(`ALTER TABLE whatsapp_instances ADD COLUMN IF NOT EXISTS bot_type TEXT DEFAULT 'sales';`);
     await pool.query(`
       CREATE TABLE IF NOT EXISTS processed_payments (
