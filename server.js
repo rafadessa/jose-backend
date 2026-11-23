@@ -1670,6 +1670,144 @@ app.get('/api/novidades/jogos', auth, async (req, res) => {
   }
 });
 
+// ==========================================
+// 11. GESTOR INTELIGENTE DE CLIENTES & VÍNCULO WHATSAPP
+// ==========================================
+
+// Garante a tabela de vínculos no banco
+async function initClientLinksTable() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS client_links (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        natv_username TEXT NOT NULL,
+        whatsapp_jns TEXT,
+        status TEXT DEFAULT 'PENDENTE', -- 'AUTOMATICO' ou 'PENDENTE'
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, natv_username)
+      );
+    `);
+  } catch (err) {
+    console.error('Erro ao criar tabela client_links:', err);
+  }
+}
+initClientLinksTable();
+
+// Rota para sincronizar e cruzar automaticamente os usuários da NATV com o WhatsApp
+app.post('/api/gestor/sincronizar', auth, async (req, res) => {
+  const userId = req.user.id;
+  try {
+    const r = await pool.query('SELECT name, natv_api_key FROM resellers WHERE id = $1', [userId]);
+    const natvKey = r.rows[0]?.natv_api_key;
+    const resellerName = String(r.rows[0]?.name || '').trim().toLowerCase();
+    if (!natvKey) return res.status(400).json({ error: 'Chave NATV não configurada' });
+
+    const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
+    const response = await fetch(`${baseUrl}/report/allusers`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${natvKey}`, 'Content-Type': 'application/json' },
+    });
+    if (!response.ok) return res.status(400).json({ error: 'Erro ao consultar NATV' });
+
+    const raw = await response.json();
+    const list = Array.isArray(raw) ? raw : (raw.data || raw.users || raw.clients || []);
+
+    // Filtra apenas os ativos do próprio revendedor
+    const activeClients = list.filter((c) => {
+      const isAtivo = String(c.t || '').trim().toLowerCase() === 'ativo';
+      const dono = String(c.r || '').trim().toLowerCase();
+      const isMeu = !resellerName || !dono || dono === resellerName;
+      return isAtivo && isMeu;
+    });
+
+    let vinculadosAuto = 0;
+    let pendentes = 0;
+
+    for (const client of activeClients) {
+      const username = String(client.u || '').trim();
+      if (!username) continue;
+
+      // Verifica se o username é um número de telefone válido (ex: só dígitos com 10 a 13 caracteres)
+      const cleanNums = username.replace(/\D/g, '');
+      const isPhoneUser = cleanNums.length >= 10 && cleanNums.length <= 13;
+
+      let whatsappJid = null;
+      let statusLink = 'PENDENTE';
+
+      if (isPhoneUser) {
+        // Formata para o padrão do WhatsApp (ex: 55 + número)
+        const formattedPhone = cleanNums.startsWith('55') ? cleanNums : `55${cleanNums}`;
+        whatsappJid = `${formattedPhone}@s.whatsapp.net`;
+        statusLink = 'AUTOMATICO';
+        vinculadosAuto++;
+      } else {
+        pendentes++;
+      }
+
+      // Salva ou atualiza no banco local do gestor
+      await pool.query(`
+        INSERT INTO client_links (user_id, natv_username, whatsapp_jns, status)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (user_id, natv_username) 
+        DO UPDATE SET whatsapp_jns = EXCLUDED.whatsapp_jns, status = EXCLUDED.status, updated_at = CURRENT_TIMESTAMP
+      `, [userId, username, whatsappJid, statusLink]);
+    }
+
+    res.json({
+      success: true,
+      total_analisados: activeClients.length,
+      vinculados_automaticamente: vinculadosAuto,
+      pendentes_ajuste: pendentes,
+      message: `Sincronização concluída! ${vinculadosAuto} clientes associados pelo número de WhatsApp.`
+    });
+
+  } catch (err) {
+    console.error('Erro na sincronização do gestor:', err);
+    res.status(500).json({ error: 'Erro interno ao sincronizar gestor' });
+  }
+});
+
+// Rota para listar os clientes e seus status de vínculo no painel
+app.get('/api/gestor/clientes', auth, async (req, res) => {
+  const userId = req.user.id;
+  try {
+    const result = await pool.query(`
+      SELECT natv_username, whatsapp_jns, status, updated_at 
+      FROM client_links 
+      WHERE user_id = $1 
+      ORDER BY status DESC, updated_at DESC
+    `, [userId]);
+    res.json({ clientes: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao buscar dados do gestor' });
+  }
+});
+
+// Rota para o revendedor ajustar manualmente o WhatsApp de um usuário pendente pelo painel
+app.post('/api/gestor/vincular', auth, async (req, res) => {
+  const userId = req.user.id;
+  const { natv_username, whatsapp } = req.body;
+  if (!natv_username || !whatsapp) {
+    return res.status(400).json({ error: 'Informe o usuário NATV e o WhatsApp' });
+  }
+
+  const cleanPhone = whatsapp.replace(/\D/g, '');
+  const whatsappJid = `${cleanPhone.startsWith('55') ? cleanPhone : '55' + cleanPhone}@s.whatsapp.net`;
+
+  try {
+    await pool.query(`
+      INSERT INTO client_links (user_id, natv_username, whatsapp_jns, status)
+      VALUES ($1, $2, $3, 'MANUAL')
+      ON CONFLICT (user_id, natv_username) 
+      DO UPDATE SET whatsapp_jns = EXCLUDED.whatsapp_jns, status = 'MANUAL', updated_at = CURRENT_TIMESTAMP
+    `, [userId, natv_username, whatsappJid]);
+
+    res.json({ success: true, message: 'WhatsApp vinculado com sucesso!' });
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao atualizar vínculo' });
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`API do José rodando na porta ${PORT}`));
