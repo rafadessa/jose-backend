@@ -1815,43 +1815,6 @@ app.post('/api/gestor/vincular', auth, async (req, res) => {
   }
 });
 
-// Coloque fora da rota (no topo do bloco do gestor):
-let natvUsersCache = { data: null, updatedAt: 0 };
-
-// Dentro do app.post('/api/gestor/sincronizar', ...):
-    const now = Date.now();
-    let users = null;
-
-    if (natvUsersCache.data && now - natvUsersCache.updatedAt < 5 * 60 * 1000) {
-      users = natvUsersCache.data;
-    } else {
-      const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
-      const response = await fetch(`${baseUrl}/report/allusers`, {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${natvKey}`,
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        },
-      });
-
-      if (response.status === 429) {
-        return res.status(429).json({
-          error: 'A NATV limitou as consultas momentaneamente. Aguarde 1 minuto e tente novamente.',
-        });
-      }
-
-      if (!response.ok) {
-        const errText = await response.text().catch(() => '');
-        console.error('Erro NATV sincronizar:', response.status, errText);
-        return res.status(400).json({ error: `Erro ao consultar NATV (${response.status})` });
-      }
-
-      const raw = await response.json();
-      users = Array.isArray(raw) ? raw : raw.data || raw.users || [];
-      natvUsersCache = { data: users, updatedAt: now };
-    }
 
 
 const PORT = process.env.PORT || 3000;
