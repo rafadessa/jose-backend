@@ -955,9 +955,9 @@ app.post('/api/webhooks/evolution', async (req, res) => {
 
     if (!remoteJid || remoteJid.includes('@g.us')) return;
 
-    // DETECÇÃO DE INTERVENÇÃO HUMANA PELO CELULAR (fromMe === true e não foi enviado pelo bot)
+        // DETECÇÃO DE INTERVENÇÃO HUMANA PELO CELULAR (fromMe === true e não foi eco do bot)
     if (fromMe) {
-      if (!botSentIds.has(msgId)) {
+      if (!isBotEcho(remoteJid, msgId)) {
         const instCheck = await pool.query(
           `SELECT reseller_id FROM whatsapp_instances WHERE instance_name = $1`,
           [instance]
@@ -973,6 +973,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       }
       return;
     }
+
 
     // 1. TRAVA IMEDIATA CONTRA DUPLICIDADE
     if (processedMessages.has(msgId)) return;
