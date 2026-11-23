@@ -1678,16 +1678,23 @@ app.get('/api/novidades/jogos', auth, async (req, res) => {
 async function initClientLinksTable() {
   try {
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS client_links (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER NOT NULL,
-        natv_username TEXT NOT NULL,
-        whatsapp_jns TEXT,
-        status TEXT DEFAULT 'PENDENTE', -- 'AUTOMATICO' ou 'PENDENTE'
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(user_id, natv_username)
-      );
-    `);
+  CREATE TABLE IF NOT EXISTS client_links (
+    id SERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    natv_username TEXT NOT NULL,
+    whatsapp_jns TEXT,
+    status TEXT DEFAULT 'PENDENTE',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, natv_username)
+  );
+`);
+
+await pool.query(`
+  ALTER TABLE client_links
+  ALTER COLUMN user_id TYPE TEXT USING user_id::text;
+`);
+
   } catch (err) {
     console.error('Erro ao criar tabela client_links:', err);
   }
