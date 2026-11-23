@@ -1086,14 +1086,13 @@ app.post('/api/webhooks/evolution', async (req, res) => {
         const args = JSON.parse(toolCall.function.arguments || '{}');
         let toolResult = 'ok';
 
-        if (fnName === 'enviar_logo_app') {
+                if (fnName === 'enviar_logo_app') {
           const appName = String(args.app_name || '').trim();
           const resellerApps = Object.values(getResellerApps(activeReseller)).flat();
           const customMatch = resellerApps.find((a) => a.name.toUpperCase() === appName.toUpperCase());
           const logoUrl = customMatch?.logo || APP_LOGOS[appName.toUpperCase()] || '';
 
           lead.chosen_app = appName;
-          sentLogoApp = appName;
           await pool.query('UPDATE leads SET chosen_app = $1 WHERE id = $2', [appName, lead.id]);
 
           if (logoUrl) {
@@ -1107,6 +1106,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
             toolResult = `App ${appName} registrado (sem imagem de logo). Agora responda ao cliente em texto curto orientando a instalar o ${appName} e avisar quando abrir.`;
           }
         }
+
 
         if (fnName === 'consultar_status_natv') {
           const busca = String(args.username || lead.natv_username || lead.phone || '').trim().toLowerCase();
