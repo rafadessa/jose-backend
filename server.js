@@ -1486,15 +1486,15 @@ async function fetchTodayGames() {
   }).format(new Date()).replace(/-/g, '');
 
   const leagues = [
-    { slug: 'bra.1', name: 'Brasileirão Série A' },
-    { slug: 'bra.2', name: 'Brasileirão Série B' },
-    { slug: 'bra.copa_do_brasil', name: 'Copa do Brasil' },
-    { slug: 'conmebol.libertadores', name: 'Libertadores' },
-    { slug: 'conmebol.sudamericana', name: 'Sul-Americana' },
-    { slug: 'uefa.champions', name: 'Champions League' },
-    { slug: 'eng.1', name: 'Premier League' },
-    { slug: 'esp.1', name: 'La Liga' },
-    { slug: 'ita.1', name: 'Serie A Itália' },
+    { slug: 'bra.1', name: 'Brasileirão Série A', defaultChannels: 'Premiere / SporTV / Globo' },
+    { slug: 'bra.2', name: 'Brasileirão Série B', defaultChannels: 'Premiere / SporTV / Band' },
+    { slug: 'bra.copa_do_brasil', name: 'Copa do Brasil', defaultChannels: 'Premiere / SporTV / Prime Video' },
+    { slug: 'conmebol.libertadores', name: 'Libertadores', defaultChannels: 'ESPN / Disney+ / Paramount+' },
+    { slug: 'conmebol.sudamericana', name: 'Sul-Americana', defaultChannels: 'ESPN / Disney+ / Paramount+' },
+    { slug: 'uefa.champions', name: 'Champions League', defaultChannels: 'TNT / Space / Max' },
+    { slug: 'eng.1', name: 'Premier League', defaultChannels: 'ESPN / Disney+' },
+    { slug: 'esp.1', name: 'La Liga', defaultChannels: 'ESPN / Disney+' },
+    { slug: 'ita.1', name: 'Serie A Itália', defaultChannels: 'ESPN / Disney+' },
   ];
 
   const results = await Promise.all(
@@ -1513,12 +1513,24 @@ async function fetchTodayGames() {
             hour: '2-digit',
             minute: '2-digit',
           }).format(dateObj);
+
+          // Extrai canais informados pela ESPN
+          const rawBroadcasts = [
+            ...(comp?.broadcasts || []).flatMap((b) => b.names || []),
+            ...(comp?.geoBroadcasts || []).map((b) => b.media?.shortName).filter(Boolean),
+          ];
+          const uniqueChannels = [...new Set(rawBroadcasts)].filter(Boolean);
+          const channels = uniqueChannels.length
+            ? uniqueChannels.slice(0, 3).join(' / ')
+            : league.defaultChannels;
+
           return {
             id: ev.id,
             league: league.name,
             home: home?.team?.shortDisplayName || home?.team?.displayName || 'Casa',
             away: away?.team?.shortDisplayName || away?.team?.displayName || 'Visitante',
             time: hora,
+            channels,
             timestamp: dateObj.getTime(),
             status: ev.status?.type?.shortDetail || '',
           };
@@ -1534,6 +1546,7 @@ async function fetchTodayGames() {
   gamesCache = { ts: Date.now(), data: payload };
   return payload;
 }
+
 
 function getBrazilHour() {
   const hourStr = new Intl.DateTimeFormat('pt-BR', {
