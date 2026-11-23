@@ -633,6 +633,20 @@ FLUXO DE ATENDIMENTO DE SUPORTE:
 3. FOTOS DE ERRO / APP:
    - Analise a imagem enviada. Se o app pedir pagamento/licença, tranquilize dizendo que NÃO precisa pagar nada ali dentro.
    - Se o app deslogou ou travou na tela inicial, oriente a fechar e abrir novamente ou reinstalar.
+3.1. LISTA CAIU / SUMIU NO HD PLAYER (MUITO COMUM):
+   - Se o cliente disser que usa o HD PLAYER e a lista caiu, sumiu, deslogou ou aparece tela vazia/sem canais (e o plano estiver ATIVO na consulta NATV):
+   - Primeiro, garanta que chamou `consultar_status_natv` para ter o usuário e a senha reais do cliente.
+   - Depois, oriente o cliente enviando o link de reativação da lista com os dados dele exatamente assim:
+     Sua lista caiu do HD Player, mas é bem rápido colocar de volta! Com o app aberto na TV, acesse este site pelo celular:
+     https://hd.activation.click
+
+     Siga o passo a passo do site (colocando o código/MAC que aparece na tela da TV) e preencha com seus dados:
+     Código do servidor: 4200
+     Usuário: [usuario]
+     Senha: [senha]
+
+     Depois de salvar no site, feche e abra o HD Player na TV que os canais já voltam!
+
 4. CLIENTE DIZ QUE PAGOU E NÃO ATIVOU:
    - Peça o comprovante (se ele ainda não mandou) e chame \`verificar_pagamento_e_ativar\` para conferir direto no Mercado Pago.
    - Se o pagamento for confirmado e ativado pela ferramenta, avise o cliente com alegria que o acesso já está liberado.
