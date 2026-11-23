@@ -1534,20 +1534,28 @@ app.get('/api/novidades/vod', auth, async (req, res) => {
     return res.json(vodCache.data);
   }
 
-  const host = (process.env.XTREAM_HOST || '').replace(/\/$/, '');
-  const user = process.env.XTREAM_USER || '';
-  const pass = process.env.XTREAM_PASS || '';
+  let host = (process.env.XTREAM_HOST || '').trim().replace(/\/$/, '');
+  const user = (process.env.XTREAM_USER || '').trim();
+  const pass = (process.env.XTREAM_PASS || '').trim();
 
   if (!host || !user || !pass) {
     return res.status(400).json({ error: 'Configure XTREAM_HOST, XTREAM_USER e XTREAM_PASS no Easypanel.' });
   }
+  if (!/^https?:\/\//i.test(host)) host = `http://${host}`;
 
   try {
     const base = `${host}/player_api.php?username=${encodeURIComponent(user)}&password=${encodeURIComponent(pass)}`;
+    const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
+
     const [vodRes, seriesRes] = await Promise.all([
-      fetch(`${base}&action=get_vod_streams`),
-      fetch(`${base}&action=get_series`),
+      fetch(`${base}&action=get_vod_streams`, { headers }),
+      fetch(`${base}&action=get_series`, { headers }),
     ]);
+
+    if (!vodRes.ok && !seriesRes.ok) {
+      console.error('❌ [XTREAM VOD] Status:', vodRes.status, seriesRes.status);
+      return res.status(502).json({ error: `Servidor NATV respondeu erro (${vodRes.status}).` });
+    }
 
     const vodRaw = vodRes.ok ? await vodRes.json() : [];
     const seriesRaw = seriesRes.ok ? await seriesRes.json() : [];
@@ -1575,13 +1583,14 @@ app.get('/api/novidades/vod', auth, async (req, res) => {
       }));
 
     const payload = { filmes, series, updated_at: new Date().toISOString() };
-    vodCache = { ts: Date.now(), data: payload };
+    if (filmes.length || series.length) vodCache = { ts: Date.now(), data: payload };
     res.json(payload);
   } catch (err) {
-    console.error('Erro ao buscar novidades VOD:', err.message);
+    console.error('❌ [XTREAM VOD ERRO]:', err.message);
     res.status(500).json({ error: 'Erro ao consultar servidor NATV.' });
   }
 });
+
 
 app.get('/api/novidades/jogos', auth, async (req, res) => {
   if (gamesCache.data && Date.now() - gamesCache.ts < 15 * 60 * 1000) {
