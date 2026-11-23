@@ -1754,47 +1754,82 @@ app.get('/api/novidades/vod', auth, async (req, res) => {
   try {
     const base = `${host}/player_api.php?username=${encodeURIComponent(user)}&password=${encodeURIComponent(pass)}`;
     const headers = { 'User-Agent': 'IPTVSmartersPlayer', Accept: '*/*' };
-    const [vodRes, seriesRes] = await Promise.all([
+
+    const [vodRes, seriesRes, vodCatRes, seriesCatRes] = await Promise.all([
       fetch(`${base}&action=get_vod_streams`, { headers }),
       fetch(`${base}&action=get_series`, { headers }),
+      fetch(`${base}&action=get_vod_categories`, { headers }),
+      fetch(`${base}&action=get_series_categories`, { headers }),
     ]);
 
-    const vodText = await vodRes.text();
-    const seriesText = await seriesRes.text();
-    let vodRaw = [];
-    let seriesRaw = [];
-    try { vodRaw = JSON.parse(vodText); } catch {}
-    try { seriesRaw = JSON.parse(seriesText); } catch {}
+    const parseSafe = async (r) => {
+      try { return JSON.parse(await r.text()); } catch { return []; }
+    };
 
-    const filmes = (Array.isArray(vodRaw) ? vodRaw : [])
+    const vodRaw = await parseSafe(vodRes);
+    const seriesRaw = await parseSafe(seriesRes);
+    const vodCats = await parseSafe(vodCatRes);
+    const seriesCats = await parseSafe(seriesCatRes);
+
+    const vodList = Array.isArray(vodRaw) ? vodRaw : [];
+    const seriesList = Array.isArray(seriesRaw) ? seriesRaw : [];
+
+    // Tenta achar categoria "TOP 10", "MAIS VISTOS", "EM ALTA" ou "DESTAQUES"
+    const isTopCat = (name) => /top\s*10|mais\s*(vistos|assistidos)|em\s*alta|destaque/i.test(String(name || ''));
+    const topVodCatIds = new Set(
+      (Array.isArray(vodCats) ? vodCats : []).filter((c) => isTopCat(c.category_name)).map((c) => String(c.category_id))
+    );
+    const topSeriesCatIds = new Set(
+      (Array.isArray(seriesCats) ? seriesCats : []).filter((c) => isTopCat(c.category_name)).map((c) => String(c.category_id))
+    );
+
+    const mapMovie = (item) => ({
+      id: String(item.stream_id),
+      title: item.name || 'Sem título',
+      cover: item.stream_icon || '',
+      rating: Number(item.rating_5based || item.rating || 0),
+      added: item.added ? new Date(Number(item.added) * 1000).toLocaleDateString('pt-BR') : '',
+    });
+
+    const mapSeries = (item) => ({
+      id: String(item.series_id),
+      title: item.name || 'Sem título',
+      cover: item.cover || '',
+      rating: Number(item.rating_5based || item.rating || 0),
+      added: (item.last_modified || item.added)
+        ? new Date(Number(item.last_modified || item.added) * 1000).toLocaleDateString('pt-BR')
+        : '',
+    });
+
+    const filmes = [...vodList]
       .sort((a, b) => Number(b.added || 0) - Number(a.added || 0))
       .slice(0, 20)
-      .map((item) => ({
-        id: String(item.stream_id),
-        title: item.name || 'Sem título',
-        cover: item.stream_icon || '',
-        added: item.added ? new Date(Number(item.added) * 1000).toLocaleDateString('pt-BR') : '',
-      }));
+      .map(mapMovie);
 
-    const series = (Array.isArray(seriesRaw) ? seriesRaw : [])
+    const series = [...seriesList]
       .sort((a, b) => Number(b.last_modified || b.added || 0) - Number(a.last_modified || a.added || 0))
       .slice(0, 20)
-      .map((item) => ({
-        id: String(item.series_id),
-        title: item.name || 'Sem título',
-        cover: item.cover || '',
-        added: (item.last_modified || item.added)
-          ? new Date(Number(item.last_modified || item.added) * 1000).toLocaleDateString('pt-BR')
-          : '',
-      }));
+      .map(mapSeries);
 
-    const payload = { filmes, series, updated_at: new Date().toISOString() };
+    const topVodSource = topVodCatIds.size
+      ? vodList.filter((i) => topVodCatIds.has(String(i.category_id)))
+      : [...vodList].sort((a, b) => Number(b.rating_5based || 0) - Number(a.rating_5based || 0) || Number(b.added || 0) - Number(a.added || 0));
+
+    const topSeriesSource = topSeriesCatIds.size
+      ? seriesList.filter((i) => topSeriesCatIds.has(String(i.category_id)))
+      : [...seriesList].sort((a, b) => Number(b.rating_5based || 0) - Number(a.rating_5based || 0) || Number(b.last_modified || 0) - Number(a.last_modified || 0));
+
+    const top10_filmes = topVodSource.slice(0, 10).map(mapMovie);
+    const top10_series = topSeriesSource.slice(0, 10).map(mapSeries);
+
+    const payload = { filmes, series, top10_filmes, top10_series, updated_at: new Date().toISOString() };
     if (filmes.length || series.length) vodCache = { ts: Date.now(), data: payload };
     res.json(payload);
   } catch {
     res.status(500).json({ error: 'Erro ao consultar servidor NATV.' });
   }
 });
+
 
 app.get('/api/novidades/jogos', auth, async (req, res) => {
   try {
