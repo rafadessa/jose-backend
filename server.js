@@ -1523,6 +1523,133 @@ async function runRenewalFollowup() {
   }
 }
 
+// ==========================================
+// 10. NOVIDADES (FILMES/SÉRIES NATV + JOGOS DO DIA)
+// ==========================================
+let vodCache = { ts: 0, data: null };
+let gamesCache = { ts: 0, data: null };
+
+app.get('/api/novidades/vod', auth, async (req, res) => {
+  if (vodCache.data && Date.now() - vodCache.ts < 60 * 60 * 1000) {
+    return res.json(vodCache.data);
+  }
+
+  const host = (process.env.XTREAM_HOST || '').replace(/\/$/, '');
+  const user = process.env.XTREAM_USER || '';
+  const pass = process.env.XTREAM_PASS || '';
+
+  if (!host || !user || !pass) {
+    return res.status(400).json({ error: 'Configure XTREAM_HOST, XTREAM_USER e XTREAM_PASS no Easypanel.' });
+  }
+
+  try {
+    const base = `${host}/player_api.php?username=${encodeURIComponent(user)}&password=${encodeURIComponent(pass)}`;
+    const [vodRes, seriesRes] = await Promise.all([
+      fetch(`${base}&action=get_vod_streams`),
+      fetch(`${base}&action=get_series`),
+    ]);
+
+    const vodRaw = vodRes.ok ? await vodRes.json() : [];
+    const seriesRaw = seriesRes.ok ? await seriesRes.json() : [];
+
+    const filmes = (Array.isArray(vodRaw) ? vodRaw : [])
+      .sort((a, b) => Number(b.added || 0) - Number(a.added || 0))
+      .slice(0, 20)
+      .map((item) => ({
+        id: String(item.stream_id),
+        title: item.name || 'Sem título',
+        cover: item.stream_icon || '',
+        added: item.added ? new Date(Number(item.added) * 1000).toLocaleDateString('pt-BR') : '',
+      }));
+
+    const series = (Array.isArray(seriesRaw) ? seriesRaw : [])
+      .sort((a, b) => Number(b.last_modified || b.added || 0) - Number(a.last_modified || a.added || 0))
+      .slice(0, 20)
+      .map((item) => ({
+        id: String(item.series_id),
+        title: item.name || 'Sem título',
+        cover: item.cover || '',
+        added: (item.last_modified || item.added)
+          ? new Date(Number(item.last_modified || item.added) * 1000).toLocaleDateString('pt-BR')
+          : '',
+      }));
+
+    const payload = { filmes, series, updated_at: new Date().toISOString() };
+    vodCache = { ts: Date.now(), data: payload };
+    res.json(payload);
+  } catch (err) {
+    console.error('Erro ao buscar novidades VOD:', err.message);
+    res.status(500).json({ error: 'Erro ao consultar servidor NATV.' });
+  }
+});
+
+app.get('/api/novidades/jogos', auth, async (req, res) => {
+  if (gamesCache.data && Date.now() - gamesCache.ts < 15 * 60 * 1000) {
+    return res.json(gamesCache.data);
+  }
+
+  const todayBr = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Sao_Paulo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date()).replace(/-/g, '');
+
+  const leagues = [
+    { slug: 'bra.1', name: 'Brasileirão Série A' },
+    { slug: 'bra.2', name: 'Brasileirão Série B' },
+    { slug: 'bra.copa_do_brasil', name: 'Copa do Brasil' },
+    { slug: 'conmebol.libertadores', name: 'Libertadores' },
+    { slug: 'conmebol.sudamericana', name: 'Sul-Americana' },
+    { slug: 'uefa.champions', name: 'Champions League' },
+    { slug: 'eng.1', name: 'Premier League' },
+    { slug: 'esp.1', name: 'La Liga' },
+    { slug: 'ita.1', name: 'Serie A Itália' },
+  ];
+
+  try {
+    const results = await Promise.all(
+      leagues.map(async (league) => {
+        try {
+          const r = await fetch(`https://site.api.espn.com/apis/site/v2/sports/soccer/${league.slug}/scoreboard?dates=${todayBr}`);
+          if (!r.ok) return [];
+          const json = await r.json();
+          const events = json.events || [];
+          return events.map((ev) => {
+            const comp = ev.competitions?.[0];
+            const home = comp?.competitors?.find((c) => c.homeAway === 'home');
+            const away = comp?.competitors?.find((c) => c.homeAway === 'away');
+            const dateObj = new Date(ev.date);
+            const hora = new Intl.DateTimeFormat('pt-BR', {
+              timeZone: 'America/Sao_Paulo',
+              hour: '2-digit',
+              minute: '2-digit',
+            }).format(dateObj);
+            return {
+              id: ev.id,
+              league: league.name,
+              home: home?.team?.shortDisplayName || home?.team?.displayName || 'Casa',
+              away: away?.team?.shortDisplayName || away?.team?.displayName || 'Visitante',
+              time: hora,
+              timestamp: dateObj.getTime(),
+              status: ev.status?.type?.shortDetail || '',
+            };
+          });
+        } catch {
+          return [];
+        }
+      })
+    );
+
+    const jogos = results.flat().sort((a, b) => a.timestamp - b.timestamp);
+    const payload = { date: new Date().toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' }), jogos };
+    gamesCache = { ts: Date.now(), data: payload };
+    res.json(payload);
+  } catch (err) {
+    console.error('Erro ao buscar jogos do dia:', err.message);
+    res.status(500).json({ error: 'Erro ao buscar jogos do dia.' });
+  }
+});
 
 
 const PORT = process.env.PORT || 3000;
