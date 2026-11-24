@@ -584,7 +584,7 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
         if (!isVipReseller(reseller)) {
           await debitWallet(
             reseller.id,
-            Number(reseller.cost_per_activation ?? 0.50),
+            Number(reseller.cost_per_activation ?? 0.18),
             'activation',
             `Ativação (${months}m / ${screens} tela(s)): ${lead.natv_username}`
           );
@@ -603,7 +603,8 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
           );
           instanceName = instRes.rows[0]?.instance_name;
         }
-                if (instanceName) {
+
+        if (instanceName) {
           await sendWhatsAppText(
             instanceName,
             lead.phone,
@@ -631,7 +632,8 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
             console.log(`💰 [ALERTA VENDA] Enviado para ${supportJid}`);
           }
         }
-}}
+      }
+    }
   } catch (err) {
     console.error('Erro no webhook mp-reseller:', err);
   }
@@ -1269,7 +1271,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
           }
         }
 
-                        if (fnName === 'gerar_teste') {
+        if (fnName === 'gerar_teste') {
           if (!activeReseller.natv_api_key) {
             toolResult = 'Erro: revendedor sem chave NATV configurada.';
           } else {
@@ -1287,7 +1289,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
                 [natvUser.username, lead.id]
               );
               if (!isVip) {
-                await debitWallet(activeReseller.id, Number(activeReseller.cost_per_test ?? 0.25), 'test_created', `Teste gerado: ${natvUser.username}`);
+                await debitWallet(activeReseller.id, Number(activeReseller.cost_per_test ?? 0.18), 'test_created', `Teste gerado: ${natvUser.username}`);
               }
               toolResult = JSON.stringify({
                 app_escolhido: lead.chosen_app || '',
@@ -1301,7 +1303,6 @@ app.post('/api/webhooks/evolution', async (req, res) => {
             }
           }
         }
-
 
         if (fnName === 'gerar_pix_plano') {
           const screens = Number(args.screens) || 1;
@@ -1375,12 +1376,12 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       replyText = `Te enviei o ícone do ${sentLogoApp} acima 👆 Pode procurar ele na loja da sua TV, instalar e me mandar uma foto da tela inicial dele?`;
     }
 
-        if (replyText) {
+    if (replyText) {
       await sendWhatsAppText(instance, remoteJid, replyText);
       console.log('6. [ENVIADO COM SUCESSO]');
 
       if (!isVip) {
-        await debitWallet(activeReseller.id, Number(activeReseller.cost_per_reply ?? 0.10), 'reply', `Resposta IA: ${lead.name || lead.phone}`);
+        await debitWallet(activeReseller.id, Number(activeReseller.cost_per_reply ?? 0.09), 'reply', `Resposta IA: ${lead.name || lead.phone}`);
       }
       await pool.query(`INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`, [lead.id, replyText]);
       await pool.query('UPDATE leads SET last_message = $1, last_interaction = now() WHERE id = $2', [replyText, lead.id]);
@@ -1458,7 +1459,6 @@ app.get('/api/leads/stats', auth, async (req, res) => {
   }
 });
 
-
 app.get('/api/leads/:leadId/messages', auth, async (req, res) => {
   try {
     const leadCheck = await pool.query('SELECT id FROM leads WHERE id = $1 AND reseller_id = $2', [req.params.leadId, req.user.id]);
@@ -1508,7 +1508,6 @@ app.post('/api/leads/:leadId/toggle-ai', auth, async (req, res) => {
     res.status(500).json({ error: 'Erro ao alterar status da IA' });
   }
 });
-
 
 // ==========================================
 // 8. CLIENTES NATV & TABELAS
@@ -1566,15 +1565,6 @@ async function initFollowupColumns() {
       ADD COLUMN IF NOT EXISTS last_followup_at TIMESTAMP,
       ADD COLUMN IF NOT EXISTS renewal_last_exp TEXT,
       ADD COLUMN IF NOT EXISTS renewal_stage TEXT,
-      ADD COLUMN IF NOT EXISTS instance_name TEXT;
-    `);
-    
-        await pool.query(`
-      ALTER TABLE leads
-      ADD COLUMN IF NOT EXISTS followup_step INTEGER DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS last_followup_at TIMESTAMP,
-      ADD COLUMN IF NOT EXISTS renewal_last_exp TEXT,
-      ADD COLUMN IF NOT EXISTS renewal_stage TEXT,
       ADD COLUMN IF NOT EXISTS instance_name TEXT,
       ADD COLUMN IF NOT EXISTS test_created_at TIMESTAMP;
     `);
@@ -1584,6 +1574,10 @@ async function initFollowupColumns() {
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS bot_name TEXT DEFAULT 'José';`);
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS custom_prices JSONB;`);
     await pool.query(`ALTER TABLE resellers ALTER COLUMN natv_credits TYPE NUMERIC(10,2) USING natv_credits::numeric;`);
+    await pool.query(`ALTER TABLE resellers ALTER COLUMN cost_per_reply SET DEFAULT 0.09;`);
+    await pool.query(`ALTER TABLE resellers ALTER COLUMN cost_per_test SET DEFAULT 0.18;`);
+    await pool.query(`ALTER TABLE resellers ALTER COLUMN cost_per_activation SET DEFAULT 0.18;`);
+    await pool.query(`UPDATE resellers SET cost_per_reply = 0.09, cost_per_test = 0.18, cost_per_activation = 0.18;`);
     await pool.query(`ALTER TABLE whatsapp_instances ADD COLUMN IF NOT EXISTS bot_type TEXT DEFAULT 'sales';`);
     await pool.query(`
       CREATE TABLE IF NOT EXISTS processed_payments (
@@ -2119,7 +2113,6 @@ const ACTIVATION_CATALOG = [
   { id: 'bob_player', name: 'Bob Player', price: 17.0, fields: ['mac', 'device_key'] },
 ];
 
-
 async function initActivationsTable() {
   try {
     await pool.query(`
@@ -2268,7 +2261,6 @@ app.patch('/api/activations/:id/status', auth, async (req, res) => {
     res.status(500).json({ error: 'Erro ao atualizar status' });
   }
 });
-
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`API do José rodando na porta ${PORT}`));
