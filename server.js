@@ -15,7 +15,10 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use('/logos', express.static(path.join(__dirname, 'logos')));
 
 app.get('/', (req, res) =>
-  res.json({ status: 'ok', app: 'API do José v4.1 (Créditos Decimais + Fix Auto-Pause + TVs Antigas + Top 10 + Canais)' })
+  res.json({
+    status: 'ok',
+    app: 'API do José v4.2 (Fix Gemini 3.5 + Fix @lid + Fix Stats + Créditos Decimais + TVs Antigas + Top 10 + Canais)',
+  })
 );
 
 const pool = new Pool({
@@ -630,7 +633,7 @@ const APP_LOGOS = {
 function buildSalesPrompt(reseller) {
   const botName = reseller?.bot_name || 'José';
   const prices = getResellerPrices(reseller);
-  const apps = getResellerApps(reseller, true); // Remove MaxPlayer se revenda não tiver token
+  const apps = getResellerApps(reseller, true);
   const hasMaxPlayer = Boolean(reseller?.maxplayer_token);
 
   const formatLine = (list) =>
@@ -792,18 +795,26 @@ PLANOS PARA RENOVAÇÃO / UPGRADE:
 // Registro de envios do bot (evita que o eco da Evolution pause a IA)
 const botSentIds = new Set();
 const botSendingWindow = new Map();
+const botInstanceWindow = new Map();
 
-function markBotSending(remoteJid) {
-  if (!remoteJid) return;
-  const clean = String(remoteJid).replace(/@.*$/, '');
-  botSendingWindow.set(clean, Date.now());
+function markBotSending(instanceName, remoteJid) {
+  const now = Date.now();
+  if (instanceName) botInstanceWindow.set(instanceName, now);
+  if (remoteJid) {
+    const clean = String(remoteJid).replace(/@.*$/, '');
+    botSendingWindow.set(clean, now);
+  }
 }
 
-function isBotEcho(remoteJid, msgId) {
+function isBotEcho(instanceName, remoteJid, msgId) {
   if (msgId && botSentIds.has(msgId)) return true;
+  const now = Date.now();
   const clean = String(remoteJid || '').replace(/@.*$/, '');
-  const lastSent = botSendingWindow.get(clean);
-  return Boolean(lastSent && Date.now() - lastSent < 10000);
+  const lastJid = botSendingWindow.get(clean);
+  if (lastJid && now - lastJid < 10000) return true;
+  const lastInst = botInstanceWindow.get(instanceName);
+  if (lastInst && now - lastInst < 6000) return true;
+  return false;
 }
 
 function trackBotSentId(id) {
@@ -813,7 +824,7 @@ function trackBotSentId(id) {
 }
 
 async function sendWhatsAppText(instanceName, remoteJid, text) {
-  markBotSending(remoteJid);
+  markBotSending(instanceName, remoteJid);
   try {
     const res = await fetch(`${EVOLUTION_URL}/message/sendText/${instanceName}`, {
       method: 'POST',
@@ -832,7 +843,7 @@ async function sendWhatsAppText(instanceName, remoteJid, text) {
 
 async function sendWhatsAppImage(instanceName, remoteJid, imageUrl, caption) {
   if (!imageUrl || imageUrl.includes('SEU_LINK_DO_JOSE_API')) return;
-  markBotSending(remoteJid);
+  markBotSending(instanceName, remoteJid);
 
   const isJpg = /\.jpe?g(\?|$)/i.test(imageUrl);
   const isWebp = /\.webp(\?|$)/i.test(imageUrl);
@@ -918,7 +929,7 @@ async function analyzeMediaWithGemini(base64, mimeType, promptText) {
 }
 
 async function callGeminiWithFallback(apiKey, messagesPayload, tools) {
-  const models = ['gemini-2.5-flash', 'gemini-2.5-flash-lite'];
+  const models = ['gemini-2.5-flash', 'gemini-3.5-flash-lite'];
   for (const model of models) {
     for (let attempt = 1; attempt <= 2; attempt++) {
       const res = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
@@ -960,9 +971,9 @@ app.post('/api/webhooks/evolution', async (req, res) => {
 
     if (!remoteJid || remoteJid.includes('@g.us')) return;
 
-    // DETECÇÃO DE INTERVENÇÃO HUMANA PELO CELULAR (fromMe === true e não foi eco do bot)
+    // DETECÇÃO DE INTERVENÇÃO HUMANA PELO CELULAR (ignora @lid e ecos do bot)
     if (fromMe) {
-      if (!isBotEcho(remoteJid, msgId)) {
+      if (!remoteJid.endsWith('@lid') && !isBotEcho(instance, remoteJid, msgId)) {
         const instCheck = await pool.query(
           `SELECT reseller_id FROM whatsapp_instances WHERE instance_name = $1`,
           [instance]
@@ -1375,7 +1386,7 @@ app.get('/api/leads/stats', auth, async (req, res) => {
          COUNT(*) FILTER (WHERE stage = 'ATIVO') AS sales_today
        FROM leads
        WHERE reseller_id = $1
-         AND (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Sao_Paulo')::date =
+         AND (COALESCE(last_interaction, created_at) AT TIME ZONE 'America/Sao_Paulo')::date =
              (NOW() AT TIME ZONE 'America/Sao_Paulo')::date`,
       [req.user.id]
     );
@@ -1383,9 +1394,18 @@ app.get('/api/leads/stats', auth, async (req, res) => {
     const conversationsToday = Number(row.conversations_today || 0);
     const testsToday = Number(row.tests_today || 0);
     const salesToday = Number(row.sales_today || 0);
-    const conversionRate = conversationsToday > 0 ? Number(((salesToday / conversationsToday) * 100).toFixed(1)) : 0;
-    res.json({ conversations_today: conversationsToday, tests_today: testsToday, sales_today: salesToday, conversion_rate: conversionRate });
-  } catch {
+    const conversionRate =
+      conversationsToday > 0
+        ? Number(((salesToday / conversationsToday) * 100).toFixed(1))
+        : 0;
+    res.json({
+      conversations_today: conversationsToday,
+      tests_today: testsToday,
+      sales_today: salesToday,
+      conversion_rate: conversionRate,
+    });
+  } catch (err) {
+    console.error('❌ [ERRO /api/leads/stats]:', err.message);
     res.status(500).json({ error: 'Erro ao carregar estatísticas' });
   }
 });
