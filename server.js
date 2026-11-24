@@ -1364,41 +1364,19 @@ app.post('/api/webhooks/evolution', async (req, res) => {
 // ==========================================
 // 7. CHAT AO VIVO E ESTATÍSTICAS DE LEADS
 // ==========================================
-app.get('/api/leads/stats', auth, async (req, res) => {
+app.get('/api/leads', auth, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT
-         COUNT(*) AS conversations_today,
-         COUNT(*) FILTER (WHERE stage IN ('TESTE', 'ATIVO') OR natv_username IS NOT NULL) AS tests_today,
-         COUNT(*) FILTER (WHERE stage = 'ATIVO') AS sales_today
-       FROM leads
-       WHERE reseller_id = $1
-         AND (COALESCE(last_interaction, created_at) AT TIME ZONE 'America/Sao_Paulo')::date =
-             (NOW() AT TIME ZONE 'America/Sao_Paulo')::date`,
+      `SELECT id, phone, name, last_message, last_interaction, stage, chosen_app, natv_username, needs_human, needs_human AS ai_paused, tab
+       FROM leads WHERE reseller_id = $1 ORDER BY last_interaction DESC`,
       [req.user.id]
     );
-    const row = result.rows[0] || {};
-    const conversationsToday = Number(row.conversations_today || 0);
-    const testsToday = Number(row.tests_today || 0);
-    const salesToday = Number(row.sales_today || 0);
-    const conversionRate =
-      conversationsToday > 0
-        ? Number(((salesToday / conversationsToday) * 100).toFixed(1))
-        : 0;
-
-    res.json({
-      conversations_today: conversationsToday,
-      tests_today: testsToday,
-      sales_today: salesToday,
-      conversion_rate: conversionRate,
-    });
-  } catch (err) {
-    console.error('❌ [ERRO /api/leads/stats]:', err.message);
-    res.status(500).json({ error: 'Erro ao carregar estatísticas' });
+    res.json(result.rows);
+  } catch {
+    res.status(500).json({ error: 'Erro ao carregar conversas' });
   }
 });
 
-
 app.get('/api/leads/stats', auth, async (req, res) => {
   try {
     const result = await pool.query(
@@ -1420,6 +1398,7 @@ app.get('/api/leads/stats', auth, async (req, res) => {
       conversationsToday > 0
         ? Number(((salesToday / conversationsToday) * 100).toFixed(1))
         : 0;
+
     res.json({
       conversations_today: conversationsToday,
       tests_today: testsToday,
@@ -1481,6 +1460,7 @@ app.post('/api/leads/:leadId/toggle-ai', auth, async (req, res) => {
     res.status(500).json({ error: 'Erro ao alterar status da IA' });
   }
 });
+
 
 // ==========================================
 // 8. CLIENTES NATV & TABELAS
