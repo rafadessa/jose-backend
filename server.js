@@ -1269,7 +1269,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
           }
         }
 
-                if (fnName === 'gerar_teste') {
+                        if (fnName === 'gerar_teste') {
           if (!activeReseller.natv_api_key) {
             toolResult = 'Erro: revendedor sem chave NATV configurada.';
           } else {
@@ -1282,7 +1282,6 @@ app.post('/api/webhooks/evolution', async (req, res) => {
             const natvUser = await natvRes.json();
             if (natvRes.ok) {
               lead.natv_username = natvUser.username;
-              // 👇 É NESTA LINHA ABAIXO QUE VOCÊ ADICIONA ", test_created_at = now()"
               await pool.query(
                 `UPDATE leads SET stage = 'TESTE', natv_username = $1, followup_step = 0, test_created_at = now() WHERE id = $2`,
                 [natvUser.username, lead.id]
@@ -1290,6 +1289,19 @@ app.post('/api/webhooks/evolution', async (req, res) => {
               if (!isVip) {
                 await debitWallet(activeReseller.id, Number(activeReseller.cost_per_test ?? 0.25), 'test_created', `Teste gerado: ${natvUser.username}`);
               }
+              toolResult = JSON.stringify({
+                app_escolhido: lead.chosen_app || '',
+                codigo_watch_hub: activeReseller.watch_hub_code || '',
+                usuario: natvUser.username,
+                senha: natvUser.password,
+                dominio: natvUser.domain,
+              });
+            } else {
+              toolResult = 'Erro ao gerar teste na NATV.';
+            }
+          }
+        }
+
 
         if (fnName === 'gerar_pix_plano') {
           const screens = Number(args.screens) || 1;
