@@ -603,15 +603,35 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
           );
           instanceName = instRes.rows[0]?.instance_name;
         }
-        if (instanceName) {
+                if (instanceName) {
           await sendWhatsAppText(
             instanceName,
             lead.phone,
             `Pagamento confirmado! 🎉 Seu plano de ${months} ${months === 1 ? 'mês' : 'meses'} (${screens} ${screens === 1 ? 'tela' : 'telas'}) já foi ativado automaticamente. Bom entretenimento!`
           );
+
+          // Notificação de venda para o WhatsApp de suporte humano da revenda
+          if (reseller.support_whatsapp) {
+            const digits = String(reseller.support_whatsapp).replace(/\D/g, '');
+            const supportNumber = digits.length <= 11 ? `55${digits}` : digits;
+            const supportJid = `${supportNumber}@s.whatsapp.net`;
+            const clientPhone = String(lead.phone || '').replace(/@.*$/, '');
+            const amountPaid = formatBRL(payment.transaction_amount);
+
+            const saleAlert =
+              `💰 *Nova Venda Confirmada!*\n\n` +
+              `Cliente: ${lead.name || 'Sem nome'}\n` +
+              `WhatsApp: ${clientPhone}\n` +
+              `Usuário NATV: ${lead.natv_username}\n` +
+              `Plano: ${months} ${months === 1 ? 'mês' : 'meses'} (${screens} ${screens === 1 ? 'tela' : 'telas'})\n` +
+              `Valor: R$ ${amountPaid}\n\n` +
+              `✅ Ativado automaticamente pelo ${reseller.bot_name || 'José'}.`;
+
+            await sendWhatsAppText(instanceName, supportJid, saleAlert);
+            console.log(`💰 [ALERTA VENDA] Enviado para ${supportJid}`);
+          }
         }
-      }
-    }
+
   } catch (err) {
     console.error('Erro no webhook mp-reseller:', err);
   }
