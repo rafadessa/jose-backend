@@ -15,7 +15,7 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use('/logos', express.static(path.join(__dirname, 'logos')));
 
 app.get('/', (req, res) =>
-  res.json({ status: 'ok', app: 'API do José v4.0 (Personalizações + Remarketing Jogos + Auto-Pause Humano)' })
+  res.json({ status: 'ok', app: 'API do José v4.1 (Créditos Decimais + Fix Auto-Pause + TVs Antigas + Top 10 + Canais)' })
 );
 
 const pool = new Pool({
@@ -202,7 +202,7 @@ app.post('/api/auth/natv-login', async (req, res) => {
     }
 
     const natvData = await response.json();
-    const credits = natvData.credits ?? 0;
+    const credits = Number(natvData.credits ?? 0);
     const natvName = natvData.username || natvData.name || `revenda_${natvData.id || Date.now()}`;
     const fakeEmail = `${natvName.toLowerCase().replace(/[^a-z0-9]/g, '')}@natv.jose`;
 
@@ -268,7 +268,7 @@ app.post('/api/natv/validate', auth, async (req, res) => {
     if (!response.ok) return res.status(400).json({ error: 'Chave de API NATV inválida' });
 
     const natvData = await response.json();
-    const credits = natvData.credits ?? 0;
+    const credits = Number(natvData.credits ?? 0);
     await pool.query(
       'UPDATE resellers SET natv_api_key = $1, natv_credits = $2 WHERE id = $3',
       [natv_api_key, credits, req.user.id]
@@ -588,7 +588,7 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
         }
 
         if (actData.owner?.credits !== undefined) {
-          await pool.query('UPDATE resellers SET natv_credits = $1 WHERE id = $2', [actData.owner.credits, reseller.id]);
+          await pool.query('UPDATE resellers SET natv_credits = $1 WHERE id = $2', [Number(actData.owner.credits), reseller.id]);
         }
 
         let instanceName = lead.instance_name;
@@ -667,7 +667,7 @@ APPS POR APARELHO (indique sempre a 1ª opção primeiro, seguindo exatamente es
 - Roku: ${formatLine(apps.roku)}
 - LG: ${formatLine(apps.lg)}
 - Android/Google TV / TV Box / Fire Stick: ${formatLine(apps.android)}
-- iPhone / iPad (iOS): 1º WATCH HUB (chame enviar_logo_app para WATCH HUB e, ao gerar o teste, entregue com o codigo_watch_hub, Usuário e Senha)
+- iPhone / iPad (iOS): 1º WATCH HUB (chame \`enviar_logo_app\` para WATCH HUB e, ao gerar o teste, entregue com o \`codigo_watch_hub\`, Usuário e Senha)
 
 REGRA DO DOWNLOADER (ANDROID / TV BOX / FIRE STICK):
 - Se o cliente disser que usa o app Downloader para baixar (ou se for para a 3ª opção no Android/Fire Stick), peça para ele digitar o código **670156** no Downloader para instalar o **TXS PRO PLAYER**.
@@ -675,6 +675,7 @@ REGRA DO DOWNLOADER (ANDROID / TV BOX / FIRE STICK):
   Seu teste está pronto! Basta abrir o TXS PRO PLAYER e entrar com:
   Usuário: [usuario]
   Senha: [senha]
+
 SMART TVS ANTIGAS E OUTRAS MARCAS (PERGUNTE SEMPRE O SISTEMA/ANO):
 - Se o cliente citar TVs Philips, AOC, TCL, Sharp, Multilaser, Panasonic ou Samsung antiga, pergunte primeiro qual é o sistema da TV (se é Android/Google TV, Roku ou Smart antiga) antes de indicar o app.
 
@@ -704,8 +705,6 @@ SMART TVS ANTIGAS E OUTRAS MARCAS (PERGUNTE SEMPRE O SISTEMA/ANO):
   • DUPLEX PLAY (pago): 192.185.7.111 (só funciona se o controle remoto tiver o botão SMART HUB colorido)
   • SMART UP (grátis): 193.201.81.128 (só roda com DNS configurado na rede da TV)
 
-
-
 CONDUÇÃO FIRME DE APPS (MUITO IMPORTANTE):
 - Se o cliente mandar foto de um app diferente do recomendado, NÃO tente configurar esse app. Reconheça qual app ele abriu, confirme a marca da TV e peça com educação e firmeza para abrir o app certo que você indicou e mandar foto da tela inicial dele.
 - Se o app mostrar tela de pagamento, licença ou ativação paga, tranquilize o cliente dizendo que ele NÃO precisa pagar nada ali dentro do app.
@@ -724,6 +723,12 @@ FERRAMENTAS:
     https://hd.activation.click
 
     Código do servidor: 4200
+    Usuário: [usuario]
+    Senha: [senha]
+  - Se o app escolhido for PLAYER MASTER, entregue EXATAMENTE neste formato:
+    Seu teste está pronto! Basta abrir o PLAYER MASTER e entrar com estes dados:
+
+    Código: 4100
     Usuário: [usuario]
     Senha: [senha]
 ${maxPlayerBlock}  - Se o app escolhido for TXS PRO PLAYER, entregue apenas Usuário e Senha.
@@ -798,7 +803,7 @@ function isBotEcho(remoteJid, msgId) {
   if (msgId && botSentIds.has(msgId)) return true;
   const clean = String(remoteJid || '').replace(/@.*$/, '');
   const lastSent = botSendingWindow.get(clean);
-  return Boolean(lastSent && Date.now() - lastSent < 10000); // 10s de janela
+  return Boolean(lastSent && Date.now() - lastSent < 10000);
 }
 
 function trackBotSentId(id) {
@@ -808,7 +813,7 @@ function trackBotSentId(id) {
 }
 
 async function sendWhatsAppText(instanceName, remoteJid, text) {
-  markBotSending(remoteJid); // Marca ANTES de chamar a Evolution
+  markBotSending(remoteJid);
   try {
     const res = await fetch(`${EVOLUTION_URL}/message/sendText/${instanceName}`, {
       method: 'POST',
@@ -827,7 +832,7 @@ async function sendWhatsAppText(instanceName, remoteJid, text) {
 
 async function sendWhatsAppImage(instanceName, remoteJid, imageUrl, caption) {
   if (!imageUrl || imageUrl.includes('SEU_LINK_DO_JOSE_API')) return;
-  markBotSending(remoteJid); // Marca ANTES de chamar a Evolution
+  markBotSending(remoteJid);
 
   const isJpg = /\.jpe?g(\?|$)/i.test(imageUrl);
   const isWebp = /\.webp(\?|$)/i.test(imageUrl);
@@ -955,7 +960,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
 
     if (!remoteJid || remoteJid.includes('@g.us')) return;
 
-        // DETECÇÃO DE INTERVENÇÃO HUMANA PELO CELULAR (fromMe === true e não foi eco do bot)
+    // DETECÇÃO DE INTERVENÇÃO HUMANA PELO CELULAR (fromMe === true e não foi eco do bot)
     if (fromMe) {
       if (!isBotEcho(remoteJid, msgId)) {
         const instCheck = await pool.query(
@@ -973,7 +978,6 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       }
       return;
     }
-
 
     // 1. TRAVA IMEDIATA CONTRA DUPLICIDADE
     if (processedMessages.has(msgId)) return;
@@ -1498,6 +1502,7 @@ async function initFollowupColumns() {
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS custom_apps JSONB;`);
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS bot_name TEXT DEFAULT 'José';`);
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS custom_prices JSONB;`);
+    await pool.query(`ALTER TABLE resellers ALTER COLUMN natv_credits TYPE NUMERIC(10,2) USING natv_credits::numeric;`);
     await pool.query(`ALTER TABLE whatsapp_instances ADD COLUMN IF NOT EXISTS bot_type TEXT DEFAULT 'sales';`);
     await pool.query(`
       CREATE TABLE IF NOT EXISTS processed_payments (
@@ -1516,7 +1521,7 @@ async function initFollowupColumns() {
 initFollowupColumns();
 
 // ==========================================
-// 9. NOVIDADES (VOD + JOGOS DO DIA) E REMARKETING AUTOMÁTICO
+// 9. NOVIDADES (VOD + TOP 10 + JOGOS COM CANAIS) E REMARKETING
 // ==========================================
 let vodCache = { ts: 0, data: null };
 let gamesCache = { ts: 0, data: null };
@@ -1562,7 +1567,6 @@ async function fetchTodayGames() {
             minute: '2-digit',
           }).format(dateObj);
 
-          // Extrai canais informados pela ESPN
           const rawBroadcasts = [
             ...(comp?.broadcasts || []).flatMap((b) => b.names || []),
             ...(comp?.geoBroadcasts || []).map((b) => b.media?.shortName).filter(Boolean),
@@ -1594,7 +1598,6 @@ async function fetchTodayGames() {
   gamesCache = { ts: Date.now(), data: payload };
   return payload;
 }
-
 
 function getBrazilHour() {
   const hourStr = new Intl.DateTimeFormat('pt-BR', {
@@ -1822,7 +1825,6 @@ app.get('/api/novidades/vod', auth, async (req, res) => {
     const vodList = Array.isArray(vodRaw) ? vodRaw : [];
     const seriesList = Array.isArray(seriesRaw) ? seriesRaw : [];
 
-    // Tenta achar categoria "TOP 10", "MAIS VISTOS", "EM ALTA" ou "DESTAQUES"
     const isTopCat = (name) => /top\s*10|mais\s*(vistos|assistidos)|em\s*alta|destaque/i.test(String(name || ''));
     const topVodCatIds = new Set(
       (Array.isArray(vodCats) ? vodCats : []).filter((c) => isTopCat(c.category_name)).map((c) => String(c.category_id))
@@ -1877,7 +1879,6 @@ app.get('/api/novidades/vod', auth, async (req, res) => {
     res.status(500).json({ error: 'Erro ao consultar servidor NATV.' });
   }
 });
-
 
 app.get('/api/novidades/jogos', auth, async (req, res) => {
   try {
