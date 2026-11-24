@@ -1407,25 +1407,43 @@ app.get('/api/leads', auth, async (req, res) => {
 
 app.get('/api/leads/stats', auth, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT
-         COUNT(*) AS conversations_today,
-         COUNT(*) FILTER (WHERE stage IN ('TESTE', 'ATIVO') OR natv_username IS NOT NULL) AS tests_today,
-         COUNT(*) FILTER (WHERE stage = 'ATIVO') AS sales_today
-       FROM leads
-       WHERE reseller_id = $1
-         AND (COALESCE(last_interaction, created_at) AT TIME ZONE 'America/Sao_Paulo')::date =
-             (NOW() AT TIME ZONE 'America/Sao_Paulo')::date`,
-      [req.user.id]
-    );
-    const row = result.rows[0] || {};
-    const conversationsToday = Number(row.conversations_today || 0);
-    const testsToday = Number(row.tests_today || 0);
-    const salesToday = Number(row.sales_today || 0);
+    const todayBrStr = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Sao_Paulo',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date());
+    const startOfTodayBr = new Date(`${todayBrStr}T00:00:00-03:00`);
+
+    const [leadsResult, salesResult] = await Promise.all([
+      pool.query(
+        `SELECT
+           COUNT(*) FILTER (WHERE last_interaction >= $2) AS conversations_today,
+           COUNT(*) FILTER (WHERE test_created_at >= $2) AS tests_today
+         FROM leads
+         WHERE reseller_id = $1`,
+        [req.user.id, startOfTodayBr]
+      ),
+      pool.query(
+        `SELECT COUNT(*) AS sales_today
+         FROM processed_payments
+         WHERE reseller_id = $1
+           AND created_at >= $2`,
+        [req.user.id, startOfTodayBr]
+      ),
+    ]);
+
+    const conversationsToday = Number(leadsResult.rows[0]?.conversations_today || 0);
+    const testsToday = Number(leadsResult.rows[0]?.tests_today || 0);
+    const salesToday = Number(salesResult.rows[0]?.sales_today || 0);
     const conversionRate =
       conversationsToday > 0
         ? Number(((salesToday / conversationsToday) * 100).toFixed(1))
         : 0;
+
+    console.log(
+      `📊 [STATS ${req.user.id.slice(0, 6)}] Conversas: ${conversationsToday} | Testes: ${testsToday} | Vendas: ${salesToday}`
+    );
 
     res.json({
       conversations_today: conversationsToday,
@@ -1438,6 +1456,7 @@ app.get('/api/leads/stats', auth, async (req, res) => {
     res.status(500).json({ error: 'Erro ao carregar estatísticas' });
   }
 });
+
 
 app.get('/api/leads/:leadId/messages', auth, async (req, res) => {
   try {
