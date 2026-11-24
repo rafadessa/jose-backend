@@ -708,7 +708,7 @@ ROTEIRO DO APLICATIVO CLOUDDY (PASSO A PASSO CURTO — UM PASSO POR VEZ):
   2. Passo 2 (Criar conta): Assim que instalar, envie exatamente:
      "Agora pelo celular, acesse https://console.clouddy.online e crie sua conta com seu e-mail e uma senha simples. Depois abra seu e-mail e clique no link de confirmação que eles enviam. Me avisa assim que confirmar!"
   3. Passo 3 (Entrar na TV): Quando o cliente confirmar que criou e validou o e-mail, peça para ele abrir o Clouddy na TV, fazer login com esse e-mail e senha e avisar quando aparecer a tela inicial.
-  4. Passo 4 (Teste): Só então chame `gerar_teste` e envie os dados (Usuário, Senha e Domínio) orientando o cliente a adicionar a lista no site do Clouddy (ou, se ele preferir que o suporte coloque a lista pra ele, chame `chamar_humano`).
+  4. Passo 4 (Teste): Só então chame gerar_teste e envie os dados (Usuário, Senha e Domínio) orientando o cliente a adicionar a lista no site do Clouddy (ou, se ele preferir que o suporte coloque a lista pra ele, chame chamar_humano).
 
 1) AOC ANTIGA (só Smart, sem Roku/Android):
 - 1ª opção: procurar o app CLOUDDY na loja da TV. Se não achar, orientar a clicar no botão VERDE do controle e ir mudando o país olhando um por um.
