@@ -2106,5 +2106,169 @@ app.post('/api/gestor/vincular', auth, async (req, res) => {
   }
 });
 
+// ==========================================
+// 11. PAINEL DE ATIVAÇÕES DE APPS (FILA + ALERTA WHATSAPP)
+// ==========================================
+const ACTIVATION_CATALOG = [
+  { id: 'clouddy', name: 'Clouddy', price: 25.0, fields: ['email'] },
+  { id: 'iboplayer', name: 'IBO Player', price: 17.0, fields: ['mac', 'device_key'] },
+  { id: 'iboplayer_pro', name: 'IBO Player Pro', price: 20.0, fields: ['mac', 'device_key'] },
+  { id: 'duplecast', name: 'Duplecast', price: 25.0, fields: ['mac', 'device_key'] },
+  { id: 'quick_player', name: 'Quick Player', price: 20.0, fields: ['mac'] },
+  { id: 'vu_player', name: 'VU Player', price: 25.0, fields: ['mac', 'device_key'] },
+  { id: 'bob_player', name: 'Bob Player', price: 17.0, fields: ['mac', 'device_key'] },
+];
+
+
+async function initActivationsTable() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS app_activations (
+        id SERIAL PRIMARY KEY,
+        reseller_id UUID NOT NULL,
+        app_id TEXT NOT NULL,
+        app_name TEXT NOT NULL,
+        mac_address TEXT,
+        device_key TEXT,
+        account_email TEXT,
+        price NUMERIC(10,2) NOT NULL,
+        status TEXT DEFAULT 'PENDENTE',
+        created_at TIMESTAMP DEFAULT now()
+      );
+    `);
+  } catch (err) {
+    console.error('Erro ao criar tabela app_activations:', err.message);
+  }
+}
+initActivationsTable();
+
+app.get('/api/activations/catalog', auth, (req, res) => {
+  res.json({ catalog: ACTIVATION_CATALOG });
+});
+
+app.get('/api/activations', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM app_activations WHERE reseller_id = $1 ORDER BY created_at DESC LIMIT 50`,
+      [req.user.id]
+    );
+    res.json({ activations: result.rows });
+  } catch {
+    res.status(500).json({ error: 'Erro ao carregar histórico de ativações' });
+  }
+});
+
+app.post('/api/activations', auth, async (req, res) => {
+  const { app_id, mac_address, device_key, account_email } = req.body || {};
+  const appItem = ACTIVATION_CATALOG.find((a) => a.id === app_id);
+  if (!appItem) return res.status(400).json({ error: 'Aplicativo inválido' });
+
+  if (appItem.fields.includes('email') && !String(account_email || '').trim()) {
+    return res.status(400).json({ error: 'Informe o e-mail da conta Clouddy' });
+  }
+  if (appItem.fields.includes('mac') && !String(mac_address || '').trim()) {
+    return res.status(400).json({ error: 'Informe o MAC Address' });
+  }
+  if (appItem.fields.includes('device_key') && !String(device_key || '').trim()) {
+    return res.status(400).json({ error: 'Informe a Device Key' });
+  }
+
+  try {
+    const resQuery = await pool.query('SELECT * FROM resellers WHERE id = $1', [req.user.id]);
+    const reseller = resQuery.rows[0];
+    if (!reseller) return res.status(404).json({ error: 'Revendedor não encontrado' });
+
+    const balance = Number(reseller.wallet_balance || 0);
+    if (balance < appItem.price) {
+      return res.status(400).json({
+        error: `Saldo insuficiente na Carteira José (necessário R$ ${formatBRL(appItem.price)}).`,
+      });
+    }
+
+    // Debita da Carteira José
+    await debitWallet(
+      reseller.id,
+      appItem.price,
+      'app_activation',
+      `Ativação ${appItem.name} (${account_email || mac_address})`
+    );
+
+    // Salva na fila como PENDENTE
+    const inserted = await pool.query(
+      `INSERT INTO app_activations (reseller_id, app_id, app_name, mac_address, device_key, account_email, price, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDENTE') RETURNING *`,
+      [
+        reseller.id,
+        appItem.id,
+        appItem.name,
+        mac_address ? String(mac_address).trim() : null,
+        device_key ? String(device_key).trim() : null,
+        account_email ? String(account_email).trim() : null,
+        appItem.price,
+      ]
+    );
+    const order = inserted.rows[0];
+
+    // Dispara alerta no WhatsApp do administrador
+    const adminPhone = String(process.env.ADMIN_ACTIVATION_WHATSAPP || '555198970564').replace(/\D/g, '');
+    if (adminPhone) {
+      const instRes = await pool.query(
+        `SELECT instance_name FROM whatsapp_instances WHERE reseller_id = $1 LIMIT 1`,
+        [reseller.id]
+      );
+      let instanceName = instRes.rows[0]?.instance_name;
+      if (!instanceName) {
+        const anyInst = await pool.query(`SELECT instance_name FROM whatsapp_instances LIMIT 1`);
+        instanceName = anyInst.rows[0]?.instance_name;
+      }
+
+      if (instanceName) {
+        const formatted = adminPhone.length <= 11 ? `55${adminPhone}` : adminPhone;
+        const adminJid = `${formatted}@s.whatsapp.net`;
+        const details = [
+          order.account_email ? `E-mail: ${order.account_email}` : null,
+          order.mac_address ? `MAC: ${order.mac_address}` : null,
+          order.device_key ? `Device Key: ${order.device_key}` : null,
+        ]
+          .filter(Boolean)
+          .join('\n');
+
+        const alertMsg =
+          `⚡ *Novo Pedido de Ativação #${order.id}*\n\n` +
+          `Revendedor: ${reseller.name}\n` +
+          `App: *${order.app_name}*\n` +
+          `${details}\n` +
+          `Valor debitado: R$ ${formatBRL(order.price)}\n\n` +
+          `Status: PENDENTE`;
+
+        await sendWhatsAppText(instanceName, adminJid, alertMsg);
+      }
+    }
+
+    res.json({ success: true, activation: order });
+  } catch (err) {
+    console.error('❌ [ERRO /api/activations]:', err.message);
+    res.status(500).json({ error: 'Erro ao solicitar ativação' });
+  }
+});
+
+app.patch('/api/activations/:id/status', auth, async (req, res) => {
+  const status = String(req.body?.status || '').toUpperCase();
+  if (!['PENDENTE', 'CONCLUIDO', 'RECUSADO'].includes(status)) {
+    return res.status(400).json({ error: 'Status inválido' });
+  }
+  try {
+    const updated = await pool.query(
+      `UPDATE app_activations SET status = $1 WHERE id = $2 RETURNING *`,
+      [status, req.params.id]
+    );
+    if (!updated.rows[0]) return res.status(404).json({ error: 'Pedido não encontrado' });
+    res.json({ success: true, activation: updated.rows[0] });
+  } catch {
+    res.status(500).json({ error: 'Erro ao atualizar status' });
+  }
+});
+
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`API do José rodando na porta ${PORT}`));
