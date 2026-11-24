@@ -1372,7 +1372,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       }
       await pool.query(`INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`, [lead.id, replyText]);
       await pool.query('UPDATE leads SET last_message = $1, last_interaction = now() WHERE id = $2', [replyText, lead.id]);
-    }
+    
   } catch (err) {
     console.error('❌ ERRO CRÍTICO NO WEBHOOK:', err);
   }
