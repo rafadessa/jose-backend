@@ -1548,6 +1548,17 @@ async function initFollowupColumns() {
       ADD COLUMN IF NOT EXISTS renewal_stage TEXT,
       ADD COLUMN IF NOT EXISTS instance_name TEXT;
     `);
+    
+        await pool.query(`
+      ALTER TABLE leads
+      ADD COLUMN IF NOT EXISTS followup_step INTEGER DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS last_followup_at TIMESTAMP,
+      ADD COLUMN IF NOT EXISTS renewal_last_exp TEXT,
+      ADD COLUMN IF NOT EXISTS renewal_stage TEXT,
+      ADD COLUMN IF NOT EXISTS instance_name TEXT,
+      ADD COLUMN IF NOT EXISTS test_created_at TIMESTAMP;
+    `);
+
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS support_whatsapp TEXT;`);
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS custom_apps JSONB;`);
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS bot_name TEXT DEFAULT 'José';`);
