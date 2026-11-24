@@ -631,7 +631,7 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
             console.log(`💰 [ALERTA VENDA] Enviado para ${supportJid}`);
           }
         }
-
+}
   } catch (err) {
     console.error('Erro no webhook mp-reseller:', err);
   }
