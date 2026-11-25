@@ -17,7 +17,7 @@ app.use('/logos', express.static(path.join(__dirname, 'logos')));
 app.get('/', (req, res) =>
   res.json({
     status: 'ok',
-    app: 'API do José v4.3 (Inove + Notifique + Sync Créditos + Ativações + Tarifas 0.09/0.18)',
+    app: 'API do José v4.3 (Inove + Notifique + Sync Créditos + Fix Webhook MP + Ativações + Tarifas 0.09/0.18)',
   })
 );
 
@@ -494,7 +494,7 @@ app.get('/api/reseller/gestor', auth, async (req, res) => {
     );
     const row = r.rows[0] || {};
     res.json({
-      provider: row.gestor_provider || 'inove',
+      provider: row.gestor_provider || 'native',
       webhook_url: row.gestor_webhook_url || '',
       token: row.gestor_token || '',
     });
@@ -504,19 +504,23 @@ app.get('/api/reseller/gestor', auth, async (req, res) => {
 });
 
 app.post('/api/reseller/gestor', auth, async (req, res) => {
-  
-    if (provider === 'native') {
-    await pool.query(
-      `UPDATE resellers SET gestor_provider = 'native', gestor_webhook_url = NULL, gestor_token = NULL WHERE id = $1`,
-      [req.user.id]
-    );
-    return res.json({ success: true, provider: 'native' });
-  }
-
-  
-  const provider = String(req.body?.provider || 'inove').trim().toLowerCase();
+  const provider = String(req.body?.provider || 'native').trim().toLowerCase();
   let webhook_url = String(req.body?.webhook_url || '').trim();
   const token = String(req.body?.token || '').trim();
+
+  if (provider === 'native') {
+    try {
+      await pool.query(
+        `UPDATE resellers
+         SET gestor_provider = 'native', gestor_webhook_url = NULL, gestor_token = NULL
+         WHERE id = $1`,
+        [req.user.id]
+      );
+      return res.json({ success: true, provider: 'native' });
+    } catch {
+      return res.status(500).json({ error: 'Erro ao ativar Gestor Nativo' });
+    }
+  }
 
   if (!['inove', 'notifique'].includes(provider)) {
     return res.status(400).json({ error: 'Provedor inválido' });
@@ -747,7 +751,7 @@ app.get('/api/whatsapp/status', auth, async (req, res) => {
 });
 
 // ==========================================
-// 4. RECARGA DA CARTEIRA DO JOSÉ
+// 4. RECARGA DA CARTEIRA DO JOSÉ (WEBHOOK BLINDADO)
 // ==========================================
 app.post('/api/wallet/recharge', auth, async (req, res) => {
   const { amount } = req.body;
@@ -794,7 +798,7 @@ app.post('/api/wallet/recharge', auth, async (req, res) => {
   }
 });
 
-app.post('/api/webhooks/mercadopago', async function processWalletRecharge(paymentId) {
+async function processWalletRecharge(paymentId) {
   const cleanId = String(paymentId || '').replace(/\D/g, '');
   if (!cleanId) return { ok: false, status: 'invalid_id' };
 
@@ -858,7 +862,6 @@ app.post('/api/webhooks/mercadopago', async (req, res) => {
   }
 });
 
-// Rota para confirmar manualmente qualquer recarga já paga no MP
 app.post('/api/wallet/confirm/:paymentId', auth, async (req, res) => {
   try {
     const result = await processWalletRecharge(req.params.paymentId);
@@ -869,14 +872,16 @@ app.post('/api/wallet/confirm/:paymentId', auth, async (req, res) => {
   }
 });
 
-
 // ==========================================
 // 5. WEBHOOK DE VENDA DE PLANOS
 // ==========================================
 app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
   res.sendStatus(200);
-  const paymentId = req.body?.data?.id || req.query?.['data.id'] || req.query?.id || req.body?.id;
-
+  const paymentId =
+    req.body?.data?.id ||
+    req.query?.['data.id'] ||
+    req.query?.id ||
+    req.body?.id;
   const { resellerId } = req.params;
   if (!paymentId || !resellerId) return;
 
@@ -1256,7 +1261,7 @@ async function sendWhatsAppImage(instanceName, remoteJid, imageUrl, caption) {
 
 async function debitWallet(resellerId, amount, category, description) {
   await pool.query(
-    'UPDATE resellers SET wallet_balance = GREATEST(wallet_balance - $1, 0) WHERE id = $2',
+    'UPDATE resellers SET wallet_balance = GREATEST(COALESCE(wallet_balance, 0) - $1, 0) WHERE id = $2',
     [amount, resellerId]
   );
   await pool.query(
