@@ -17,7 +17,7 @@ app.use('/logos', express.static(path.join(__dirname, 'logos')));
 app.get('/', (req, res) =>
   res.json({
     status: 'ok',
-    app: 'API do José v4.5 (Inove + Notifique + Sync Créditos + Fix Webhook MP + Remarketing Inteligente + Renovação Só Suporte)',
+    app: 'API do José v4.6 (MaxPlayer Integrado + Vendas Sem Auto-Pause + Renovação Só Suporte)',
   })
 );
 
@@ -611,7 +611,6 @@ async function syncUserToMaxPlayer(reseller, lead, natvUser) {
   };
 
   try {
-    // 1. Busca os domínios aprovados no painel MaxPlayer para obter o domain_id
     const domRes = await fetch(`${MAXPLAYER_API_BASE}/domains`, { method: 'GET', headers });
     if (!domRes.ok) {
       const errText = await domRes.text();
@@ -641,16 +640,75 @@ async function syncUserToMaxPlayer(reseller, lead, natvUser) {
     const password = String(natvUser.password).trim();
     const fullname = String(lead?.name || username).trim();
 
-    
+    const createRes = await fetch(`${MAXPLAYER_API_BASE}/users`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        domain_id: domainId,
+        iptv_user: username,
+        iptv_pass: password,
+        username,
+        user_password: password,
+        fullname,
+      }),
+    });
 
+    if (createRes.ok) {
+      const created = await createRes.json();
+      console.log(`✅ [MAXPLAYER] Usuário ${username} criado (user_id: ${created.user_id})`);
+      return { ok: true, user_id: created.user_id };
+    }
 
-app.post('/api/reseller/support-whatsapp', auth, async (req, res) => {
-  const cleanPhone = String(req.body?.support_whatsapp || '').replace(/\D/g, '');
+    if (createRes.status === 409) {
+      const searchRes = await fetch(`${MAXPLAYER_API_BASE}/users/search?limit=10`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ username }),
+      });
+
+      if (searchRes.ok) {
+        const searchJson = await searchRes.json();
+        const existing = (searchJson?.users || []).find(
+          (u) => String(u.username || '').toLowerCase() === username.toLowerCase()
+        );
+
+        if (existing?.id) {
+          await fetch(`${MAXPLAYER_API_BASE}/users/password`, {
+            method: 'PUT',
+            headers,
+            body: JSON.stringify({ user_id: String(existing.id), password }),
+          });
+          await fetch(`${MAXPLAYER_API_BASE}/users/list`, {
+            method: 'PUT',
+            headers,
+            body: JSON.stringify({
+              user_id: String(existing.id),
+              domain_id: domainId,
+              iptv_username: username,
+              iptv_password: password,
+            }),
+          });
+          console.log(`✅ [MAXPLAYER] Usuário ${username} atualizado (user_id: ${existing.id})`);
+          return { ok: true, user_id: existing.id, updated: true };
+        }
+      }
+    }
+
+    const errBody = await createRes.text();
+    console.error('❌ [MAXPLAYER] Erro ao criar usuário:', createRes.status, errBody);
+    return { ok: false, error: `MaxPlayer retornou erro ${createRes.status}` };
+  } catch (err) {
+    console.error('❌ [MAXPLAYER] Exceção:', err.message);
+    return { ok: false, error: err.message };
+  }
+}
+
+app.post('/api/reseller/mercadopago', auth, async (req, res) => {
   try {
-    await pool.query('UPDATE resellers SET support_whatsapp = $1 WHERE id = $2', [cleanPhone, req.user.id]);
-    res.json({ success: true, support_whatsapp: cleanPhone });
+    await pool.query('UPDATE resellers SET mp_access_token = $1 WHERE id = $2', [req.body.mp_access_token, req.user.id]);
+    res.json({ success: true });
   } catch {
-    res.status(500).json({ error: 'Erro ao salvar WhatsApp de suporte' });
+    res.status(500).json({ error: 'Erro ao salvar Token do Mercado Pago' });
   }
 });
 
@@ -1400,7 +1458,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
 
     if (!remoteJid || remoteJid.includes('@g.us')) return;
 
-       // DETECÇÃO DE INTERVENÇÃO HUMANA PELO CELULAR (pausa apenas no José Suporte)
+    // DETECÇÃO DE INTERVENÇÃO HUMANA PELO CELULAR (pausa apenas no José Suporte)
     if (fromMe) {
       if (!remoteJid.endsWith('@lid') && !isBotEcho(instance, remoteJid, msgId)) {
         const instCheck = await pool.query(
@@ -1419,7 +1477,6 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       }
       return;
     }
-
 
     // 1. TRAVA IMEDIATA CONTRA DUPLICIDADE
     if (processedMessages.has(msgId)) return;
@@ -1672,7 +1729,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
           }
         }
 
-                if (fnName === 'gerar_teste') {
+        if (fnName === 'gerar_teste') {
           if (!activeReseller.natv_api_key) {
             toolResult = 'Erro: revendedor sem chave NATV configurada.';
           } else {
@@ -1907,7 +1964,7 @@ app.post('/api/leads/:leadId/messages', auth, async (req, res) => {
       `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'human', $2) RETURNING id, sender, content, content AS text, created_at`,
       [lead.id, text.trim()]
     );
-        const isSupportInstance = String(instanceName || '').startsWith('jose_sup_');
+    const isSupportInstance = String(instanceName || '').startsWith('jose_sup_');
     if (isSupportInstance) {
       await pool.query(
         `UPDATE leads SET last_message = $1, last_interaction = now(), needs_human = true WHERE id = $2`,
@@ -2462,7 +2519,7 @@ app.get('/api/novidades/vod', auth, async (req, res) => {
 
     const topVodSource = topVodCatIds.size
       ? vodList.filter((i) => topVodCatIds.has(String(i.category_id)))
-      : [...vodList].sort((a, b) => Number(b.rating_5based || 0) - Number(a.rating_5based || 0) || Number(b.added || 0) - Number(a.added || 0));
+      : [...vodList].sort((a, b) => Number(b.rating_5based || 0) - Number(a.rating_5based || 0) || Number(b.added || 0) - Number(b.added || 0));
 
     const topSeriesSource = topSeriesCatIds.size
       ? seriesList.filter((i) => topSeriesCatIds.has(String(i.category_id)))
