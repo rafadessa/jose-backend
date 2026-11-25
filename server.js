@@ -598,13 +598,102 @@ app.post('/api/reseller/maxplayer', auth, async (req, res) => {
 });
 
 app.post('/api/reseller/mercadopago', auth, async (req, res) => {
-  try {
-    await pool.query('UPDATE resellers SET mp_access_token = $1 WHERE id = $2', [req.body.mp_access_token, req.user.id]);
-    res.json({ success: true });
-  } catch {
-    res.status(500).json({ error: 'Erro ao salvar Token do Mercado Pago' });
+try {
+    // 1. Busca os domínios aprovados no painel MaxPlayer para obter o domain_id
+    const domRes = await fetch(`${MAXPLAYER_API_BASE}/domains`, { method: 'GET', headers });
+    if (!domRes.ok) {
+      const errText = await domRes.text();
+      console.error('❌ [MAXPLAYER] Erro ao listar domínios:', domRes.status, errText);
+      return { ok: false, error: 'Falha ao consultar domínios no MaxPlayer.' };
+    }
+
+    const domJson = await domRes.json();
+    const domains = Array.isArray(domJson?.data) ? domJson.data : [];
+    if (!domains.length) {
+      return { ok: false, error: 'Nenhum domínio aprovado encontrado na conta MaxPlayer.' };
+    }
+
+    const natvHost = String(natvUser.domain || '')
+      .replace(/^https?:\/\//i, '')
+      .replace(/[:/].*$/, '')
+      .trim()
+      .toLowerCase();
+
+    const matchedDomain =
+      domains.find((d) => String(d.domain || '').trim().toLowerCase() === natvHost) ||
+      domains.find((d) => String(d.status || '').toLowerCase() === 'approved') ||
+      domains[0];
+
+    const domainId = String(matchedDomain.id);
+    const username = String(natvUser.username).trim();
+    const password = String(natvUser.password).trim();
+    const fullname = String(lead?.name || username).trim();
+
+    // 2. Cria o usuário + lista inicial no MaxPlayer
+    const createRes = await fetch(`${MAXPLAYER_API_BASE}/users`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        domain_id: domainId,
+        iptv_user: username,
+        iptv_pass: password,
+        username,
+        user_password: password,
+        fullname,
+      }),
+    });
+
+    if (createRes.ok) {
+      const created = await createRes.json();
+      console.log(`✅ [MAXPLAYER] Usuário ${username} criado (user_id: ${created.user_id})`);
+      return { ok: true, user_id: created.user_id };
+    }
+
+    // 3. Se já existir (409), busca o user_id e atualiza a lista e a senha
+    if (createRes.status === 409) {
+      const searchRes = await fetch(`${MAXPLAYER_API_BASE}/users/search?limit=10`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ username }),
+      });
+
+      if (searchRes.ok) {
+        const searchJson = await searchRes.json();
+        const existing = (searchJson?.users || []).find(
+          (u) => String(u.username || '').toLowerCase() === username.toLowerCase()
+        );
+
+        if (existing?.id) {
+          await fetch(`${MAXPLAYER_API_BASE}/users/password`, {
+            method: 'PUT',
+            headers,
+            body: JSON.stringify({ user_id: String(existing.id), password }),
+          });
+          await fetch(`${MAXPLAYER_API_BASE}/users/list`, {
+            method: 'PUT',
+            headers,
+            body: JSON.stringify({
+              user_id: String(existing.id),
+              domain_id: domainId,
+              iptv_username: username,
+              iptv_password: password,
+            }),
+          });
+          console.log(`✅ [MAXPLAYER] Usuário ${username} atualizado (user_id: ${existing.id})`);
+          return { ok: true, user_id: existing.id, updated: true };
+        }
+      }
+    }
+
+    const errBody = await createRes.text();
+    console.error('❌ [MAXPLAYER] Erro ao criar usuário:', createRes.status, errBody);
+    return { ok: false, error: `MaxPlayer retornou erro ${createRes.status}` };
+  } catch (err) {
+    console.error('❌ [MAXPLAYER] Exceção:', err.message);
+    return { ok: false, error: err.message };
   }
-});
+}
+
 
 app.post('/api/reseller/support-whatsapp', auth, async (req, res) => {
   const cleanPhone = String(req.body?.support_whatsapp || '').replace(/\D/g, '');
