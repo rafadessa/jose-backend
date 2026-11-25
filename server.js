@@ -875,7 +875,8 @@ app.post('/api/wallet/confirm/:paymentId', auth, async (req, res) => {
 // ==========================================
 app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
   res.sendStatus(200);
-  const paymentId = req.body?.data?.id;
+  const paymentId = req.body?.data?.id || req.query?.['data.id'] || req.query?.id || req.body?.id;
+
   const { resellerId } = req.params;
   if (!paymentId || !resellerId) return;
 
