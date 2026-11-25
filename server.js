@@ -2043,7 +2043,16 @@ async function runSalesFollowup() {
 
   try {
     const { rows } = await pool.query(`
-      SELECT l.*, r.id AS r_id, r.bot_active, r.wallet_balance, r.natv_api_key, r.custom_prices, wi.instance_name
+      SELECT
+        l.*,
+        r.id AS r_id,
+        r.bot_active,
+        r.wallet_balance,
+        r.natv_api_key,
+        r.custom_prices,
+        wi.instance_name,
+        EXTRACT(EPOCH FROM (NOW() - COALESCE(l.last_interaction, l.created_at))) / 60 AS diff_min,
+        EXTRACT(EPOCH FROM (NOW() - l.last_followup_at)) / 60 AS diff_followup_min
       FROM leads l
       JOIN resellers r ON r.id = l.reseller_id
       JOIN whatsapp_instances wi ON wi.reseller_id = r.id
@@ -2058,46 +2067,83 @@ async function runSalesFollowup() {
     let featuredGame = null;
     try {
       const gamesData = await fetchTodayGames();
-      const upcoming = (gamesData.jogos || []).find((g) => g.timestamp > now);
-      featuredGame = upcoming || (gamesData.jogos || [])[0] || null;
+      // Só considera jogos que ainda vão começar (pelo menos 30 min no futuro)
+      const upcomingGames = (gamesData.jogos || []).filter(
+        (g) => g.timestamp > now + 30 * 60 * 1000
+      );
+      const priorityLeagues = [
+        'Brasileirão Série A',
+        'Copa do Brasil',
+        'Libertadores',
+        'Champions League',
+      ];
+      featuredGame =
+        upcomingGames.find((g) => priorityLeagues.includes(g.league)) ||
+        upcomingGames[0] ||
+        null;
     } catch {}
 
     for (const lead of rows) {
       if (!isVipReseller(lead) && Number(lead.wallet_balance) <= 0) continue;
 
-      const lastTime = new Date(lead.last_interaction || lead.created_at).getTime();
-      const diffMin = (now - lastTime) / 60000;
+      const diffMin = Number(lead.diff_min || 0);
+      const diffFollowupMin = lead.last_followup_at ? Number(lead.diff_followup_min || 0) : 999999;
       const step = Number(lead.followup_step || 0);
       const stage = String(lead.stage || '').toUpperCase();
+      const chosenApp = String(lead.chosen_app || '').trim();
       const prices = getResellerPrices(lead);
       const mensalStr = formatBRL(prices[1][1]);
 
       let msg = null;
       let nextStep = step;
 
-      if (stage !== 'TESTE' && step === 0 && diffMin >= 45 && diffMin < 1440) {
-        msg = 'Opa! Conseguiu encontrar o aplicativo na loja da sua TV? Se precisar de ajuda pra achar, me avisa aqui que te auxilio 👍';
-        nextStep = 1;
-      } else if (stage === 'TESTE' && step === 0 && diffMin >= 65 && diffMin < 1440) {
-        msg = `E aí, o que achou da qualidade dos canais e filmes no teste? Quer que eu já libere o plano mensal de R$ ${mensalStr} pra você continuar assistindo? 📺`;
-        nextStep = 1;
-      } else if (step === 1 && diffMin >= 1440 && diffMin < 4320) {
-        if (featuredGame) {
-          msg = `Ahh! Tem jogaço hoje: *${featuredGame.home} x ${featuredGame.away}* às ${featuredGame.time}, vai perder? ⚽ Se quiser, já libero seu plano mensal de R$ ${mensalStr} em 1 minutinho pra você assistir tranquilo!`;
-        } else {
-          msg = `Passando só pra avisar que o seu acesso ainda está pronto por aqui! Se quiser ativar o plano mensal de R$ ${mensalStr} hoje, levo 1 minutinho pra liberar 😉`;
+      // STEP 1: Primeiro lembrete (após 45 min sem teste ou 65 min após teste)
+      if (step === 0) {
+        if (stage === 'TESTE' && diffMin >= 65 && diffMin < 1440) {
+          msg = `E aí, o que achou da qualidade dos canais e filmes no teste? Quer que eu já libere o plano mensal de R$ ${mensalStr} pra você continuar assistindo? 📺`;
+          nextStep = 1;
+        } else if (stage !== 'TESTE' && chosenApp && diffMin >= 45 && diffMin < 1440) {
+          msg = `Opa! Conseguiu encontrar o *${chosenApp}* na loja da sua TV? Se não apareceu ou travou em alguma tela, me avisa aqui que te ajudo 👍`;
+          nextStep = 1;
+        } else if (stage !== 'TESTE' && !chosenApp && diffMin >= 45 && diffMin < 1440) {
+          msg = `Opa! Ainda quer fazer o teste grátis de 1 hora sem compromisso? Me diz qual a marca da sua TV ou aparelho que já te ajudo a testar rapidinho 📺`;
+          nextStep = 1;
         }
-        nextStep = 2;
+      }
+
+      // STEP 2: Segundo lembrete (apenas após 24h reais do último contato E do último follow-up)
+      else if (step === 1 && diffMin >= 1440 && diffMin < 4320 && diffFollowupMin >= 1440) {
+        if (stage === 'TESTE') {
+          if (featuredGame) {
+            msg = `Hoje tem *${featuredGame.home} x ${featuredGame.away}* às ${featuredGame.time} ⚽ Se quiser, já libero seu plano mensal de R$ ${mensalStr} em 1 minutinho pra você assistir tranquilo!`;
+          } else {
+            msg = `Passando só pra avisar que o seu acesso ainda está pronto por aqui! Se quiser ativar o plano mensal de R$ ${mensalStr} hoje, levo 1 minutinho pra liberar 😉`;
+          }
+          nextStep = 2;
+        } else if (chosenApp) {
+          msg = `Oi! Vi que você ainda não chegou a testar no *${chosenApp}*. Se quiser, te passo outro aplicativo bem fácil de instalar e já libero 1 hora grátis agora 👍`;
+          nextStep = 2;
+        } else {
+          if (featuredGame) {
+            msg = `Opa! Hoje tem *${featuredGame.home} x ${featuredGame.away}* às ${featuredGame.time} ⚽ Se quiser experimentar a qualidade dos canais com 1 hora de teste grátis antes do jogo, é só me chamar aqui!`;
+          } else {
+            msg = `Oi! Seu teste grátis de 1 hora ainda está disponível por aqui 😉 Quando estiver na frente da TV, me manda um oi que libero na hora pra você conhecer sem compromisso!`;
+          }
+          nextStep = 2;
+        }
       }
 
       if (msg) {
         await sendWhatsAppText(lead.instance_name, lead.phone, msg);
-        await pool.query(`INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`, [lead.id, msg]);
+        await pool.query(
+          `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`,
+          [lead.id, msg]
+        );
         await pool.query(
           `UPDATE leads SET followup_step = $1, last_followup_at = now(), last_message = $2, last_interaction = now() WHERE id = $3`,
           [nextStep, msg, lead.id]
         );
-        console.log(`🔁 [REMARKETING STEP ${nextStep}] Enviado para ${lead.phone}`);
+        console.log(`🔁 [REMARKETING STEP ${nextStep}] Enviado para ${lead.phone} (stage: ${stage || 'LEAD'}, app: ${chosenApp || 'nenhum'})`);
         await new Promise((r) => setTimeout(r, 2500));
       }
     }
