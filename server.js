@@ -1845,7 +1845,19 @@ app.post('/api/leads/:leadId/messages', auth, async (req, res) => {
       `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'human', $2) RETURNING id, sender, content, content AS text, created_at`,
       [lead.id, text.trim()]
     );
-    await pool.query(`UPDATE leads SET last_message = $1, last_interaction = now(), needs_human = true WHERE id = $2`, [text.trim(), lead.id]);
+        const isSupportInstance = String(instanceName || '').startsWith('jose_sup_');
+    if (isSupportInstance) {
+      await pool.query(
+        `UPDATE leads SET last_message = $1, last_interaction = now(), needs_human = true WHERE id = $2`,
+        [text.trim(), lead.id]
+      );
+    } else {
+      await pool.query(
+        `UPDATE leads SET last_message = $1, last_interaction = now() WHERE id = $2`,
+        [text.trim(), lead.id]
+      );
+    }
+
     res.json(saved.rows[0]);
   } catch {
     res.status(500).json({ error: 'Erro ao enviar mensagem' });
