@@ -794,31 +794,81 @@ app.post('/api/wallet/recharge', auth, async (req, res) => {
   }
 });
 
+app.post('/api/webhooks/mercadopago', async function processWalletRecharge(paymentId) {
+  const cleanId = String(paymentId || '').replace(/\D/g, '');
+  if (!cleanId) return { ok: false, status: 'invalid_id' };
+
+  const already = await pool.query(
+    'SELECT 1 FROM processed_payments WHERE payment_id = $1',
+    [`wallet_${cleanId}`]
+  );
+  if (already.rows.length > 0) {
+    return { ok: true, status: 'already_processed' };
+  }
+
+  const mpRes = await fetch(`https://api.mercadopago.com/v1/payments/${cleanId}`, {
+    headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
+  });
+  const payment = await mpRes.json();
+
+  if (!mpRes.ok) {
+    console.error('❌ [WEBHOOK MP CARTEIRA] Erro ao consultar MP:', mpRes.status, payment);
+    return { ok: false, status: 'mp_error', detail: payment.message };
+  }
+
+  if (payment.status === 'approved' && payment.external_reference) {
+    const resellerId = payment.external_reference;
+    const amount = Number(payment.transaction_amount);
+
+    await pool.query(
+      'INSERT INTO processed_payments (payment_id, reseller_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [`wallet_${cleanId}`, resellerId]
+    );
+    await pool.query(
+      'UPDATE resellers SET wallet_balance = COALESCE(wallet_balance, 0) + $1 WHERE id = $2',
+      [amount, resellerId]
+    );
+    await pool.query(
+      `INSERT INTO wallet_transactions (reseller_id, type, category, amount, description)
+       VALUES ($1, 'recharge', 'pix_recharge', $2, $3)`,
+      [resellerId, amount, `Recarga Pix #${cleanId}`]
+    );
+
+    console.log(`✅ [CARTEIRA CREDITADA] Revendedor ${resellerId} +R$ ${amount.toFixed(2)} (Pix #${cleanId})`);
+    return { ok: true, status: 'credited', amount, resellerId };
+  }
+
+  return { ok: false, status: payment.status || 'not_approved' };
+}
+
 app.post('/api/webhooks/mercadopago', async (req, res) => {
-  const paymentId = req.body?.data?.id;
-  if (!paymentId) return res.sendStatus(200);
+  res.sendStatus(200);
+  const paymentId =
+    req.body?.data?.id ||
+    req.query?.['data.id'] ||
+    req.query?.id ||
+    req.body?.id;
+
+  if (!paymentId) return;
 
   try {
-    const mpRes = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
-      headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` },
-    });
-    const payment = await mpRes.json();
-
-    if (payment.status === 'approved' && payment.external_reference) {
-      const resellerId = payment.external_reference;
-      const amount = Number(payment.transaction_amount);
-      await pool.query('UPDATE resellers SET wallet_balance = wallet_balance + $1 WHERE id = $2', [amount, resellerId]);
-      await pool.query(
-        `INSERT INTO wallet_transactions (reseller_id, type, category, amount, description)
-         VALUES ($1, 'recharge', 'pix_recharge', $2, $3)`,
-        [resellerId, amount, `Recarga Pix #${paymentId}`]
-      );
-    }
-    res.sendStatus(200);
-  } catch {
-    res.sendStatus(500);
+    await processWalletRecharge(paymentId);
+  } catch (err) {
+    console.error('❌ [ERRO WEBHOOK CARTEIRA]:', err.message);
   }
 });
+
+// Rota para confirmar manualmente qualquer recarga já paga no MP
+app.post('/api/wallet/confirm/:paymentId', auth, async (req, res) => {
+  try {
+    const result = await processWalletRecharge(req.params.paymentId);
+    res.json(result);
+  } catch (err) {
+    console.error('❌ [ERRO CONFIRM CARTEIRA]:', err.message);
+    res.status(500).json({ error: 'Erro ao verificar pagamento no Mercado Pago' });
+  }
+});
+
 
 // ==========================================
 // 5. WEBHOOK DE VENDA DE PLANOS
