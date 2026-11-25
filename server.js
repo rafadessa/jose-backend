@@ -688,12 +688,30 @@ try {
     const errBody = await createRes.text();
     console.error('❌ [MAXPLAYER] Erro ao criar usuário:', createRes.status, errBody);
     return { ok: false, error: `MaxPlayer retornou erro ${createRes.status}` };
-  } catch (err) {
+    } catch (err) {
     console.error('❌ [MAXPLAYER] Exceção:', err.message);
     return { ok: false, error: err.message };
   }
 }
 
+app.post('/api/reseller/mercadopago', auth, async (req, res) => {
+  try {
+    await pool.query('UPDATE resellers SET mp_access_token = $1 WHERE id = $2', [req.body.mp_access_token, req.user.id]);
+    res.json({ success: true });
+  } catch {
+    res.status(500).json({ error: 'Erro ao salvar Token do Mercado Pago' });
+  }
+});
+
+app.post('/api/reseller/support-whatsapp', auth, async (req, res) => {
+  const cleanPhone = String(req.body?.support_whatsapp || '').replace(/\D/g, '');
+  try {
+    await pool.query('UPDATE resellers SET support_whatsapp = $1 WHERE id = $2', [cleanPhone, req.user.id]);
+    res.json({ success: true, support_whatsapp: cleanPhone });
+  } catch {
+    res.status(500).json({ error: 'Erro ao salvar WhatsApp de suporte' });
+  }
+});
 
 app.post('/api/reseller/support-whatsapp', auth, async (req, res) => {
   const cleanPhone = String(req.body?.support_whatsapp || '').replace(/\D/g, '');
