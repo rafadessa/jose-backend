@@ -17,7 +17,7 @@ app.use('/logos', express.static(path.join(__dirname, 'logos')));
 app.get('/', (req, res) =>
   res.json({
     status: 'ok',
-    app: 'API do José v4.6 (MaxPlayer Integrado + Vendas Sem Auto-Pause + Renovação Só Suporte)',
+    app: 'API do José v4.8 (Áudio + Visão de Imagens Corrigidos + Botões da Gaveta + MaxPlayer)',
   })
 );
 
@@ -26,7 +26,7 @@ const pool = new Pool({
 });
 
 const JWT_SECRET = process.env.JWT_SECRET || 'jose_super_secret_key';
-const EVOLUTION_URL = process.env.EVOLUTION_API_URL;
+const EVOLUTION_URL = (process.env.EVOLUTION_API_URL || '').replace(/\/$/, '');
 const EVOLUTION_KEY = process.env.EVOLUTION_API_KEY;
 const MP_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -787,7 +787,7 @@ app.post('/api/whatsapp/connect', auth, async (req, res) => {
     enabled: true,
     url: `${BASE_URL}/api/webhooks/evolution`,
     byEvents: false,
-    base64: false,
+    base64: true,
     events: ['MESSAGES_UPSERT'],
   };
 
@@ -1097,7 +1097,7 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
 });
 
 // ==========================================
-// 6. MOTOR DO JOSÉ (VENDAS + SUPORTE + AUTO-PAUSE HUMANO)
+// 6. MOTOR DO JOSÉ (VENDAS + SUPORTE + ÁUDIO + VISÃO)
 // ==========================================
 const APP_LOGOS = {
   'WATCH HUB': `${BASE_URL}/logos/watch-hub.png`,
@@ -1377,46 +1377,129 @@ async function debitWallet(resellerId, amount, category, description) {
   );
 }
 
-async function getEvolutionMediaBase64(instanceName, messageData) {
-  try {
-    const res = await fetch(`${EVOLUTION_URL}/chat/getBase64FromMediaMessage/${instanceName}`, {
-      method: 'POST',
-      headers: { apikey: EVOLUTION_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: { key: messageData.key }, convertToMp4: false }),
-    });
-    if (!res.ok) return null;
-    const json = await res.json();
-    return json.base64 || null;
-  } catch {
-    return null;
-  }
+// Extrai o conteúdo real da mensagem (suporta ephemeralMessage / viewOnceMessage)
+function unwrapMessageContainer(dataObj) {
+  let container = dataObj?.message || dataObj?.data?.message || {};
+  if (container.ephemeralMessage?.message) container = container.ephemeralMessage.message;
+  if (container.viewOnceMessage?.message) container = container.viewOnceMessage.message;
+  if (container.viewOnceMessageV2?.message) container = container.viewOnceMessageV2.message;
+  if (container.documentWithCaptionMessage?.message) container = container.documentWithCaptionMessage.message;
+  return container;
 }
 
-async function analyzeMediaWithGemini(base64, mimeType, promptText) {
-  try {
-    const apiKey = process.env.OPENAI_API_KEY || process.env.GEMINI_API_KEY;
-    if (!apiKey || !base64) return null;
-    const cleanBase64 = base64.replace(/^data:[^;]+;base64,/, '');
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
-      {
+// Baixa mídia (áudio ou imagem) em base64 puro com 3 camadas de fallback
+async function getEvolutionMediaBase64(instanceName, dataObj, key) {
+  const cleanB64 = (raw) => {
+    if (!raw || typeof raw !== 'string') return null;
+    const stripped = raw.includes(',') ? raw.split(',')[1] : raw;
+    return stripped.trim() || null;
+  };
+
+  // Camada 1: base64 já incluído no payload do webhook da Evolution API
+  const inlineB64 =
+    cleanB64(dataObj?.message?.base64) ||
+    cleanB64(dataObj?.data?.message?.base64) ||
+    cleanB64(dataObj?.base64) ||
+    cleanB64(dataObj?.messageBase64);
+  if (inlineB64) {
+    console.log('📦 [MÍDIA] Base64 obtido diretamente do webhook.');
+    return inlineB64;
+  }
+
+  // Camada 2: Endpoint oficial Evolution API v2 (/chat/getBase64FromMediaMessage)
+  const msgKey = key || dataObj?.key || dataObj?.data?.key;
+  const payloadsToTry = [
+    ...(msgKey ? [{ message: { key: msgKey }, convertToMp4: false }] : []),
+    { message: dataObj?.data || dataObj, convertToMp4: false },
+  ];
+
+  for (const payload of payloadsToTry) {
+    try {
+      const res = await fetch(`${EVOLUTION_URL}/chat/getBase64FromMediaMessage/${instanceName}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: promptText }, { inlineData: { mimeType, data: cleanBase64 } }] }],
-        }),
+        headers: { apikey: EVOLUTION_KEY, 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) {
+        const json = await res.json().catch(() => ({}));
+        const found = cleanB64(json.base64 || json.data?.base64);
+        if (found) {
+          console.log('📦 [MÍDIA] Base64 obtido via getBase64FromMediaMessage.');
+          return found;
+        }
+      } else {
+        const errText = await res.text().catch(() => '');
+        console.warn(`⚠️ [MÍDIA] Evolution retornou ${res.status}: ${errText.slice(0, 200)}`);
       }
-    );
-    if (!res.ok) return null;
-    const data = await res.json();
-    return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null;
-  } catch {
+    } catch (err) {
+      console.warn('⚠️ [MÍDIA] Erro na chamada getBase64FromMediaMessage:', err.message);
+    }
+  }
+
+  console.error('❌ [MÍDIA] Não foi possível obter base64 da mídia na Evolution API.');
+  return null;
+}
+
+// Analisa áudio ou imagem diretamente via API nativa do Gemini com retry + fallback de modelos
+async function analyzeMediaWithGemini(base64, mimeType, promptText) {
+  const apiKey = (process.env.GEMINI_API_KEY || process.env.OPENAI_API_KEY || '').trim();
+  if (!apiKey || !base64) {
+    console.error('❌ [GEMINI MÍDIA] Chave de API ou base64 ausente.');
     return null;
   }
+
+  const cleanBase64 = base64.replace(/^data:[^;]+;base64,/, '').trim();
+  const cleanMime = String(mimeType || 'audio/ogg').split(';')[0].trim();
+  const models = ['gemini-2.5-flash', 'gemini-2.0-flash'];
+
+  for (const model of models) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const res = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [
+                {
+                  parts: [
+                    { text: promptText },
+                    { inlineData: { mimeType: cleanMime, data: cleanBase64 } },
+                  ],
+                },
+              ],
+            }),
+          }
+        );
+
+        if (res.ok) {
+          const data = await res.json();
+          const resultText = data?.candidates?.[0]?.content?.parts
+            ?.map((p) => p.text)
+            .filter(Boolean)
+            .join('\n')
+            .trim();
+          if (resultText) return resultText;
+        } else {
+          const errText = await res.text().catch(() => '');
+          console.error(`❌ [GEMINI MÍDIA ${model} tentativa ${attempt}] Status ${res.status}: ${errText.slice(0, 250)}`);
+          if (res.status === 503 || res.status === 429) {
+            await new Promise((r) => setTimeout(r, 1500));
+            continue;
+          }
+          break;
+        }
+      } catch (err) {
+        console.error(`❌ [GEMINI MÍDIA ${model}] Exceção:`, err.message);
+      }
+    }
+  }
+  return null;
 }
 
 async function callGeminiWithFallback(apiKey, messagesPayload, tools) {
-  const models = ['gemini-2.5-flash', 'gemini-3.5-flash-lite'];
+  const models = ['gemini-2.5-flash', 'gemini-2.0-flash'];
   for (const model of models) {
     for (let attempt = 1; attempt <= 2; attempt++) {
       const res = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
@@ -1424,7 +1507,7 @@ async function callGeminiWithFallback(apiKey, messagesPayload, tools) {
         headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ model, temperature: 0.3, messages: messagesPayload, tools }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (res.ok) return { ok: true, status: res.status, data };
       if (res.status === 503 || res.status === 429) {
         await new Promise((r) => setTimeout(r, 1500));
@@ -1483,30 +1566,76 @@ app.post('/api/webhooks/evolution', async (req, res) => {
     processedMessages.add(msgId);
     setTimeout(() => processedMessages.delete(msgId), 60000);
 
-    const messageContainer = dataObj.message || dataObj.data?.message || {};
+    const messageContainer = unwrapMessageContainer(dataObj);
     let text =
       messageContainer.conversation ||
       messageContainer.extendedTextMessage?.text ||
       dataObj.text ||
       '';
+    let mediaUrl = null;
 
-    console.log(`2. [MENSAGEM CAPTURADA] De: ${remoteJid} | Instância: ${instance} | Texto: ${text || '[Mídia]'}`);
+    const audioMsg = messageContainer.audioMessage || messageContainer.pttMessage;
+    const imageMsg = messageContainer.imageMessage;
 
-    if (!text && messageContainer.audioMessage) {
-      const base64 = await getEvolutionMediaBase64(instance, dataObj);
+    console.log(
+      `2. [MENSAGEM CAPTURADA] De: ${remoteJid} | Instância: ${instance} | Tipo: ${
+        audioMsg ? 'ÁUDIO' : imageMsg ? 'IMAGEM' : 'TEXTO'
+      } | Texto: ${text || '[Mídia]'}`
+    );
+
+    // PROCESSAMENTO DE ÁUDIO (PTT / Voice Note / Audio)
+    if (!text && audioMsg) {
+      const base64 = await getEvolutionMediaBase64(instance, dataObj, key);
       if (base64) {
-        const mimeType = (messageContainer.audioMessage.mimetype || 'audio/ogg').split(';')[0];
+        const mimeType = (audioMsg.mimetype || 'audio/ogg').split(';')[0].trim();
         const transcript = await analyzeMediaWithGemini(
           base64,
           mimeType,
-          'Transcreva exatamente o que o cliente falou neste áudio em português. Retorne apenas a transcrição.'
+          'Transcreva fielmente em português tudo o que a pessoa falou neste áudio. Retorne apenas a transcrição, sem comentários.'
         );
-        if (transcript) text = `[Áudio transcrito]: ${transcript}`;
+        if (transcript) {
+          text = `[Áudio transcrito]: ${transcript}`;
+          console.log(`🎙️ [ÁUDIO TRANSCRITO]: ${transcript}`);
+        }
       }
-      if (!text) text = '[O cliente enviou um áudio.]';
+      if (!text) text = '[O cliente enviou um áudio que não pôde ser transcrito.]';
     }
 
-    if (!text) return;
+    // PROCESSAMENTO DE IMAGEM (FOTOS DE TV, APP, ERRO, COMPROVANTE)
+    if (imageMsg) {
+      const caption = (imageMsg.caption || '').trim();
+      const mimeType = (imageMsg.mimetype || 'image/jpeg').split(';')[0].trim();
+      const base64 = await getEvolutionMediaBase64(instance, dataObj, key);
+
+      if (base64) {
+        mediaUrl = `data:${mimeType};base64,${base64}`;
+        const visionPrompt =
+          'Analise esta imagem enviada por um cliente de streaming/IPTV no WhatsApp. ' +
+          'Descreva objetivamente em português: qual aplicativo está aberto na tela (se houver), ' +
+          'se aparece alguma mensagem de erro, tela de pagamento/licença, código/MAC/Device Key, ' +
+          'ou se é um comprovante de pagamento PIX (com valor e status). Seja direto e preciso.';
+        const visionAnalysis = await analyzeMediaWithGemini(base64, mimeType, visionPrompt);
+
+        if (visionAnalysis) {
+          console.log(`👁️ [IMAGEM ANALISADA]: ${visionAnalysis.slice(0, 150)}...`);
+          text = caption
+            ? `${caption}\n[Análise da foto enviada pelo cliente]: ${visionAnalysis}`
+            : `[Análise da foto enviada pelo cliente]: ${visionAnalysis}`;
+        } else {
+          text = caption || '[O cliente enviou uma foto.]';
+        }
+      } else {
+        if (imageMsg.jpegThumbnail) {
+          const thumb = typeof imageMsg.jpegThumbnail === 'string'
+            ? imageMsg.jpegThumbnail
+            : Buffer.from(imageMsg.jpegThumbnail).toString('base64');
+          mediaUrl = `data:image/jpeg;base64,${thumb}`;
+        }
+        text = caption || '[O cliente enviou uma foto.]';
+      }
+    }
+
+    if (!text && !mediaUrl) return;
 
     const pushName = dataObj.pushName || body.pushName || 'Cliente';
 
@@ -1533,22 +1662,27 @@ app.post('/api/webhooks/evolution', async (req, res) => {
     );
     let lead = leadRes.rows[0];
 
+    const previewMsg = imageMsg ? (imageMsg.caption || '📷 Foto enviada') : text;
+
     if (!lead) {
       const insertLead = await pool.query(
         `INSERT INTO leads (reseller_id, phone, name, last_message, instance_name)
          VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-        [activeReseller.id, remoteJid, pushName, text, instance]
+        [activeReseller.id, remoteJid, pushName, previewMsg, instance]
       );
       lead = insertLead.rows[0];
     } else {
       await pool.query(
         'UPDATE leads SET last_message = $1, last_interaction = now(), followup_step = 0, instance_name = $2 WHERE id = $3',
-        [text, instance, lead.id]
+        [previewMsg, instance, lead.id]
       );
       lead.instance_name = instance;
     }
 
-    await pool.query(`INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'client', $2)`, [lead.id, text]);
+    await pool.query(
+      `INSERT INTO messages (lead_id, sender, content, media_url) VALUES ($1, 'client', $2, $3)`,
+      [lead.id, text, mediaUrl]
+    );
 
     // Se humano já assumiu, para aqui!
     if (lead.needs_human) {
@@ -1629,7 +1763,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       ...history,
     ];
 
-    const apiKey = process.env.OPENAI_API_KEY || process.env.GEMINI_API_KEY;
+    const apiKey = (process.env.GEMINI_API_KEY || process.env.OPENAI_API_KEY || '').trim();
 
     // 5. Primeira chamada ao Gemini
     let aiRes = await callGeminiWithFallback(apiKey, messagesPayload, tools);
@@ -1697,7 +1831,11 @@ app.post('/api/webhooks/evolution', async (req, res) => {
                   toolResult = JSON.stringify({ encontrado: false, mensagem: 'Usuário não encontrado no painel NATV.' });
                 } else {
                   lead.natv_username = found.u;
-                  await pool.query('UPDATE leads SET natv_username = $1 WHERE id = $2', [found.u, lead.id]);
+                  await pool.query('UPDATE leads SET natv_username = $1, natv_password = COALESCE($2, natv_password) WHERE id = $3', [
+                    found.u,
+                    found.p || null,
+                    lead.id,
+                  ]);
                   const expMs = found.e ? Date.parse(String(found.e).replace(' ', 'T')) : NaN;
                   const expired = !Number.isNaN(expMs) && expMs < Date.now();
                   const ultimoAcesso = found.l || null;
@@ -1743,8 +1881,8 @@ app.post('/api/webhooks/evolution', async (req, res) => {
             if (natvRes.ok) {
               lead.natv_username = natvUser.username;
               await pool.query(
-                `UPDATE leads SET stage = 'TESTE', natv_username = $1, followup_step = 0, test_created_at = now() WHERE id = $2`,
-                [natvUser.username, lead.id]
+                `UPDATE leads SET stage = 'TESTE', natv_username = $1, natv_password = $2, followup_step = 0, test_created_at = now() WHERE id = $3`,
+                [natvUser.username, natvUser.password || null, lead.id]
               );
               if (!isVip) {
                 await debitWallet(
@@ -1821,7 +1959,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
             const clientPhone = String(lead.phone || '').replace(/@.*$/, '');
             const botLabel = activeReseller.bot_name || 'José';
             const originLabel = isSupportBot ? `${botLabel} Suporte` : `${botLabel} Vendas`;
-            const alertMsg = `🚨 *Atendimento Humano Solicitado (${originLabel})*\n\nCliente: ${lead.name || 'Sem nome'}\nNúmero: ${clientPhone}\nÚltima msg: ${text}\n\nA IA foi pausada nessa conversa para você assumir.`;
+            const alertMsg = `🚨 *Atendimento Humano Solicitado (${originLabel})*\n\nCliente: ${lead.name || 'Sem nome'}\nNúmero: ${clientPhone}\nÚltima msg: ${previewMsg}\n\nA IA foi pausada nessa conversa para você assumir.`;
             const sent = await sendWhatsAppText(instance, supportJid, alertMsg);
             console.log(`📣 [ALERTA HUMANO] Enviado para ${supportJid} (${originLabel}) | OK: ${sent.ok}`);
           } else {
@@ -1864,12 +2002,12 @@ app.post('/api/webhooks/evolution', async (req, res) => {
 });
 
 // ==========================================
-// 7. CHAT AO VIVO E ESTATÍSTICAS DE LEADS
+// 7. CHAT AO VIVO, ESTATÍSTICAS E BOTÕES DA GAVETA DE LEADS
 // ==========================================
 app.get('/api/leads', auth, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, phone, name, last_message, last_interaction, stage, chosen_app, natv_username, needs_human, needs_human AS ai_paused, tab
+      `SELECT id, phone, name, last_message, last_interaction, stage, chosen_app, natv_username, natv_password, needs_human, needs_human AS ai_paused, tab, test_created_at, created_at
        FROM leads WHERE reseller_id = $1 ORDER BY last_interaction DESC`,
       [req.user.id]
     );
@@ -1931,12 +2069,36 @@ app.get('/api/leads/stats', auth, async (req, res) => {
   }
 });
 
+app.get('/api/leads/:leadId', auth, async (req, res) => {
+  try {
+    const leadRes = await pool.query(
+      `SELECT id, phone, name, last_message, last_interaction, stage, chosen_app, natv_username, natv_password, needs_human, needs_human AS ai_paused, tab, test_created_at, created_at
+       FROM leads WHERE id = $1 AND reseller_id = $2`,
+      [req.params.leadId, req.user.id]
+    );
+    const lead = leadRes.rows[0];
+    if (!lead) return res.status(404).json({ error: 'Lead não encontrado' });
+    res.json({
+      success: true,
+      lead: {
+        ...lead,
+        whatsapp_link: `https://wa.me/${String(lead.phone || '').replace(/\D/g, '')}`,
+      },
+    });
+  } catch {
+    res.status(500).json({ error: 'Erro ao buscar dados do lead' });
+  }
+});
+
 app.get('/api/leads/:leadId/messages', auth, async (req, res) => {
   try {
     const leadCheck = await pool.query('SELECT id FROM leads WHERE id = $1 AND reseller_id = $2', [req.params.leadId, req.user.id]);
     if (!leadCheck.rows[0]) return res.status(404).json({ error: 'Conversa não encontrada' });
 
-    const msgs = await pool.query('SELECT id, sender, content, content AS text, created_at FROM messages WHERE lead_id = $1 ORDER BY created_at ASC', [req.params.leadId]);
+    const msgs = await pool.query(
+      'SELECT id, sender, content, content AS text, media_url, created_at FROM messages WHERE lead_id = $1 ORDER BY created_at ASC',
+      [req.params.leadId]
+    );
     res.json(msgs.rows);
   } catch {
     res.status(500).json({ error: 'Erro ao carregar mensagens' });
@@ -1961,7 +2123,7 @@ app.post('/api/leads/:leadId/messages', auth, async (req, res) => {
 
     await sendWhatsAppText(instanceName, lead.phone, text.trim());
     const saved = await pool.query(
-      `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'human', $2) RETURNING id, sender, content, content AS text, created_at`,
+      `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'human', $2) RETURNING id, sender, content, content AS text, media_url, created_at`,
       [lead.id, text.trim()]
     );
     const isSupportInstance = String(instanceName || '').startsWith('jose_sup_');
@@ -1983,13 +2145,133 @@ app.post('/api/leads/:leadId/messages', auth, async (req, res) => {
   }
 });
 
+// Alternar IA (Pausar / Reativar / Assumir Conversa)
 app.post('/api/leads/:leadId/toggle-ai', auth, async (req, res) => {
-  const { pause_ai } = req.body;
+  const { pause_ai, needs_human, ai_paused } = req.body || {};
+  const paused = Boolean(pause_ai ?? needs_human ?? ai_paused);
   try {
-    await pool.query('UPDATE leads SET needs_human = $1 WHERE id = $2 AND reseller_id = $3', [Boolean(pause_ai), req.params.leadId, req.user.id]);
-    res.json({ success: true, needs_human: Boolean(pause_ai) });
-  } catch {
+    await pool.query(
+      'UPDATE leads SET needs_human = $1 WHERE id = $2 AND reseller_id = $3',
+      [paused, req.params.leadId, req.user.id]
+    );
+    res.json({ success: true, needs_human: paused, ai_paused: paused });
+  } catch (err) {
+    console.error('❌ [ERRO /toggle-ai]:', err.message);
     res.status(500).json({ error: 'Erro ao alterar status da IA' });
+  }
+});
+
+// Resetar Lead
+app.post('/api/leads/:leadId/reset', auth, async (req, res) => {
+  try {
+    await pool.query(
+      `UPDATE leads
+       SET stage = 'NOVO', natv_username = NULL, natv_password = NULL, chosen_app = NULL,
+           followup_step = 0, needs_human = false
+       WHERE id = $1 AND reseller_id = $2`,
+      [req.params.leadId, req.user.id]
+    );
+    res.json({ success: true, message: 'Lead resetado com sucesso!' });
+  } catch (err) {
+    console.error('❌ [ERRO /reset]:', err.message);
+    res.status(500).json({ error: 'Erro ao resetar lead' });
+  }
+});
+
+// Deletar Lead (remove mensagens antes para evitar erro de chave estrangeira)
+app.delete('/api/leads/:leadId', auth, async (req, res) => {
+  try {
+    const check = await pool.query('SELECT id FROM leads WHERE id = $1 AND reseller_id = $2', [req.params.leadId, req.user.id]);
+    if (!check.rows[0]) return res.status(404).json({ error: 'Lead não encontrado' });
+
+    await pool.query('DELETE FROM messages WHERE lead_id = $1', [req.params.leadId]);
+    await pool.query('DELETE FROM leads WHERE id = $1 AND reseller_id = $2', [req.params.leadId, req.user.id]);
+    res.json({ success: true, message: 'Lead deletado com sucesso!' });
+  } catch (err) {
+    console.error('❌ [ERRO DELETE /api/leads/:leadId]:', err.message);
+    res.status(500).json({ error: 'Erro ao deletar lead' });
+  }
+});
+
+// Gerar Teste pelo Painel (Gaveta do Lead)
+app.post('/api/leads/:leadId/generate-test', auth, async (req, res) => {
+  try {
+    const leadRes = await pool.query('SELECT * FROM leads WHERE id = $1 AND reseller_id = $2', [req.params.leadId, req.user.id]);
+    const lead = leadRes.rows[0];
+    if (!lead) return res.status(404).json({ error: 'Lead não encontrado' });
+
+    const resRes = await pool.query('SELECT * FROM resellers WHERE id = $1', [req.user.id]);
+    const reseller = resRes.rows[0];
+    if (!reseller?.natv_api_key) return res.status(400).json({ error: 'Revendedor sem chave NATV configurada.' });
+
+    const clientPhone = String(lead.phone || '').replace(/@.*$/, '').replace(/\D/g, '');
+    const natvRes = await fetch('https://revenda.pixbot.link/user', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${reseller.natv_api_key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ minutes: '60', ...(clientPhone ? { username: clientPhone } : {}) }),
+    });
+    const natvUser = await natvRes.json().catch(() => ({}));
+
+    if (!natvRes.ok || !natvUser.username) {
+      return res.status(400).json({ error: natvUser.message || 'Erro ao gerar teste na NATV.' });
+    }
+
+    await pool.query(
+      `UPDATE leads SET stage = 'TESTE', natv_username = $1, natv_password = $2, followup_step = 0, test_created_at = now() WHERE id = $3`,
+      [natvUser.username, natvUser.password || null, lead.id]
+    );
+
+    if (String(lead.chosen_app || '').toUpperCase().includes('MAXPLAYER') && reseller.maxplayer_token) {
+      await syncUserToMaxPlayer(reseller, lead, natvUser);
+    }
+
+    res.json({
+      success: true,
+      usuario: natvUser.username,
+      senha: natvUser.password || '',
+      dominio: natvUser.domain || '',
+    });
+  } catch (err) {
+    console.error('❌ [ERRO /generate-test]:', err.message);
+    res.status(500).json({ error: 'Erro interno ao criar teste' });
+  }
+});
+
+// Adicionar Tempo ao Teste (+1h, +3h, +6h)
+app.post('/api/leads/:leadId/add-time', auth, async (req, res) => {
+  const hours = Math.min(Math.max(Number(req.body?.hours) || 1, 1), 6);
+  try {
+    const leadRes = await pool.query('SELECT * FROM leads WHERE id = $1 AND reseller_id = $2', [req.params.leadId, req.user.id]);
+    const lead = leadRes.rows[0];
+    if (!lead || !lead.natv_username) {
+      return res.status(400).json({ error: 'Lead ainda não possui usuário NATV gerado.' });
+    }
+
+    const resRes = await pool.query('SELECT natv_api_key FROM resellers WHERE id = $1', [req.user.id]);
+    const reseller = resRes.rows[0];
+    if (!reseller?.natv_api_key) {
+      return res.status(400).json({ error: 'Chave NATV não configurada.' });
+    }
+
+    const natvRes = await fetch('https://revenda.pixbot.link/user/extension', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${reseller.natv_api_key}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ username: lead.natv_username, hours }),
+    });
+
+    if (!natvRes.ok) {
+      const errBody = await natvRes.text().catch(() => '');
+      console.error('❌ [NATV EXTENSION]:', natvRes.status, errBody);
+      return res.status(400).json({ error: 'A API NATV recusou a extensão de tempo para este usuário.' });
+    }
+
+    res.json({ success: true, message: `+${hours}h adicionadas com sucesso!` });
+  } catch (err) {
+    console.error('❌ [ERRO /add-time]:', err.message);
+    res.status(500).json({ error: 'Erro interno ao adicionar tempo' });
   }
 });
 
@@ -2050,9 +2332,12 @@ async function initFollowupColumns() {
       ADD COLUMN IF NOT EXISTS renewal_last_exp TEXT,
       ADD COLUMN IF NOT EXISTS renewal_stage TEXT,
       ADD COLUMN IF NOT EXISTS instance_name TEXT,
-      ADD COLUMN IF NOT EXISTS test_created_at TIMESTAMP;
+      ADD COLUMN IF NOT EXISTS test_created_at TIMESTAMP,
+      ADD COLUMN IF NOT EXISTS natv_password TEXT;
     `);
 
+    await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_url TEXT;`);
+    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS maxplayer_token TEXT;`);
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS support_whatsapp TEXT;`);
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS custom_apps JSONB;`);
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS bot_name TEXT DEFAULT 'José';`);
