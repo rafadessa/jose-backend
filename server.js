@@ -17,7 +17,7 @@ app.use('/logos', express.static(path.join(__dirname, 'logos')));
 app.get('/', (req, res) =>
   res.json({
     status: 'ok',
-    app: 'API do José v4.2 (Fix Gemini 3.5 + Fix @lid + Fix Stats + Créditos Decimais + TVs Antigas + Top 10 + Canais)',
+    app: 'API do José v4.3 (Inove + Notifique + Sync Créditos + Ativações + Tarifas 0.09/0.18)',
   })
 );
 
@@ -279,6 +279,289 @@ app.post('/api/natv/validate', auth, async (req, res) => {
     res.json({ success: true, credits, natvData });
   } catch {
     res.status(500).json({ error: 'Erro ao conectar na API NATV' });
+  }
+});
+
+const natvCreditsCache = new Map();
+
+app.get('/api/reseller/sync-credits', auth, async (req, res) => {
+  const userId = req.user.id;
+  try {
+    const r = await pool.query(
+      'SELECT natv_api_key, natv_credits, wallet_balance FROM resellers WHERE id = $1',
+      [userId]
+    );
+    const reseller = r.rows[0];
+    if (!reseller) return res.status(404).json({ error: 'Revendedor não encontrado' });
+
+    const cached = natvCreditsCache.get(userId);
+    if (cached && Date.now() - cached.ts < 60000) {
+      return res.json({
+        natv_credits: cached.credits,
+        wallet_balance: reseller.wallet_balance,
+      });
+    }
+
+    let credits = Number(reseller.natv_credits ?? 0);
+    if (reseller.natv_api_key) {
+      const natvRes = await fetch('https://revenda.pixbot.link/reseller/me', {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${reseller.natv_api_key}`,
+          'Content-Type': 'application/json',
+        },
+      });
+      if (natvRes.ok) {
+        const natvData = await natvRes.json();
+        credits = Number(natvData.credits ?? credits);
+        await pool.query('UPDATE resellers SET natv_credits = $1 WHERE id = $2', [credits, userId]);
+        natvCreditsCache.set(userId, { ts: Date.now(), credits });
+      }
+    }
+
+    res.json({ natv_credits: credits, wallet_balance: reseller.wallet_balance });
+  } catch {
+    res.status(500).json({ error: 'Erro ao sincronizar créditos' });
+  }
+});
+
+// Integração Gestor Inove & Gestor Notifique
+const INOVE_API_BASE = 'https://api.gestorinove.com.br/api';
+const NOTIFIQUE_API_BASE = 'https://apiv1.notifique.net/v1';
+
+function extractInoveWorkspaceId(raw) {
+  const value = String(raw || '').trim();
+  if (!value) return '';
+  const match = value.match(/workspaces\/([^/?#]+)/i);
+  return match ? match[1] : value.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+}
+
+async function syncClientToInove(reseller, lead, months, screens) {
+  const workspaceId = extractInoveWorkspaceId(reseller.gestor_webhook_url);
+  const apiKey = String(reseller.gestor_token || '').trim();
+  if (!workspaceId || !apiKey || !lead?.natv_username) return;
+
+  const headers = {
+    Authorization: `Bearer ${apiKey}`,
+    'Content-Type': 'application/json',
+  };
+
+  const expDate = new Date();
+  expDate.setDate(expDate.getDate() + Number(months || 1) * 30);
+  const expiresAt = expDate.toISOString();
+
+  const rawDigits = String(lead.phone || '').replace(/@.*$/, '').replace(/\D/g, '');
+  const fullPhone = rawDigits ? `+${rawDigits.startsWith('55') ? rawDigits : '55' + rawDigits}` : undefined;
+  const externalId = String(lead.natv_username).trim();
+
+  try {
+    const findRes = await fetch(
+      `${INOVE_API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/clients/external/${encodeURIComponent(externalId)}`,
+      { method: 'GET', headers }
+    );
+
+    if (findRes.ok) {
+      const foundJson = await findRes.json();
+      const clientId = foundJson?.data?.id;
+      if (clientId) {
+        await fetch(
+          `${INOVE_API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/clients/${encodeURIComponent(clientId)}`,
+          {
+            method: 'PATCH',
+            headers,
+            body: JSON.stringify({
+              expiresAt,
+              notes: `Renovado via José (${months}m / ${screens} tela(s))`,
+            }),
+          }
+        );
+        console.log(`✅ [INOVE] Cliente ${externalId} atualizado`);
+        return;
+      }
+    }
+
+    const clientName = String(lead.name || externalId).trim();
+    const createRes = await fetch(
+      `${INOVE_API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/clients`,
+      {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          name: clientName.length >= 2 ? clientName : `Cliente ${externalId}`,
+          username: externalId,
+          ...(fullPhone ? { fullPhone } : {}),
+          externalId,
+          expiresAt,
+          notes: `Ativado via José (${months}m / ${screens} tela(s))`,
+          optInMessages: true,
+          sendWelcomeMessage: false,
+        }),
+      }
+    );
+
+    if (createRes.ok) {
+      console.log(`✅ [INOVE] Cliente ${externalId} criado no workspace ${workspaceId}`);
+    } else {
+      console.error('❌ [INOVE] Erro ao criar cliente:', createRes.status, await createRes.text());
+    }
+  } catch (err) {
+    console.error('❌ [INOVE] Falha na sincronização:', err.message);
+  }
+}
+
+async function syncClientToNotifique(reseller, lead, months, screens) {
+  const apiKey = String(reseller.gestor_token || '').trim();
+  if (!apiKey || !lead?.phone) return;
+
+  const headers = {
+    Authorization: `Bearer ${apiKey}`,
+    'Content-Type': 'application/json',
+  };
+
+  const rawDigits = String(lead.phone || '').replace(/@.*$/, '').replace(/\D/g, '');
+  if (rawDigits.length < 10) return;
+  const whats = rawDigits.startsWith('55') ? rawDigits : `55${rawDigits}`;
+
+  try {
+    const findRes = await fetch(
+      `${NOTIFIQUE_API_BASE}/clientes?whats=${encodeURIComponent(whats)}`,
+      { method: 'GET', headers }
+    );
+    if (!findRes.ok) {
+      console.error('❌ [NOTIFIQUE] Erro ao buscar cliente:', findRes.status);
+      return;
+    }
+
+    const foundData = await findRes.json();
+    if (foundData?.cliente === false) {
+      console.log(`ℹ️ [NOTIFIQUE] Cliente ${whats} ainda não existe no Gestor Notifique.`);
+      return;
+    }
+
+    const clientObj = foundData?.cliente || foundData?.data || foundData;
+    const clientId = clientObj?.id || clientObj?.idBanco;
+    if (!clientId) return;
+
+    // Sincroniza com o painel IPTV (atualiza vencimento SEM gastar crédito em dobro)
+    const syncRes = await fetch(
+      `${NOTIFIQUE_API_BASE}/clientes/${encodeURIComponent(clientId)}/sincronizar`,
+      { method: 'POST', headers }
+    );
+
+    if (syncRes.ok) {
+      console.log(`✅ [NOTIFIQUE] Cliente #${clientId} (${whats}) sincronizado com o painel.`);
+      return;
+    }
+
+    const expDate = new Date();
+    expDate.setDate(expDate.getDate() + Number(months || 1) * 30);
+    const vencimentoBr = new Intl.DateTimeFormat('pt-BR', {
+      timeZone: 'America/Sao_Paulo',
+    }).format(expDate);
+
+    await fetch(`${NOTIFIQUE_API_BASE}/clientes/${encodeURIComponent(clientId)}`, {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify({
+        editar_vencimento: true,
+        editar_nota: true,
+        informacoes: {
+          vencimento: vencimentoBr,
+          nota: `Ativado via José (${months}m / ${screens} tela(s))`,
+        },
+        sincronizar: true,
+      }),
+    });
+    console.log(`✅ [NOTIFIQUE] Cliente #${clientId} atualizado via PATCH (${vencimentoBr})`);
+  } catch (err) {
+    console.error('❌ [NOTIFIQUE] Falha na sincronização:', err.message);
+  }
+}
+
+async function syncClientToGestor(reseller, lead, months, screens) {
+  if (reseller?.gestor_provider === 'inove') {
+    await syncClientToInove(reseller, lead, months, screens);
+  } else if (reseller?.gestor_provider === 'notifique') {
+    await syncClientToNotifique(reseller, lead, months, screens);
+  }
+}
+
+app.get('/api/reseller/gestor', auth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      'SELECT gestor_provider, gestor_webhook_url, gestor_token FROM resellers WHERE id = $1',
+      [req.user.id]
+    );
+    const row = r.rows[0] || {};
+    res.json({
+      provider: row.gestor_provider || 'inove',
+      webhook_url: row.gestor_webhook_url || '',
+      token: row.gestor_token || '',
+    });
+  } catch {
+    res.status(500).json({ error: 'Erro ao carregar configuração do gestor' });
+  }
+});
+
+app.post('/api/reseller/gestor', auth, async (req, res) => {
+  const provider = String(req.body?.provider || 'inove').trim().toLowerCase();
+  let webhook_url = String(req.body?.webhook_url || '').trim();
+  const token = String(req.body?.token || '').trim();
+
+  if (!['inove', 'notifique'].includes(provider)) {
+    return res.status(400).json({ error: 'Provedor inválido' });
+  }
+  if (!token) {
+    return res.status(400).json({ error: 'Informe o Token / API Key de integração.' });
+  }
+
+  try {
+    let servidores = [];
+
+    if (provider === 'inove') {
+      if (!webhook_url) {
+        return res.status(400).json({ error: 'Informe o Workspace ID do Gestor Inove.' });
+      }
+      const workspaceId = extractInoveWorkspaceId(webhook_url);
+      const checkRes = await fetch(
+        `${INOVE_API_BASE}/workspaces/${encodeURIComponent(workspaceId)}`,
+        { method: 'GET', headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!checkRes.ok) {
+        return res.status(400).json({
+          error:
+            'Gestor Inove recusou a conexão. Verifique o Workspace ID e os escopos (workspace:read, clients:read, clients:write).',
+        });
+      }
+    }
+
+    if (provider === 'notifique') {
+      const checkRes = await fetch(`${NOTIFIQUE_API_BASE}/servidores`, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!checkRes.ok) {
+        return res.status(400).json({
+          error: 'Chave da API Notifique inválida ou revogada. Confira sua chave no painel Notifique.',
+        });
+      }
+      const data = await checkRes.json();
+      servidores = Array.isArray(data?.servidores) ? data.servidores : [];
+      if (!webhook_url && servidores[0]?.id) {
+        webhook_url = String(servidores[0].id);
+      }
+    }
+
+    await pool.query(
+      `UPDATE resellers
+       SET gestor_provider = $1, gestor_webhook_url = $2, gestor_token = $3
+       WHERE id = $4`,
+      [provider, webhook_url, token, req.user.id]
+    );
+
+    res.json({ success: true, provider, webhook_url, servidores });
+  } catch {
+    res.status(500).json({ error: 'Erro ao validar/salvar configuração do gestor' });
   }
 });
 
@@ -580,6 +863,8 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
           [String(paymentId), reseller.id, lead.id]
         );
         await pool.query(`UPDATE leads SET stage = 'ATIVO' WHERE id = $1`, [lead.id]);
+
+        await syncClientToGestor(reseller, lead, months, screens);
 
         if (!isVipReseller(reseller)) {
           await debitWallet(
@@ -1573,6 +1858,9 @@ async function initFollowupColumns() {
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS custom_apps JSONB;`);
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS bot_name TEXT DEFAULT 'José';`);
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS custom_prices JSONB;`);
+    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS gestor_provider TEXT;`);
+    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS gestor_webhook_url TEXT;`);
+    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS gestor_token TEXT;`);
     await pool.query(`ALTER TABLE resellers ALTER COLUMN natv_credits TYPE NUMERIC(10,2) USING natv_credits::numeric;`);
     await pool.query(`ALTER TABLE resellers ALTER COLUMN cost_per_reply SET DEFAULT 0.09;`);
     await pool.query(`ALTER TABLE resellers ALTER COLUMN cost_per_test SET DEFAULT 0.18;`);
