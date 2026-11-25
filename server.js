@@ -17,7 +17,7 @@ app.use('/logos', express.static(path.join(__dirname, 'logos')));
 app.get('/', (req, res) =>
   res.json({
     status: 'ok',
-    app: 'API do José v4.3 (Inove + Notifique + Sync Créditos + Fix Webhook MP + Ativações + Tarifas 0.09/0.18)',
+    app: 'API do José v4.4 (Inove + Notifique + Sync Créditos + Fix Webhook MP + Remarketing Inteligente + Fix Renovação)',
   })
 );
 
@@ -2037,6 +2037,22 @@ function getBrazilHour() {
   return Number(hourStr);
 }
 
+function getBrDateKey(dateInput) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Sao_Paulo',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(dateInput);
+}
+
+function parseNatvDateMs(rawDate) {
+  if (!rawDate) return NaN;
+  const str = String(rawDate).trim().replace(' ', 'T');
+  const hasTz = /[zZ]$|[+-]\d{2}:?\d{2}$/.test(str);
+  return Date.parse(hasTz ? str : `${str}-03:00`);
+}
+
 async function runSalesFollowup() {
   const hour = getBrazilHour();
   if (hour < 8 || hour >= 22) return;
@@ -2097,7 +2113,7 @@ async function runSalesFollowup() {
       let msg = null;
       let nextStep = step;
 
-      // STEP 1: Primeiro lembrete (após 45 min sem teste ou 65 min após teste)
+      // STEP 1: Primeiro lembrete (45 min sem teste ou 65 min após teste)
       if (step === 0) {
         if (stage === 'TESTE' && diffMin >= 65 && diffMin < 1440) {
           msg = `E aí, o que achou da qualidade dos canais e filmes no teste? Quer que eu já libere o plano mensal de R$ ${mensalStr} pra você continuar assistindo? 📺`;
@@ -2110,7 +2126,6 @@ async function runSalesFollowup() {
           nextStep = 1;
         }
       }
-
       // STEP 2: Segundo lembrete (apenas após 24h reais do último contato E do último follow-up)
       else if (step === 1 && diffMin >= 1440 && diffMin < 4320 && diffFollowupMin >= 1440) {
         if (stage === 'TESTE') {
@@ -2167,6 +2182,8 @@ async function runRenewalFollowup() {
     `);
 
     const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
+    const todayKey = getBrDateKey(new Date());
+    const todayMidnightMs = Date.parse(`${todayKey}T00:00:00-03:00`);
 
     for (const reseller of resellersRes.rows) {
       if (!isVipReseller(reseller) && Number(reseller.wallet_balance) <= 0) continue;
@@ -2186,17 +2203,32 @@ async function runRenewalFollowup() {
         [reseller.id]
       );
       const leadByUser = new Map(leadsRes.rows.map((l) => [String(l.natv_username).trim().toLowerCase(), l]));
-      const now = Date.now();
 
       for (const c of list) {
         const dono = String(c.r || '').trim().toLowerCase();
         if (resellerName && dono && dono !== resellerName) continue;
         if (!c.e || !c.u) continue;
 
-        const expMs = Date.parse(String(c.e).replace(' ', 'T'));
+        // 1. Bloqueia qualquer usuário de teste/trial vindo da NATV
+        const statusNatv = String(c.t || '').trim().toLowerCase();
+        if (
+          statusNatv.includes('test') ||
+          statusNatv.includes('trial') ||
+          c.is_trial === true ||
+          c.is_trial === 1 ||
+          String(c.is_trial) === '1'
+        ) {
+          continue;
+        }
+
+        // 2. Calcula os dias restantes usando data exata no fuso de Brasília
+        const expMs = parseNatvDateMs(c.e);
         if (Number.isNaN(expMs)) continue;
 
-        const daysLeft = Math.ceil((expMs - now) / (1000 * 60 * 60 * 24));
+        const expDateKey = getBrDateKey(new Date(expMs));
+        const expMidnightMs = Date.parse(`${expDateKey}T00:00:00-03:00`);
+        const daysLeft = Math.round((expMidnightMs - todayMidnightMs) / (1000 * 60 * 60 * 24));
+
         let stageToSend = null;
         let msg = null;
 
@@ -2246,6 +2278,10 @@ async function runRenewalFollowup() {
           }
           leadByUser.set(userKey, lead);
         }
+
+        // 3. Bloqueia qualquer lead que fez teste pelo José e nunca ativou plano pago
+        if (String(lead.stage || '').toUpperCase() === 'TESTE') continue;
+        if (lead.test_created_at && String(lead.stage || '').toUpperCase() !== 'ATIVO') continue;
 
         if (lead.needs_human) continue;
         if (lead.renewal_last_exp === String(c.e) && lead.renewal_stage === stageToSend) continue;
