@@ -504,6 +504,16 @@ app.get('/api/reseller/gestor', auth, async (req, res) => {
 });
 
 app.post('/api/reseller/gestor', auth, async (req, res) => {
+  
+    if (provider === 'native') {
+    await pool.query(
+      `UPDATE resellers SET gestor_provider = 'native', gestor_webhook_url = NULL, gestor_token = NULL WHERE id = $1`,
+      [req.user.id]
+    );
+    return res.json({ success: true, provider: 'native' });
+  }
+
+  
   const provider = String(req.body?.provider || 'inove').trim().toLowerCase();
   let webhook_url = String(req.body?.webhook_url || '').trim();
   const token = String(req.body?.token || '').trim();
