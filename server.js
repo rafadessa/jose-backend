@@ -17,7 +17,7 @@ app.use('/logos', express.static(path.join(__dirname, 'logos')));
 app.get('/', (req, res) =>
   res.json({
     status: 'ok',
-    app: 'API do José v4.4 (Inove + Notifique + Sync Créditos + Fix Webhook MP + Remarketing Inteligente + Fix Renovação)',
+    app: 'API do José v4.5 (Inove + Notifique + Sync Créditos + Fix Webhook MP + Remarketing Inteligente + Renovação Só Suporte)',
   })
 );
 
@@ -2083,7 +2083,6 @@ async function runSalesFollowup() {
     let featuredGame = null;
     try {
       const gamesData = await fetchTodayGames();
-      // Só considera jogos que ainda vão começar (pelo menos 30 min no futuro)
       const upcomingGames = (gamesData.jogos || []).filter(
         (g) => g.timestamp > now + 30 * 60 * 1000
       );
@@ -2113,7 +2112,6 @@ async function runSalesFollowup() {
       let msg = null;
       let nextStep = step;
 
-      // STEP 1: Primeiro lembrete (45 min sem teste ou 65 min após teste)
       if (step === 0) {
         if (stage === 'TESTE' && diffMin >= 65 && diffMin < 1440) {
           msg = `E aí, o que achou da qualidade dos canais e filmes no teste? Quer que eu já libere o plano mensal de R$ ${mensalStr} pra você continuar assistindo? 📺`;
@@ -2125,9 +2123,7 @@ async function runSalesFollowup() {
           msg = `Opa! Ainda quer fazer o teste grátis de 1 hora sem compromisso? Me diz qual a marca da sua TV ou aparelho que já te ajudo a testar rapidinho 📺`;
           nextStep = 1;
         }
-      }
-      // STEP 2: Segundo lembrete (apenas após 24h reais do último contato E do último follow-up)
-      else if (step === 1 && diffMin >= 1440 && diffMin < 4320 && diffFollowupMin >= 1440) {
+      } else if (step === 1 && diffMin >= 1440 && diffMin < 4320 && diffFollowupMin >= 1440) {
         if (stage === 'TESTE') {
           if (featuredGame) {
             msg = `Hoje tem *${featuredGame.home} x ${featuredGame.away}* às ${featuredGame.time} ⚽ Se quiser, já libero seu plano mensal de R$ ${mensalStr} em 1 minutinho pra você assistir tranquilo!`;
@@ -2172,13 +2168,15 @@ async function runRenewalFollowup() {
   if (hour < 9 || hour >= 21) return;
 
   try {
+    // Busca APENAS revendedores que possuem instância do José Suporte
     const resellersRes = await pool.query(`
       SELECT DISTINCT ON (r.id) r.*, wi.instance_name
       FROM resellers r
       JOIN whatsapp_instances wi ON wi.reseller_id = r.id
       WHERE r.bot_active = true
         AND r.natv_api_key IS NOT NULL
-      ORDER BY r.id, (CASE WHEN wi.bot_type = 'support' THEN 0 ELSE 1 END) ASC
+        AND wi.bot_type = 'support'
+      ORDER BY r.id
     `);
 
     const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
@@ -2187,6 +2185,20 @@ async function runRenewalFollowup() {
 
     for (const reseller of resellersRes.rows) {
       if (!isVipReseller(reseller) && Number(reseller.wallet_balance) <= 0) continue;
+
+      // Confirma na Evolution API se o WhatsApp do José Suporte está realmente conectado
+      try {
+        const stateRes = await fetch(`${EVOLUTION_URL}/instance/connectionState/${reseller.instance_name}`, {
+          method: 'GET',
+          headers: { apikey: EVOLUTION_KEY },
+        });
+        if (!stateRes.ok) continue;
+        const stateData = await stateRes.json();
+        const state = stateData?.instance?.state || stateData?.state || 'close';
+        if (state !== 'open') continue;
+      } catch {
+        continue;
+      }
 
       const response = await fetch(`${baseUrl}/report/allusers`, {
         method: 'GET',
