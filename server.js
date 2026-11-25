@@ -1713,7 +1713,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
           }
         }
 
-        if (fnName === 'gerar_teste') {
+                if (fnName === 'gerar_teste') {
           if (!activeReseller.natv_api_key) {
             toolResult = 'Erro: revendedor sem chave NATV configurada.';
           } else {
@@ -1731,11 +1731,25 @@ app.post('/api/webhooks/evolution', async (req, res) => {
                 [natvUser.username, lead.id]
               );
               if (!isVip) {
-                await debitWallet(activeReseller.id, Number(activeReseller.cost_per_test ?? 0.18), 'test_created', `Teste gerado: ${natvUser.username}`);
+                await debitWallet(
+                  activeReseller.id,
+                  Number(activeReseller.cost_per_test ?? 0.18),
+                  'test_created',
+                  `Teste gerado: ${natvUser.username}`
+                );
               }
+
+              let maxplayerCadastrado = false;
+              const isMaxPlayer = String(lead.chosen_app || '').toUpperCase().includes('MAXPLAYER');
+              if (isMaxPlayer && activeReseller.maxplayer_token) {
+                const mpSync = await syncUserToMaxPlayer(activeReseller, lead, natvUser);
+                maxplayerCadastrado = Boolean(mpSync.ok);
+              }
+
               toolResult = JSON.stringify({
                 app_escolhido: lead.chosen_app || '',
                 codigo_watch_hub: activeReseller.watch_hub_code || '',
+                maxplayer_cadastrado: maxplayerCadastrado,
                 usuario: natvUser.username,
                 senha: natvUser.password,
                 dominio: natvUser.domain,
