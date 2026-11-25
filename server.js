@@ -1352,24 +1352,26 @@ app.post('/api/webhooks/evolution', async (req, res) => {
 
     if (!remoteJid || remoteJid.includes('@g.us')) return;
 
-    // DETECÇÃO DE INTERVENÇÃO HUMANA PELO CELULAR (ignora @lid e ecos do bot)
+       // DETECÇÃO DE INTERVENÇÃO HUMANA PELO CELULAR (pausa apenas no José Suporte)
     if (fromMe) {
       if (!remoteJid.endsWith('@lid') && !isBotEcho(instance, remoteJid, msgId)) {
         const instCheck = await pool.query(
-          `SELECT reseller_id FROM whatsapp_instances WHERE instance_name = $1`,
+          `SELECT reseller_id, COALESCE(bot_type, 'sales') AS bot_type
+           FROM whatsapp_instances WHERE instance_name = $1`,
           [instance]
         );
-        const resellerId = instCheck.rows[0]?.reseller_id;
-        if (resellerId) {
+        const inst = instCheck.rows[0];
+        if (inst?.reseller_id && inst.bot_type === 'support') {
           await pool.query(
             `UPDATE leads SET needs_human = true, last_interaction = now() WHERE reseller_id = $1 AND phone = $2`,
-            [resellerId, remoteJid]
+            [inst.reseller_id, remoteJid]
           );
-          console.log(`✋ [HUMANO ASSUMIU NO CELULAR] IA pausada para ${remoteJid} na instância ${instance}`);
+          console.log(`✋ [HUMANO ASSUMIU NO CELULAR] IA pausada no Suporte para ${remoteJid}`);
         }
       }
       return;
     }
+
 
     // 1. TRAVA IMEDIATA CONTRA DUPLICIDADE
     if (processedMessages.has(msgId)) return;
