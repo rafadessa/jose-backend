@@ -2059,21 +2059,22 @@ app.get('/api/leads', auth, async (req, res) => {
          id, phone, name, last_message, last_interaction, stage, chosen_app,
          natv_username, natv_password, needs_human, needs_human AS ai_paused,
          tab, instance_name, test_created_at, created_at,
-                           CASE
+         CASE
            WHEN COALESCE(instance_name, '') LIKE 'jose_sup_%' THEN 'support'
            ELSE 'sales'
          END AS bot_type
-u
        FROM leads
        WHERE reseller_id = $1
        ORDER BY last_interaction DESC`,
       [req.user.id]
     );
     res.json(result.rows);
-  } catch {
+  } catch (err) {
+    console.error('❌ [ERRO /api/leads]:', err.message);
     res.status(500).json({ error: 'Erro ao carregar conversas' });
   }
 });
+
 
 app.get('/api/leads/stats', auth, async (req, res) => {
   try {
