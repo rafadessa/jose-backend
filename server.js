@@ -2059,10 +2059,11 @@ app.get('/api/leads', auth, async (req, res) => {
          id, phone, name, last_message, last_interaction, stage, chosen_app,
          natv_username, natv_password, needs_human, needs_human AS ai_paused,
          tab, instance_name, test_created_at, created_at,
-         CASE
-           WHEN COALESCE(instance_name, '') LIKE 'jose_sup_%' OR COALESCE(tab, '') = 'suporte' THEN 'support'
+                           CASE
+           WHEN COALESCE(instance_name, '') LIKE 'jose_sup_%' THEN 'support'
            ELSE 'sales'
          END AS bot_type
+u
        FROM leads
        WHERE reseller_id = $1
        ORDER BY last_interaction DESC`,
