@@ -17,7 +17,7 @@ app.use('/logos', express.static(path.join(__dirname, 'logos')));
 app.get('/', (req, res) =>
   res.json({
     status: 'ok',
-    app: 'API do José v5.1 (Painel de Sub-Revendedores + Transferência de Créditos + Extend Test Oficial)',
+    app: 'API do José v5.2 (José Gestor Completo + Importação Anti-Duplicidade + Avisos Personalizados)',
   })
 );
 
@@ -2069,12 +2069,10 @@ app.get('/api/leads', auth, async (req, res) => {
       [req.user.id]
     );
     res.json(result.rows);
-  } catch (err) {
-    console.error('❌ [ERRO /api/leads]:', err.message);
+  } catch {
     res.status(500).json({ error: 'Erro ao carregar conversas' });
   }
 });
-
 
 app.get('/api/leads/stats', auth, async (req, res) => {
   try {
@@ -2416,6 +2414,7 @@ async function initFollowupColumns() {
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS gestor_provider TEXT;`);
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS gestor_webhook_url TEXT;`);
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS gestor_token TEXT;`);
+    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS gestor_settings JSONB;`);
     await pool.query(`ALTER TABLE resellers ALTER COLUMN natv_credits TYPE NUMERIC(10,2) USING natv_credits::numeric;`);
     await pool.query(`ALTER TABLE resellers ALTER COLUMN cost_per_reply SET DEFAULT 0.09;`);
     await pool.query(`ALTER TABLE resellers ALTER COLUMN cost_per_test SET DEFAULT 0.18;`);
@@ -2652,6 +2651,72 @@ async function runSalesFollowup() {
   }
 }
 
+const DEFAULT_GESTOR_SETTINGS = {
+  send_renewal_alerts: false,
+  messages: {
+    '3d': {
+      enabled: true,
+      text: 'Oi {nome}! Passando pra lembrar que o seu plano ({plano}) vence em 3 dias ({vencimento}). Se já quiser deixar renovado pra não ficar sem sinal, é só me chamar aqui que gero o Pix na hora! 📺',
+    },
+    '0d': {
+      enabled: true,
+      text: 'Olá {nome}! Seu plano ({plano}) vence hoje ({vencimento}). Quer que eu já envie o Pix de R$ {valor} para renovar automaticamente e manter seu acesso ativo?',
+    },
+    '-1d': {
+      enabled: true,
+      text: 'Oi {nome}! Vi aqui que o seu acesso ({usuario}) venceu ontem. Se quiser reativar agora, é só responder aqui que libero em 1 minutinho pra você 😉',
+    },
+    '-3d': {
+      enabled: true,
+      text: 'Olá {nome}! Notei que seu plano venceu há 3 dias. Se quiser voltar a assistir hoje, seu usuário ({usuario}) continua salvo aqui — só me avisar qual plano prefere que já mando o Pix!',
+    },
+    '-7d': {
+      enabled: true,
+      text: 'Oi {nome}! Passando só pra avisar que seu login ({usuario}) ainda está guardado por aqui. Quando quiser reativar sua TV, é só dar um oi que libero na hora 👍',
+    },
+  },
+};
+
+function getResellerGestorSettings(reseller) {
+  const raw = reseller?.gestor_settings;
+  if (!raw || typeof raw !== 'object') return DEFAULT_GESTOR_SETTINGS;
+  const msgs = raw.messages && typeof raw.messages === 'object' ? raw.messages : {};
+  return {
+    send_renewal_alerts: Boolean(raw.send_renewal_alerts),
+    messages: {
+      '3d': {
+        enabled: msgs['3d']?.enabled ?? DEFAULT_GESTOR_SETTINGS.messages['3d'].enabled,
+        text: msgs['3d']?.text || DEFAULT_GESTOR_SETTINGS.messages['3d'].text,
+      },
+      '0d': {
+        enabled: msgs['0d']?.enabled ?? DEFAULT_GESTOR_SETTINGS.messages['0d'].enabled,
+        text: msgs['0d']?.text || DEFAULT_GESTOR_SETTINGS.messages['0d'].text,
+      },
+      '-1d': {
+        enabled: msgs['-1d']?.enabled ?? DEFAULT_GESTOR_SETTINGS.messages['-1d'].enabled,
+        text: msgs['-1d']?.text || DEFAULT_GESTOR_SETTINGS.messages['-1d'].text,
+      },
+      '-3d': {
+        enabled: msgs['-3d']?.enabled ?? DEFAULT_GESTOR_SETTINGS.messages['-3d'].enabled,
+        text: msgs['-3d']?.text || DEFAULT_GESTOR_SETTINGS.messages['-3d'].text,
+      },
+      '-7d': {
+        enabled: msgs['-7d']?.enabled ?? DEFAULT_GESTOR_SETTINGS.messages['-7d'].enabled,
+        text: msgs['-7d']?.text || DEFAULT_GESTOR_SETTINGS.messages['-7d'].text,
+      },
+    },
+  };
+}
+
+function renderGestorTemplate(template, vars) {
+  return String(template || '')
+    .replace(/\{nome\}/gi, vars.nome || 'Cliente')
+    .replace(/\{usuario\}/gi, vars.usuario || '')
+    .replace(/\{vencimento\}/gi, vars.vencimento || '')
+    .replace(/\{plano\}/gi, vars.plano || 'Mensal')
+    .replace(/\{valor\}/gi, vars.valor || '29,90');
+}
+
 async function runRenewalFollowup() {
   const hour = getBrazilHour();
   if (hour < 9 || hour >= 21) return;
@@ -2674,6 +2739,11 @@ async function runRenewalFollowup() {
 
     for (const reseller of resellersRes.rows) {
       if (!isVipReseller(reseller) && Number(reseller.wallet_balance) <= 0) continue;
+
+      // Só dispara avisos de vencimento se o revendedor usar o Gestor José (native) E tiver a opção marcada
+      const provider = String(reseller.gestor_provider || 'native').toLowerCase();
+      const gestorCfg = getResellerGestorSettings(reseller);
+      if (provider !== 'native' || !gestorCfg.send_renewal_alerts) continue;
 
       // Confirma na Evolution API se o WhatsApp do José Suporte está realmente conectado
       try {
@@ -2699,11 +2769,13 @@ async function runRenewalFollowup() {
       const list = Array.isArray(raw) ? raw : (raw.data || raw.users || raw.clients || []);
       const resellerName = String(reseller.name || '').trim().toLowerCase();
 
-      const leadsRes = await pool.query(
-        `SELECT * FROM leads WHERE reseller_id = $1 AND natv_username IS NOT NULL`,
-        [reseller.id]
-      );
+      const [leadsRes, linksRes] = await Promise.all([
+        pool.query(`SELECT * FROM leads WHERE reseller_id = $1 AND natv_username IS NOT NULL`, [reseller.id]),
+        pool.query(`SELECT * FROM client_links WHERE user_id = $1`, [String(reseller.id)]),
+      ]);
       const leadByUser = new Map(leadsRes.rows.map((l) => [String(l.natv_username).trim().toLowerCase(), l]));
+      const linkByUser = new Map(linksRes.rows.map((cl) => [String(cl.natv_username).trim().toLowerCase(), cl]));
+      const resellerPrices = getResellerPrices(reseller);
 
       for (const c of list) {
         const dono = String(c.r || '').trim().toLowerCase();
@@ -2741,35 +2813,30 @@ async function runRenewalFollowup() {
         const daysLeft = Math.round((expMidnightMs - todayMidnightMs) / (1000 * 60 * 60 * 24));
 
         let stageToSend = null;
-        let msg = null;
-
-        if (daysLeft === 3) {
-          stageToSend = '3d';
-          msg = `Oi! Passando pra lembrar que o seu plano vence em 3 dias (${String(c.e).slice(0, 10)}). Se já quiser deixar renovado pra não ficar sem sinal, é só me chamar aqui que gero o Pix na hora! 📺`;
-        } else if (daysLeft === 0) {
-          stageToSend = '0d';
-          msg = `Olá! Seu plano vence hoje. Quer que eu já envie o Pix para renovar automaticamente e manter seu acesso ativo?`;
-        } else if (daysLeft === -1) {
-          stageToSend = '-1d';
-          msg = `Oi! Vi aqui que o seu acesso venceu ontem. Se quiser reativar agora, é só responder aqui que libero em 1 minutinho pra você 😉`;
-        } else if (daysLeft === -3) {
-          stageToSend = '-3d';
-          msg = `Olá! Notei que seu plano venceu há 3 dias. Se quiser voltar a assistir hoje, seu usuário continua salvo aqui — só me avisar qual plano prefere que já mando o Pix!`;
-        } else if (daysLeft === -7) {
-          stageToSend = '-7d';
-          msg = `Oi! Passando só pra avisar que seu login ainda está guardado por aqui. Quando quiser reativar sua TV, é só dar um oi que libero na hora 👍`;
-        }
+        if (daysLeft === 3) stageToSend = '3d';
+        else if (daysLeft === 0) stageToSend = '0d';
+        else if (daysLeft === -1) stageToSend = '-1d';
+        else if (daysLeft === -3) stageToSend = '-3d';
+        else if (daysLeft === -7) stageToSend = '-7d';
 
         if (!stageToSend) continue;
+        const stageCfg = gestorCfg.messages[stageToSend];
+        if (!stageCfg?.enabled || !stageCfg?.text) continue;
 
         const userKey = String(c.u).trim().toLowerCase();
+        const clientLink = linkByUser.get(userKey);
+        if (clientLink && clientLink.auto_renew_alert === false) continue;
+
         let lead = leadByUser.get(userKey);
 
         if (!lead) {
-          const digits = String(c.u).replace(/\D/g, '');
-          if (digits.length < 10 || digits.length > 13) continue;
-          const phoneWithDdi = digits.length <= 11 ? `55${digits}` : digits;
-          const remoteJid = `${phoneWithDdi}@s.whatsapp.net`;
+          let remoteJid = clientLink?.whatsapp_jns || null;
+          if (!remoteJid) {
+            const digits = String(c.u).replace(/\D/g, '');
+            if (digits.length < 10 || digits.length > 13) continue;
+            const phoneWithDdi = digits.length <= 11 ? `55${digits}` : digits;
+            remoteJid = `${phoneWithDdi}@s.whatsapp.net`;
+          }
 
           const existingByPhone = await pool.query(
             `SELECT * FROM leads WHERE reseller_id = $1 AND phone = $2 LIMIT 1`,
@@ -2796,6 +2863,14 @@ async function runRenewalFollowup() {
 
         if (lead.needs_human) continue;
         if (lead.renewal_last_exp === String(c.e) && lead.renewal_stage === stageToSend) continue;
+
+        const msg = renderGestorTemplate(stageCfg.text, {
+          nome: clientLink?.client_name || lead.name || String(c.n || c.u).trim(),
+          usuario: String(c.u).trim(),
+          vencimento: String(c.e).slice(0, 10).split('-').reverse().join('/'),
+          plano: clientLink?.plan_name || 'Plano Mensal',
+          valor: formatBRL(clientLink?.plan_price ?? resellerPrices[1][1]),
+        });
 
         await sendWhatsAppText(reseller.instance_name, lead.phone, msg);
         await pool.query(`INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`, [lead.id, msg]);
@@ -2929,6 +3004,16 @@ async function initClientLinksTable() {
       );
     `);
     await pool.query(`ALTER TABLE client_links ALTER COLUMN user_id TYPE TEXT USING user_id::text;`);
+    await pool.query(`
+      ALTER TABLE client_links
+      ADD COLUMN IF NOT EXISTS client_name TEXT,
+      ADD COLUMN IF NOT EXISTS plan_name TEXT,
+      ADD COLUMN IF NOT EXISTS plan_price NUMERIC(10,2),
+      ADD COLUMN IF NOT EXISTS screens INTEGER DEFAULT 1,
+      ADD COLUMN IF NOT EXISTS exp_date TEXT,
+      ADD COLUMN IF NOT EXISTS notes TEXT,
+      ADD COLUMN IF NOT EXISTS auto_renew_alert BOOLEAN DEFAULT true;
+    `);
   } catch (err) {
     console.error('Erro ao criar tabela client_links:', err);
   }
@@ -3019,12 +3104,246 @@ app.post('/api/gestor/sincronizar', auth, async (req, res) => {
 app.get('/api/gestor/clientes', auth, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT natv_username, whatsapp_jns, status, updated_at FROM client_links WHERE user_id = $1 ORDER BY status DESC, updated_at DESC`,
-      [req.user.id]
+      `SELECT natv_username, whatsapp_jns, status, client_name, plan_name, plan_price, screens, exp_date, notes, COALESCE(auto_renew_alert, true) AS auto_renew_alert, updated_at
+       FROM client_links
+       WHERE user_id = $1
+       ORDER BY status DESC, updated_at DESC`,
+      [String(req.user.id)]
     );
     res.json({ clientes: result.rows });
   } catch {
     res.status(500).json({ error: 'Erro ao buscar dados do gestor' });
+  }
+});
+
+app.get('/api/gestor/settings', auth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      'SELECT gestor_provider, gestor_settings FROM resellers WHERE id = $1',
+      [req.user.id]
+    );
+    const row = r.rows[0] || {};
+    res.json({
+      provider: row.gestor_provider || 'native',
+      settings: getResellerGestorSettings(row),
+    });
+  } catch {
+    res.status(500).json({ error: 'Erro ao carregar configurações do Gestor José' });
+  }
+});
+
+app.post('/api/gestor/settings', auth, async (req, res) => {
+  const settings = req.body?.settings;
+  if (!settings || typeof settings !== 'object') {
+    return res.status(400).json({ error: 'Configurações inválidas.' });
+  }
+  try {
+    await pool.query('UPDATE resellers SET gestor_settings = $1 WHERE id = $2', [
+      JSON.stringify(settings),
+      req.user.id,
+    ]);
+    res.json({ success: true, settings });
+  } catch {
+    res.status(500).json({ error: 'Erro ao salvar configurações do Gestor José' });
+  }
+});
+
+app.post('/api/gestor/cliente', auth, async (req, res) => {
+  const { natv_username, whatsapp, client_name, plan_name, plan_price, screens, notes, auto_renew_alert } = req.body || {};
+  if (!natv_username) return res.status(400).json({ error: 'Informe o usuário NATV' });
+
+  const cleanPhone = String(whatsapp || '').replace(/\D/g, '');
+  const whatsappJid = cleanPhone.length >= 10
+    ? `${cleanPhone.startsWith('55') ? cleanPhone : '55' + cleanPhone}@s.whatsapp.net`
+    : null;
+  const statusVal = whatsappJid ? 'MANUAL' : 'PENDENTE';
+  const parsedPrice = plan_price !== '' && plan_price !== null && plan_price !== undefined ? Number(plan_price) : null;
+  const parsedScreens = Math.max(1, Math.min(Number(screens || 1), 4));
+
+  try {
+    await pool.query(
+      `INSERT INTO client_links (user_id, natv_username, whatsapp_jns, status, client_name, plan_name, plan_price, screens, notes, auto_renew_alert)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       ON CONFLICT (user_id, natv_username)
+       DO UPDATE SET
+         whatsapp_jns = COALESCE(EXCLUDED.whatsapp_jns, client_links.whatsapp_jns),
+         status = CASE WHEN EXCLUDED.whatsapp_jns IS NOT NULL THEN 'MANUAL' ELSE client_links.status END,
+         client_name = EXCLUDED.client_name,
+         plan_name = EXCLUDED.plan_name,
+         plan_price = EXCLUDED.plan_price,
+         screens = EXCLUDED.screens,
+         notes = EXCLUDED.notes,
+         auto_renew_alert = EXCLUDED.auto_renew_alert,
+         updated_at = CURRENT_TIMESTAMP`,
+      [
+        String(req.user.id),
+        String(natv_username).trim(),
+        whatsappJid,
+        statusVal,
+        client_name ? String(client_name).trim() : null,
+        plan_name ? String(plan_name).trim() : null,
+        Number.isFinite(parsedPrice) ? parsedPrice : null,
+        parsedScreens,
+        notes ? String(notes).trim() : null,
+        auto_renew_alert !== false,
+      ]
+    );
+    res.json({ success: true, message: 'Ficha do cliente salva com sucesso!' });
+  } catch (err) {
+    console.error('❌ [ERRO /api/gestor/cliente]:', err.message);
+    res.status(500).json({ error: 'Erro ao salvar ficha do cliente' });
+  }
+});
+
+// Importação inteligente do Gestor Inove ou Gestor Notifique cruzando com a NATV sem duplicar
+app.post('/api/gestor/importar', auth, async (req, res) => {
+  const userId = String(req.user.id);
+  const provider = String(req.body?.provider || '').trim().toLowerCase();
+  const token = String(req.body?.token || '').trim();
+  const workspaceInput = String(req.body?.workspace_id || '').trim();
+
+  if (!['inove', 'notifique'].includes(provider)) {
+    return res.status(400).json({ error: 'Selecione Inove ou Notifique para importar.' });
+  }
+  if (!token) {
+    return res.status(400).json({ error: 'Informe a API Key / Token do gestor.' });
+  }
+
+  try {
+    const r = await pool.query('SELECT name, natv_api_key FROM resellers WHERE id = $1', [req.user.id]);
+    const natvKey = r.rows[0]?.natv_api_key;
+    const resellerName = String(r.rows[0]?.name || '').trim().toLowerCase();
+    if (!natvKey) return res.status(400).json({ error: 'Chave NATV não configurada.' });
+
+    // 1. Puxa base NATV para cruzamento anti-duplicidade
+    const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
+    const natvRes = await fetch(`${baseUrl}/report/allusers`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${natvKey}`, 'Content-Type': 'application/json' },
+    });
+    const natvRaw = natvRes.ok ? await natvRes.json().catch(() => []) : [];
+    const natvList = (Array.isArray(natvRaw) ? natvRaw : natvRaw.data || natvRaw.users || []).filter((c) => {
+      const dono = String(c.r || '').trim().toLowerCase();
+      return !resellerName || !dono || dono === resellerName;
+    });
+
+    const natvByUser = new Map();
+    const natvByPhoneTail = new Map();
+    for (const c of natvList) {
+      const u = String(c.u || '').trim();
+      if (!u) continue;
+      natvByUser.set(u.toLowerCase(), c);
+      const digits = u.replace(/\D/g, '');
+      if (digits.length >= 8) natvByPhoneTail.set(digits.slice(-8), c);
+    }
+
+    // 2. Puxa clientes do gestor externo
+    let externalClients = [];
+    if (provider === 'inove') {
+      const wsId = extractInoveWorkspaceId(workspaceInput);
+      if (!wsId) return res.status(400).json({ error: 'Informe o Workspace ID do Gestor Inove.' });
+      const inoveRes = await fetch(`${INOVE_API_BASE}/workspaces/${encodeURIComponent(wsId)}/clients?limit=500`, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      });
+      if (!inoveRes.ok) {
+        return res.status(400).json({ error: 'Gestor Inove recusou a leitura de clientes. Verifique o Workspace ID e escopo clients:read.' });
+      }
+      const inoveJson = await inoveRes.json().catch(() => ({}));
+      const rawArr = Array.isArray(inoveJson) ? inoveJson : inoveJson.data || inoveJson.clients || [];
+      externalClients = rawArr.map((c) => ({
+        username: String(c.username || c.externalId || '').trim(),
+        name: String(c.name || '').trim(),
+        phone: String(c.fullPhone || c.phone || c.whatsapp || '').replace(/\D/g, ''),
+        plan_name: String(c.plan?.name || c.planName || '').trim(),
+        plan_price: c.plan?.price ?? c.price ?? null,
+        screens: Number(c.connections || c.screens || 1),
+        exp_date: c.expiresAt ? String(c.expiresAt).slice(0, 10) : null,
+        notes: String(c.notes || '').trim(),
+      }));
+    } else if (provider === 'notifique') {
+      const notRes = await fetch(`${NOTIFIQUE_API_BASE}/clientes`, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      });
+      if (!notRes.ok) {
+        return res.status(400).json({ error: 'Chave do Gestor Notifique inválida ou recusada.' });
+      }
+      const notJson = await notRes.json().catch(() => ({}));
+      const rawArr = Array.isArray(notJson) ? notJson : notJson.clientes || notJson.data || [];
+      externalClients = rawArr.map((c) => ({
+        username: String(c.usuario || c.username || c.login || '').trim(),
+        name: String(c.nome || c.name || '').trim(),
+        phone: String(c.whats || c.whatsapp || c.telefone || '').replace(/\D/g, ''),
+        plan_name: String(c.plano || c.plan || '').trim(),
+        plan_price: c.valor ?? c.price ?? null,
+        screens: Number(c.telas || c.conexoes || 1),
+        exp_date: c.vencimento ? String(c.vencimento) : null,
+        notes: String(c.nota || c.obs || '').trim(),
+      }));
+    }
+
+    // 3. Cruza e faz UPSERT sem duplicar
+    let cruzadosNatv = 0;
+    let importadosNovos = 0;
+
+    for (const ext of externalClients) {
+      let matchedNatv = ext.username ? natvByUser.get(ext.username.toLowerCase()) : null;
+      if (!matchedNatv && ext.phone.length >= 8) {
+        matchedNatv = natvByPhoneTail.get(ext.phone.slice(-8)) || null;
+      }
+
+      const finalUsername = matchedNatv ? String(matchedNatv.u).trim() : ext.username || ext.phone;
+      if (!finalUsername) continue;
+
+      if (matchedNatv) cruzadosNatv++;
+      else importadosNovos++;
+
+      const whatsappJid = ext.phone.length >= 10
+        ? `${ext.phone.startsWith('55') ? ext.phone : '55' + ext.phone}@s.whatsapp.net`
+        : null;
+      const statusLink = whatsappJid ? 'MANUAL' : 'PENDENTE';
+      const parsedPrice = ext.plan_price !== null && ext.plan_price !== '' ? Number(String(ext.plan_price).replace(',', '.')) : null;
+
+      await pool.query(
+        `INSERT INTO client_links (user_id, natv_username, whatsapp_jns, status, client_name, plan_name, plan_price, screens, exp_date, notes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT (user_id, natv_username)
+         DO UPDATE SET
+           whatsapp_jns = COALESCE(EXCLUDED.whatsapp_jns, client_links.whatsapp_jns),
+           status = CASE WHEN EXCLUDED.whatsapp_jns IS NOT NULL THEN 'MANUAL' ELSE client_links.status END,
+           client_name = COALESCE(NULLIF(EXCLUDED.client_name, ''), client_links.client_name),
+           plan_name = COALESCE(NULLIF(EXCLUDED.plan_name, ''), client_links.plan_name),
+           plan_price = COALESCE(EXCLUDED.plan_price, client_links.plan_price),
+           screens = COALESCE(EXCLUDED.screens, client_links.screens),
+           exp_date = COALESCE(EXCLUDED.exp_date, client_links.exp_date),
+           notes = COALESCE(NULLIF(EXCLUDED.notes, ''), client_links.notes),
+           updated_at = CURRENT_TIMESTAMP`,
+        [
+          userId,
+          finalUsername,
+          whatsappJid,
+          statusLink,
+          ext.name || null,
+          ext.plan_name || null,
+          Number.isFinite(parsedPrice) ? parsedPrice : null,
+          Math.max(1, Math.min(ext.screens || 1, 4)),
+          matchedNatv?.e ? String(matchedNatv.e).slice(0, 10) : ext.exp_date,
+          ext.notes || null,
+        ]
+      );
+    }
+
+    res.json({
+      success: true,
+      total_lidos: externalClients.length,
+      cruzados_natv: cruzadosNatv,
+      outros_importados: importadosNovos,
+      message: `Importação concluída sem duplicidade! ${cruzadosNatv} clientes cruzados com a NATV e ${importadosNovos} registros adicionais importados.`,
+    });
+  } catch (err) {
+    console.error('❌ [ERRO /api/gestor/importar]:', err.message);
+    res.status(500).json({ error: 'Erro interno ao importar clientes do gestor.' });
   }
 });
 
