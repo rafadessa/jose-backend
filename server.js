@@ -17,7 +17,7 @@ app.use('/logos', express.static(path.join(__dirname, 'logos')));
 app.get('/', (req, res) =>
   res.json({
     status: 'ok',
-    app: 'API do José v4.8 (Áudio + Visão de Imagens Corrigidos + Botões da Gaveta + MaxPlayer)',
+    app: 'API do José v4.9 (Renovação Blindada Contra Testes + Sync de Créditos NATV + Áudio/Visão)',
   })
 );
 
@@ -284,8 +284,15 @@ app.post('/api/natv/validate', auth, async (req, res) => {
 
 const natvCreditsCache = new Map();
 
+function parseNatvCredits(rawVal, fallback = 0) {
+  if (rawVal === undefined || rawVal === null || rawVal === '') return fallback;
+  const parsed = Number(String(rawVal).replace(',', '.').trim());
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
 app.get('/api/reseller/sync-credits', auth, async (req, res) => {
   const userId = req.user.id;
+  const forceSync = req.query.force === '1' || req.query.force === 'true';
   try {
     const r = await pool.query(
       'SELECT natv_api_key, natv_credits, wallet_balance FROM resellers WHERE id = $1',
@@ -295,32 +302,48 @@ app.get('/api/reseller/sync-credits', auth, async (req, res) => {
     if (!reseller) return res.status(404).json({ error: 'Revendedor não encontrado' });
 
     const cached = natvCreditsCache.get(userId);
-    if (cached && Date.now() - cached.ts < 60000) {
+    if (!forceSync && cached && Date.now() - cached.ts < 15000) {
       return res.json({
         natv_credits: cached.credits,
+        credits: cached.credits,
         wallet_balance: reseller.wallet_balance,
       });
     }
 
-    let credits = Number(reseller.natv_credits ?? 0);
+    let credits = parseNatvCredits(reseller.natv_credits, 0);
     if (reseller.natv_api_key) {
-      const natvRes = await fetch('https://revenda.pixbot.link/reseller/me', {
+      const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
+      const natvRes = await fetch(`${baseUrl}/reseller/me`, {
         method: 'GET',
         headers: {
-          Authorization: `Bearer ${reseller.natv_api_key}`,
+          Authorization: `Bearer ${reseller.natv_api_key.trim()}`,
           'Content-Type': 'application/json',
+          Accept: 'application/json',
         },
       });
       if (natvRes.ok) {
-        const natvData = await natvRes.json();
-        credits = Number(natvData.credits ?? credits);
+        const natvData = await natvRes.json().catch(() => ({}));
+        const rawCredits =
+          natvData.credits ??
+          natvData.data?.credits ??
+          natvData.reseller?.credits ??
+          natvData.balance;
+        credits = parseNatvCredits(rawCredits, credits);
         await pool.query('UPDATE resellers SET natv_credits = $1 WHERE id = $2', [credits, userId]);
         natvCreditsCache.set(userId, { ts: Date.now(), credits });
+      } else {
+        const errText = await natvRes.text().catch(() => '');
+        console.error(`❌ [SYNC-CREDITS] NATV retornou ${natvRes.status}: ${errText.slice(0, 200)}`);
       }
     }
 
-    res.json({ natv_credits: credits, wallet_balance: reseller.wallet_balance });
-  } catch {
+    res.json({
+      natv_credits: credits,
+      credits,
+      wallet_balance: reseller.wallet_balance,
+    });
+  } catch (err) {
+    console.error('❌ [SYNC-CREDITS] Erro:', err.message);
     res.status(500).json({ error: 'Erro ao sincronizar créditos' });
   }
 });
@@ -2644,6 +2667,7 @@ async function runRenewalFollowup() {
         if (
           statusNatv.includes('test') ||
           statusNatv.includes('trial') ||
+          statusNatv.includes('demo') ||
           c.is_trial === true ||
           c.is_trial === 1 ||
           String(c.is_trial) === '1'
@@ -2654,6 +2678,15 @@ async function runRenewalFollowup() {
         // 2. Calcula os dias restantes usando data exata no fuso de Brasília
         const expMs = parseNatvDateMs(c.e);
         if (Number.isNaN(expMs)) continue;
+
+        // Bloqueia contas cuja duração total foi <= 48h (testes de 1h/6h que já expiraram na NATV)
+        const createdRaw = c.d || c.created_at || c.criado_em;
+        if (createdRaw) {
+          const createdMs = parseNatvDateMs(createdRaw);
+          if (!Number.isNaN(createdMs) && expMs - createdMs <= 48 * 60 * 60 * 1000) {
+            continue;
+          }
+        }
 
         const expDateKey = getBrDateKey(new Date(expMs));
         const expMidnightMs = Date.parse(`${expDateKey}T00:00:00-03:00`);
@@ -2709,9 +2742,9 @@ async function runRenewalFollowup() {
           leadByUser.set(userKey, lead);
         }
 
-        // 3. Bloqueia qualquer lead que fez teste pelo José e nunca ativou plano pago
-        if (String(lead.stage || '').toUpperCase() === 'TESTE') continue;
-        if (lead.test_created_at && String(lead.stage || '').toUpperCase() !== 'ATIVO') continue;
+        // 3. Só envia cobrança de renovação para leads com estágio estritamente ATIVO (bloqueia NOVO, TESTE, etc.)
+        const leadStage = String(lead.stage || '').trim().toUpperCase();
+        if (leadStage !== 'ATIVO') continue;
 
         if (lead.needs_human) continue;
         if (lead.renewal_last_exp === String(c.e) && lead.renewal_stage === stageToSend) continue;
