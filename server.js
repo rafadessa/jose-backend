@@ -17,7 +17,7 @@ app.use('/logos', express.static(path.join(__dirname, 'logos')));
 app.get('/', (req, res) =>
   res.json({
     status: 'ok',
-    app: 'API do José v5.0 (Vendedor Total + Conferência de Login na Foto + Abas Vendas/Suporte + Meta Ads)',
+    app: 'API do José v5.1 (Painel de Sub-Revendedores + Transferência de Créditos + Extend Test Oficial)',
   })
 );
 
@@ -2310,7 +2310,8 @@ app.post('/api/leads/:leadId/add-time', auth, async (req, res) => {
       return res.status(400).json({ error: 'Chave NATV não configurada.' });
     }
 
-    const natvRes = await fetch('https://revenda.pixbot.link/user/extension', {
+    const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
+    let natvRes = await fetch(`${baseUrl}/user/extend_test`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${reseller.natv_api_key}`,
@@ -2318,6 +2319,17 @@ app.post('/api/leads/:leadId/add-time', auth, async (req, res) => {
       },
       body: JSON.stringify({ username: lead.natv_username, hours }),
     });
+
+    if (!natvRes.ok && natvRes.status === 404) {
+      natvRes = await fetch(`${baseUrl}/user/extension`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${reseller.natv_api_key}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ username: lead.natv_username, hours }),
+      });
+    }
 
     if (!natvRes.ok) {
       const errBody = await natvRes.text().catch(() => '');
@@ -3330,6 +3342,178 @@ app.post('/api/ads/campaigns', auth, async (req, res) => {
   } catch (err) {
     console.error('❌ [ERRO /api/ads/campaigns]:', err.message);
     res.status(500).json({ error: 'Erro ao criar campanha Meta Ads' });
+  }
+});
+
+
+// ==========================================
+// 13. SUB-REVENDEDORES NATV (LISTAR, CRIAR E ENVIAR CRÉDITOS)
+// ==========================================
+const subresellersCache = new Map();
+
+app.get('/api/reseller/subresellers', auth, async (req, res) => {
+  const userId = req.user.id;
+  const force = req.query.force === '1' || req.query.force === 'true';
+  const cached = subresellersCache.get(userId);
+  if (!force && cached && Date.now() - cached.ts < 30000) {
+    return res.json(cached.payload);
+  }
+
+  try {
+    const r = await pool.query('SELECT name, natv_api_key FROM resellers WHERE id = $1', [userId]);
+    const natvKey = r.rows[0]?.natv_api_key?.trim();
+    const myName = String(r.rows[0]?.name || '').trim().toLowerCase();
+    if (!natvKey) return res.status(400).json({ error: 'Chave NATV não configurada' });
+
+    const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
+    const headers = {
+      Authorization: `Bearer ${natvKey}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    };
+
+    const [searchRes, usersRes] = await Promise.all([
+      fetch(`${baseUrl}/reseller/subreseller/search`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ query: '' }),
+      }).catch(() => null),
+      fetch(`${baseUrl}/report/allusers`, { method: 'GET', headers }).catch(() => null),
+    ]);
+
+    let rawSubs = [];
+    if (searchRes && searchRes.ok) {
+      const sData = await searchRes.json().catch(() => ({}));
+      rawSubs = Array.isArray(sData)
+        ? sData
+        : sData.subresellers || sData.resellers || sData.data || sData.results || [];
+    }
+
+    // Contagem de clientes ativos e totais por revendedor via /report/allusers
+    const statsByOwner = new Map();
+    if (usersRes && usersRes.ok) {
+      const uData = await usersRes.json().catch(() => ({}));
+      const userList = Array.isArray(uData) ? uData : uData.data || uData.users || uData.clients || [];
+      for (const c of userList) {
+        const owner = String(c.r || '').trim().toLowerCase();
+        if (!owner || owner === myName) continue;
+        const curr = statsByOwner.get(owner) || { active: 0, total: 0 };
+        curr.total += 1;
+        if (String(c.t || '').trim().toLowerCase() === 'ativo') curr.active += 1;
+        statsByOwner.set(owner, curr);
+      }
+    }
+
+    const subMap = new Map();
+    for (const s of rawSubs) {
+      const uname = String(s.username || s.u || s.name || '').trim();
+      if (!uname) continue;
+      const key = uname.toLowerCase();
+      const st = statsByOwner.get(key) || { active: 0, total: 0 };
+      subMap.set(key, {
+        id: String(s.id ?? uname),
+        username: uname,
+        credits: Number(s.credits ?? s.saldo ?? 0),
+        active_clients: st.active,
+        total_clients: st.total,
+        status: s.status || 'Ativo',
+      });
+    }
+
+    // Inclui também sub-revendas que apareceram em /report/allusers caso não tenham vindo na busca
+    for (const [ownerKey, st] of statsByOwner.entries()) {
+      if (!subMap.has(ownerKey)) {
+        subMap.set(ownerKey, {
+          id: ownerKey,
+          username: ownerKey,
+          credits: null,
+          active_clients: st.active,
+          total_clients: st.total,
+          status: 'Ativo',
+        });
+      }
+    }
+
+    const subresellers = Array.from(subMap.values()).sort((a, b) => b.active_clients - a.active_clients);
+    const payload = { total: subresellers.length, subresellers };
+    subresellersCache.set(userId, { ts: Date.now(), payload });
+    res.json(payload);
+  } catch (err) {
+    console.error('❌ [ERRO /api/reseller/subresellers]:', err.message);
+    res.status(500).json({ error: 'Erro ao listar sub-revendedores' });
+  }
+});
+
+app.post('/api/reseller/subresellers', auth, async (req, res) => {
+  const username = String(req.body?.username || '').trim();
+  if (!username) return res.status(400).json({ error: 'Informe o usuário da nova sub-revenda.' });
+
+  try {
+    const r = await pool.query('SELECT natv_api_key FROM resellers WHERE id = $1', [req.user.id]);
+    const natvKey = r.rows[0]?.natv_api_key?.trim();
+    if (!natvKey) return res.status(400).json({ error: 'Chave NATV não configurada.' });
+
+    const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
+    const natvRes = await fetch(`${baseUrl}/reseller/subreseller`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${natvKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username }),
+    });
+    const data = await natvRes.json().catch(() => ({}));
+    if (!natvRes.ok) {
+      return res.status(natvRes.status).json({ error: data.detail || data.message || 'Erro ao criar sub-revendedor.' });
+    }
+
+    subresellersCache.delete(req.user.id);
+    natvCreditsCache.delete(req.user.id);
+    res.json({ success: true, subreseller: data });
+  } catch (err) {
+    console.error('❌ [ERRO CRIAR SUBREVENDA]:', err.message);
+    res.status(500).json({ error: 'Erro interno ao criar sub-revendedor.' });
+  }
+});
+
+app.post('/api/reseller/subresellers/credits', auth, async (req, res) => {
+  const username = String(req.body?.username || '').trim();
+  const amount = Number(req.body?.amount || 0);
+  if (!username) return res.status(400).json({ error: 'Informe o usuário da sub-revenda.' });
+  if (!Number.isFinite(amount) || amount < 4) {
+    return res.status(400).json({ error: 'Quantidade mínima: 4 créditos (se tiver 1 crédito) ou 5 créditos nos demais casos.' });
+  }
+
+  try {
+    const r = await pool.query('SELECT natv_api_key FROM resellers WHERE id = $1', [req.user.id]);
+    const natvKey = r.rows[0]?.natv_api_key?.trim();
+    if (!natvKey) return res.status(400).json({ error: 'Chave NATV não configurada.' });
+
+    const baseUrl = (process.env.NATV_API_URL || 'https://revenda.pixbot.link').replace(/\/$/, '');
+    const natvRes = await fetch(`${baseUrl}/reseller/credits`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${natvKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, amount }),
+    });
+    const data = await natvRes.json().catch(() => ({}));
+    if (!natvRes.ok) {
+      return res.status(natvRes.status).json({ error: data.detail || data.message || 'Erro ao transferir créditos.' });
+    }
+
+    if (data.caller_credits !== undefined) {
+      await pool.query('UPDATE resellers SET natv_credits = $1 WHERE id = $2', [Number(data.caller_credits), req.user.id]);
+      natvCreditsCache.set(req.user.id, { ts: Date.now(), credits: Number(data.caller_credits) });
+    }
+    subresellersCache.delete(req.user.id);
+
+    res.json({
+      success: true,
+      recipient_username: data.recipient_username || username,
+      amount_sent: data.amount_sent ?? amount,
+      caller_credits: data.caller_credits,
+      recipient_credits: data.recipient_credits,
+      message: `${amount} créditos enviados para ${username} com sucesso!`,
+    });
+  } catch (err) {
+    console.error('❌ [ERRO TRANSFERIR CRÉDITOS]:', err.message);
+    res.status(500).json({ error: 'Erro interno ao transferir créditos.' });
   }
 });
 
