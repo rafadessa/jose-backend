@@ -17,7 +17,7 @@ app.use('/logos', express.static(path.join(__dirname, 'logos')));
 app.get('/', (req, res) =>
   res.json({
     status: 'ok',
-    app: 'API do José v4.9 (Renovação Blindada Contra Testes + Sync de Créditos NATV + Áudio/Visão)',
+    app: 'API do José v5.0 (Vendedor Total + Conferência de Login na Foto + Abas Vendas/Suporte + Meta Ads)',
   })
 );
 
@@ -1152,8 +1152,20 @@ function buildSalesPrompt(reseller) {
     Senha: [senha]\n`
     : `  - NUNCA recomende nem mencione o aplicativo MAXPLAYER (não está habilitado nesta revenda).\n`;
 
-  return `Você é o ${botName}, atendente comercial de streaming no WhatsApp.
-Estilo: leve, direto, simpático e natural. Mensagens CURTAS (máx. 2 a 3 linhas) e APENAS UMA pergunta por vez.
+  return `Você é o ${botName}, um vendedor especialista, engajado, educado e consultivo de streaming no WhatsApp.
+Seu objetivo principal é encantar o cliente, conduzir até o teste grátis sem atrito e CONVERTER A VENDA do plano.
+Estilo: leve, entusiasmado na medida certa, simpático e natural. Mensagens CURTAS (máx. 2 a 3 linhas) e APENAS UMA pergunta por vez.
+
+POSTURA DE VENDEDOR (CONVERSÃO):
+- Sempre valorize o que o cliente vai ganhar (canais abertos e fechados, esportes ao vivo, filmes e séries atualizados sem travar).
+- Assim que o cliente entrar no teste ou disser que gostou, conduza naturalmente para o fechamento oferecendo o plano mensal ou trimestral (destacando a economia do trimestral) e já se colocando à disposição para gerar o Pix na hora.
+- Se o cliente tiver objeção de preço ou dúvida, responda com educação, destaque o custo-benefício (menos de R$ 1 por dia) e puxe para o fechamento.
+
+CONFERÊNCIA DE ERRO DE DIGITAÇÃO (MUITO IMPORTANTE):
+- Se o cliente disser que "não entrou", "deu erro", "servidor rejeitou as credenciais", "usuário/senha inválidos" ou mandar foto da tela de login:
+  1. Compare CARACTERE POR CARACTERE o Código, Usuário e Senha que aparecem na foto com os [DADOS ATUAIS DO LEAD] informados no contexto.
+  2. Se encontrar qualquer erro de digitação (ex: digitou dois "55" no começo como 5555..., faltou/sobrou um número, espaço extra, código errado), avise com muita educação exatamente onde foi o erro (ex: "Vi aqui na foto que acabou indo um 55 a mais no começo do usuário! 😉").
+  3. Reenvie os dados corretos bem organizados e peça para apagar e digitar novamente com calma. Só chame \`chamar_humano\` se os dados na foto estiverem 100% idênticos aos gerados e mesmo assim não entrar.
 
 PLANOS (até 4 telas simultâneas):
 - 1 tela: Mensal R$ ${formatBRL(prices[1][1])} | Trimestral R$ ${formatBRL(prices[1][3])} | Semestral R$ ${formatBRL(prices[1][6])} | Anual R$ ${formatBRL(prices[1][12])}
@@ -1634,9 +1646,11 @@ app.post('/api/webhooks/evolution', async (req, res) => {
         mediaUrl = `data:${mimeType};base64,${base64}`;
         const visionPrompt =
           'Analise esta imagem enviada por um cliente de streaming/IPTV no WhatsApp. ' +
-          'Descreva objetivamente em português: qual aplicativo está aberto na tela (se houver), ' +
-          'se aparece alguma mensagem de erro, tela de pagamento/licença, código/MAC/Device Key, ' +
-          'ou se é um comprovante de pagamento PIX (com valor e status). Seja direto e preciso.';
+          'Descreva objetivamente em português: ' +
+          '1) Qual aplicativo está aberto na tela (se identificável); ' +
+          '2) Se for tela de login, TRANSCREVA EXATAMENTE caractere por caractere o que está digitado nos campos de Código/Servidor, Usuário e Senha; ' +
+          '3) Qualquer mensagem de erro exibida (ex: "Servidor rejeitou as credenciais", "Invalid credentials"); ' +
+          '4) Se aparece tela de pagamento/licença, código/MAC/Device Key, ou comprovante PIX (com valor e status). Seja direto e preciso.';
         const visionAnalysis = await analyzeMediaWithGemini(base64, mimeType, visionPrompt);
 
         if (visionAnalysis) {
@@ -1781,8 +1795,19 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       },
     ];
 
+    const leadContextNote =
+      `[DADOS ATUAIS DO LEAD PARA CONFERÊNCIA]\n` +
+      `- Estágio: ${lead.stage || 'NOVO'}\n` +
+      `- App escolhido: ${lead.chosen_app || 'Ainda não escolhido'}\n` +
+      `- Usuário NATV gerado: ${lead.natv_username || 'Nenhum'}\n` +
+      `- Senha NATV gerada: ${lead.natv_password || 'Nenhuma'}\n` +
+      `- Código Watch Hub da revenda: ${activeReseller.watch_hub_code || 'Não configurado'}`;
+
     const messagesPayload = [
-      { role: 'system', content: isSupportBot ? buildSupportPrompt(activeReseller) : buildSalesPrompt(activeReseller) },
+      {
+        role: 'system',
+        content: `${isSupportBot ? buildSupportPrompt(activeReseller) : buildSalesPrompt(activeReseller)}\n\n${leadContextNote}`,
+      },
       ...history,
     ];
 
@@ -2030,8 +2055,17 @@ app.post('/api/webhooks/evolution', async (req, res) => {
 app.get('/api/leads', auth, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, phone, name, last_message, last_interaction, stage, chosen_app, natv_username, natv_password, needs_human, needs_human AS ai_paused, tab, test_created_at, created_at
-       FROM leads WHERE reseller_id = $1 ORDER BY last_interaction DESC`,
+      `SELECT
+         id, phone, name, last_message, last_interaction, stage, chosen_app,
+         natv_username, natv_password, needs_human, needs_human AS ai_paused,
+         tab, instance_name, test_created_at, created_at,
+         CASE
+           WHEN COALESCE(instance_name, '') LIKE 'jose_sup_%' OR COALESCE(tab, '') = 'suporte' THEN 'support'
+           ELSE 'sales'
+         END AS bot_type
+       FROM leads
+       WHERE reseller_id = $1
+       ORDER BY last_interaction DESC`,
       [req.user.id]
     );
     res.json(result.rows);
@@ -3158,6 +3192,144 @@ app.patch('/api/activations/:id/status', auth, async (req, res) => {
     res.json({ success: true, activation: updated.rows[0] });
   } catch {
     res.status(500).json({ error: 'Erro ao atualizar status' });
+  }
+});
+
+
+// ==========================================
+// 12. META ADS (CAMPANHAS COM CRIATIVOS PRÉ-PROGRAMADOS + CARTEIRA JOSÉ)
+// ==========================================
+const ADS_CREATIVES_CATALOG = [
+  {
+    id: 'futebol_ao_vivo',
+    name: 'Futebol ao Vivo + Todos os Canais',
+    headline: 'Todos os Jogos ao Vivo na sua TV!',
+    description: 'Teste grátis de 1 hora sem compromisso. Chama no WhatsApp!',
+    cta: 'Enviar mensagem no WhatsApp',
+    preview_url: `${BASE_URL}/logos/ad-futebol.jpg`,
+    min_daily_budget: 20.0,
+  },
+  {
+    id: 'filmes_series_4k',
+    name: 'Filmes, Séries e Canais 4K',
+    headline: 'Cinema em Casa por menos de R$ 1/dia',
+    description: 'Lançamentos, séries e canais ao vivo. Peça seu teste grátis!',
+    cta: 'Enviar mensagem no WhatsApp',
+    preview_url: `${BASE_URL}/logos/ad-cinema.jpg`,
+    min_daily_budget: 20.0,
+  },
+];
+
+async function initAdsTable() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ad_campaigns (
+        id SERIAL PRIMARY KEY,
+        reseller_id UUID NOT NULL,
+        creative_id TEXT NOT NULL,
+        creative_name TEXT NOT NULL,
+        whatsapp_number TEXT NOT NULL,
+        daily_budget NUMERIC(10,2) NOT NULL,
+        days INTEGER NOT NULL,
+        total_budget NUMERIC(10,2) NOT NULL,
+        status TEXT DEFAULT 'PENDENTE',
+        meta_campaign_id TEXT,
+        created_at TIMESTAMP DEFAULT now()
+      );
+    `);
+  } catch (err) {
+    console.error('Erro ao criar tabela ad_campaigns:', err.message);
+  }
+}
+initAdsTable();
+
+app.get('/api/ads/creatives', auth, (req, res) => {
+  res.json({ creatives: ADS_CREATIVES_CATALOG });
+});
+
+app.get('/api/ads/campaigns', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM ad_campaigns WHERE reseller_id = $1 ORDER BY created_at DESC LIMIT 50`,
+      [req.user.id]
+    );
+    res.json({ campaigns: result.rows });
+  } catch {
+    res.status(500).json({ error: 'Erro ao carregar campanhas' });
+  }
+});
+
+app.post('/api/ads/campaigns', auth, async (req, res) => {
+  const { creative_id, whatsapp_number, daily_budget, days } = req.body || {};
+  const creative = ADS_CREATIVES_CATALOG.find((c) => c.id === creative_id);
+  if (!creative) return res.status(400).json({ error: 'Criativo inválido.' });
+
+  const cleanPhone = String(whatsapp_number || '').replace(/\D/g, '');
+  if (cleanPhone.length < 10) return res.status(400).json({ error: 'Informe um número de WhatsApp válido.' });
+
+  const budgetDay = Number(daily_budget || 0);
+  const totalDays = Math.max(1, Math.min(Number(days || 1), 30));
+  if (budgetDay < creative.min_daily_budget) {
+    return res.status(400).json({ error: `Orçamento diário mínimo é R$ ${formatBRL(creative.min_daily_budget)}.` });
+  }
+
+  const totalBudget = Number((budgetDay * totalDays).toFixed(2));
+
+  try {
+    const resQuery = await pool.query('SELECT * FROM resellers WHERE id = $1', [req.user.id]);
+    const reseller = resQuery.rows[0];
+    if (!reseller) return res.status(404).json({ error: 'Revendedor não encontrado' });
+
+    const balance = Number(reseller.wallet_balance || 0);
+    if (balance < totalBudget) {
+      return res.status(400).json({
+        error: `Saldo insuficiente na Carteira José (necessário R$ ${formatBRL(totalBudget)}).`,
+      });
+    }
+
+    await debitWallet(
+      reseller.id,
+      totalBudget,
+      'meta_ads',
+      `Campanha Meta Ads: ${creative.name} (${totalDays}d x R$ ${formatBRL(budgetDay)})`
+    );
+
+    const inserted = await pool.query(
+      `INSERT INTO ad_campaigns (reseller_id, creative_id, creative_name, whatsapp_number, daily_budget, days, total_budget, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDENTE') RETURNING *`,
+      [reseller.id, creative.id, creative.name, cleanPhone, budgetDay, totalDays, totalBudget]
+    );
+    const campaign = inserted.rows[0];
+
+    const adminPhone = String(process.env.ADMIN_ACTIVATION_WHATSAPP || '555198970564').replace(/\D/g, '');
+    if (adminPhone) {
+      const anyInst = await pool.query(
+        `SELECT instance_name FROM whatsapp_instances WHERE reseller_id = $1 LIMIT 1`,
+        [reseller.id]
+      );
+      let instanceName = anyInst.rows[0]?.instance_name;
+      if (!instanceName) {
+        const fallbackInst = await pool.query(`SELECT instance_name FROM whatsapp_instances LIMIT 1`);
+        instanceName = fallbackInst.rows[0]?.instance_name;
+      }
+      if (instanceName) {
+        const formatted = adminPhone.length <= 11 ? `55${adminPhone}` : adminPhone;
+        const alertMsg =
+          `📣 *Nova Campanha Meta Ads #${campaign.id}*\n\n` +
+          `Revendedor: ${reseller.name}\n` +
+          `Criativo: *${campaign.creative_name}*\n` +
+          `WhatsApp destino: ${campaign.whatsapp_number}\n` +
+          `Orçamento: R$ ${formatBRL(budgetDay)}/dia por ${totalDays} dia(s)\n` +
+          `Total debitado da carteira: *R$ ${formatBRL(totalBudget)}*\n\n` +
+          `Status: PENDENTE`;
+        await sendWhatsAppText(instanceName, `${formatted}@s.whatsapp.net`, alertMsg);
+      }
+    }
+
+    res.json({ success: true, campaign });
+  } catch (err) {
+    console.error('❌ [ERRO /api/ads/campaigns]:', err.message);
+    res.status(500).json({ error: 'Erro ao criar campanha Meta Ads' });
   }
 });
 
