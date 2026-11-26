@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -14,10 +15,17 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 // Serve os logos hospedados na pasta /logos do repositório
 app.use('/logos', express.static(path.join(__dirname, 'logos')));
 
+// Pasta de uploads leves (imagens de confirmação de venda/renovação)
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
+if (!fs.existsSync(UPLOADS_DIR)) {
+  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+}
+app.use('/uploads', express.static(UPLOADS_DIR));
+
 app.get('/', (req, res) =>
   res.json({
     status: 'ok',
-    app: 'API do José v5.2 (José Gestor Completo + Importação Anti-Duplicidade + Avisos Personalizados)',
+    app: 'API do José v5.3 (José Gestor + Mensagem de Venda/Renovação com Imagem Comprimida no VPS)',
   })
 );
 
@@ -1085,11 +1093,30 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
         }
 
         if (instanceName) {
-          await sendWhatsAppText(
-            instanceName,
-            lead.phone,
-            `Pagamento confirmado! 🎉 Seu plano de ${months} ${months === 1 ? 'mês' : 'meses'} (${screens} ${screens === 1 ? 'tela' : 'telas'}) já foi ativado automaticamente. Bom entretenimento!`
-          );
+          const gestorCfg = getResellerGestorSettings(reseller);
+          const welcomeCfg = gestorCfg.welcome_message;
+          const expDate = new Date();
+          expDate.setDate(expDate.getDate() + months * 30);
+          const expBr = new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Sao_Paulo' }).format(expDate);
+          const planLabel = months === 1 ? 'Plano Mensal' : months === 3 ? 'Plano Trimestral' : months === 6 ? 'Plano Semestral' : months === 12 ? 'Plano Anual' : `Plano ${months} meses`;
+
+          const defaultConfirmMsg = `Pagamento confirmado! 🎉 Seu plano de ${months} ${months === 1 ? 'mês' : 'meses'} (${screens} ${screens === 1 ? 'tela' : 'telas'}) já foi ativado automaticamente. Bom entretenimento!`;
+          const finalMsg = welcomeCfg?.enabled && welcomeCfg?.text
+            ? renderGestorTemplate(welcomeCfg.text, {
+                nome: lead.name || 'Cliente',
+                usuario: lead.natv_username,
+                vencimento: expBr,
+                plano: planLabel,
+                valor: formatBRL(payment.transaction_amount),
+                telas: screens,
+              })
+            : defaultConfirmMsg;
+
+          if (welcomeCfg?.enabled && welcomeCfg?.image_url) {
+            await sendWhatsAppImage(instanceName, lead.phone, welcomeCfg.image_url, finalMsg);
+          } else {
+            await sendWhatsAppText(instanceName, lead.phone, finalMsg);
+          }
 
           // Notificação de venda para o WhatsApp de suporte humano da revenda
           if (reseller.support_whatsapp) {
@@ -2653,6 +2680,11 @@ async function runSalesFollowup() {
 
 const DEFAULT_GESTOR_SETTINGS = {
   send_renewal_alerts: false,
+  welcome_message: {
+    enabled: true,
+    text: 'Pagamento confirmado, {nome}! 🎉 Seu {plano} ({telas} tela(s)) foi ativado automaticamente. Usuário: {usuario} · Vencimento: {vencimento}. Bom entretenimento!',
+    image_url: '',
+  },
   messages: {
     '3d': {
       enabled: true,
@@ -2681,8 +2713,14 @@ function getResellerGestorSettings(reseller) {
   const raw = reseller?.gestor_settings;
   if (!raw || typeof raw !== 'object') return DEFAULT_GESTOR_SETTINGS;
   const msgs = raw.messages && typeof raw.messages === 'object' ? raw.messages : {};
+  const welcome = raw.welcome_message && typeof raw.welcome_message === 'object' ? raw.welcome_message : {};
   return {
     send_renewal_alerts: Boolean(raw.send_renewal_alerts),
+    welcome_message: {
+      enabled: welcome.enabled ?? DEFAULT_GESTOR_SETTINGS.welcome_message.enabled,
+      text: welcome.text || DEFAULT_GESTOR_SETTINGS.welcome_message.text,
+      image_url: typeof welcome.image_url === 'string' ? welcome.image_url : '',
+    },
     messages: {
       '3d': {
         enabled: msgs['3d']?.enabled ?? DEFAULT_GESTOR_SETTINGS.messages['3d'].enabled,
@@ -2714,7 +2752,8 @@ function renderGestorTemplate(template, vars) {
     .replace(/\{usuario\}/gi, vars.usuario || '')
     .replace(/\{vencimento\}/gi, vars.vencimento || '')
     .replace(/\{plano\}/gi, vars.plano || 'Mensal')
-    .replace(/\{valor\}/gi, vars.valor || '29,90');
+    .replace(/\{valor\}/gi, vars.valor || '29,90')
+    .replace(/\{telas\}/gi, String(vars.telas || 1));
 }
 
 async function runRenewalFollowup() {
@@ -3145,6 +3184,44 @@ app.post('/api/gestor/settings', auth, async (req, res) => {
     res.json({ success: true, settings });
   } catch {
     res.status(500).json({ error: 'Erro ao salvar configurações do Gestor José' });
+  }
+});
+
+app.post('/api/gestor/upload-image', auth, async (req, res) => {
+  const { image_base64 } = req.body || {};
+  if (!image_base64 || typeof image_base64 !== 'string') {
+    return res.status(400).json({ error: 'Envie uma imagem válida.' });
+  }
+
+  try {
+    const cleanBase64 = image_base64.replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, '').trim();
+    const buffer = Buffer.from(cleanBase64, 'base64');
+
+    // Limite de 600 KB no disco para manter o VPS sempre leve
+    if (buffer.length > 600 * 1024) {
+      return res.status(400).json({ error: 'Imagem muito pesada (máx. 600 KB após compressão).' });
+    }
+
+    const fileName = `gestor_welcome_${req.user.id}.jpg`;
+    const filePath = path.join(UPLOADS_DIR, fileName);
+    fs.writeFileSync(filePath, buffer);
+
+    // Adiciona timestamp na query para evitar cache antigo no WhatsApp/navegador
+    const imageUrl = `${BASE_URL}/uploads/${fileName}?v=${Date.now()}`;
+    res.json({ success: true, image_url: imageUrl, size_kb: Math.round(buffer.length / 1024) });
+  } catch (err) {
+    console.error('❌ [UPLOAD IMAGEM GESTOR]:', err.message);
+    res.status(500).json({ error: 'Erro ao salvar imagem no servidor.' });
+  }
+});
+
+app.delete('/api/gestor/upload-image', auth, async (req, res) => {
+  try {
+    const filePath = path.join(UPLOADS_DIR, `gestor_welcome_${req.user.id}.jpg`);
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    res.json({ success: true });
+  } catch {
+    res.status(500).json({ error: 'Erro ao remover imagem.' });
   }
 });
 
