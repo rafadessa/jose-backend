@@ -22,10 +22,17 @@ if (!fs.existsSync(UPLOADS_DIR)) {
 }
 app.use('/uploads', express.static(UPLOADS_DIR));
 
+// Pasta de vídeos tutoriais curtos (.mp4) hospedados no VPS
+const VIDEOS_DIR = path.join(__dirname, 'videos');
+if (!fs.existsSync(VIDEOS_DIR)) {
+  fs.mkdirSync(VIDEOS_DIR, { recursive: true });
+}
+app.use('/videos', express.static(VIDEOS_DIR));
+
 app.get('/', (req, res) =>
   res.json({
     status: 'ok',
-    app: 'API do José v5.3 (José Gestor + Mensagem de Venda/Renovação com Imagem Comprimida no VPS)',
+    app: 'API do José v5.4 (Trial Exato 24h ao Conectar WhatsApp + Vídeos Tutoriais /videos + José Gestor)',
   })
 );
 
@@ -48,6 +55,64 @@ const VIP_NATV_KEYS = (process.env.VIP_NATV_KEYS || '')
 
 function isVipReseller(reseller) {
   return Boolean(reseller?.natv_api_key && VIP_NATV_KEYS.includes(reseller.natv_api_key.trim()));
+}
+
+// ==========================================
+// SISTEMA DE TRIAL EXATO DE 24H (ATIVADO AO CONECTAR WHATSAPP PELA 1ª VEZ)
+// ==========================================
+function getTrialStatus(reseller) {
+  if (!reseller?.trial_expires_at) {
+    return {
+      active: false,
+      used: Boolean(reseller?.trial_used),
+      remainingSeconds: 0,
+      startedAt: reseller?.trial_started_at || null,
+      expiresAt: null,
+    };
+  }
+  const expiresMs = new Date(reseller.trial_expires_at).getTime();
+  const remainingSeconds = Math.max(0, Math.floor((expiresMs - Date.now()) / 1000));
+  return {
+    active: remainingSeconds > 0,
+    used: true,
+    remainingSeconds,
+    startedAt: reseller.trial_started_at || null,
+    expiresAt: reseller.trial_expires_at,
+  };
+}
+
+function isTrialActive(reseller) {
+  return getTrialStatus(reseller).active;
+}
+
+function canUseBot(reseller) {
+  return isVipReseller(reseller) || isTrialActive(reseller) || Number(reseller?.wallet_balance || 0) > 0;
+}
+
+function shouldDebitBot(reseller) {
+  return !isVipReseller(reseller) && !isTrialActive(reseller);
+}
+
+async function activateTrialOnFirstConnect(resellerId) {
+  if (!resellerId) return null;
+  try {
+    const { rows } = await pool.query(
+      `UPDATE resellers
+       SET trial_started_at = NOW(),
+           trial_expires_at = NOW() + INTERVAL '24 hours',
+           trial_used = TRUE
+       WHERE id = $1 AND COALESCE(trial_used, FALSE) = FALSE
+       RETURNING trial_started_at, trial_expires_at`,
+      [resellerId]
+    );
+    if (rows.length > 0) {
+      console.log(`⏱️ [TRIAL 24H] Iniciado para revendedor ${resellerId} até ${rows[0].trial_expires_at}`);
+      return rows[0];
+    }
+  } catch (err) {
+    console.error('❌ [TRIAL 24H] Erro ao ativar trial:', err.message);
+  }
+  return null;
 }
 
 // Tabela padrão de preços (pode ser sobrescrita por revendedor em custom_prices)
@@ -185,6 +250,7 @@ app.post('/api/auth/login', async (req, res) => {
         support_whatsapp: user.support_whatsapp || '',
         bot_name: user.bot_name || 'José',
         is_vip: isVipReseller(user),
+        trial: getTrialStatus(user),
       },
     });
   } catch {
@@ -255,6 +321,7 @@ app.post('/api/auth/natv-login', async (req, res) => {
         support_whatsapp: user.support_whatsapp || '',
         bot_name: user.bot_name || 'José',
         is_vip: isVipReseller(user),
+        trial: getTrialStatus(user),
       },
     });
   } catch (err) {
@@ -303,18 +370,20 @@ app.get('/api/reseller/sync-credits', auth, async (req, res) => {
   const forceSync = req.query.force === '1' || req.query.force === 'true';
   try {
     const r = await pool.query(
-      'SELECT natv_api_key, natv_credits, wallet_balance FROM resellers WHERE id = $1',
+      'SELECT natv_api_key, natv_credits, wallet_balance, trial_started_at, trial_expires_at, trial_used FROM resellers WHERE id = $1',
       [userId]
     );
     const reseller = r.rows[0];
     if (!reseller) return res.status(404).json({ error: 'Revendedor não encontrado' });
 
+    const trial = getTrialStatus(reseller);
     const cached = natvCreditsCache.get(userId);
     if (!forceSync && cached && Date.now() - cached.ts < 15000) {
       return res.json({
         natv_credits: cached.credits,
         credits: cached.credits,
         wallet_balance: reseller.wallet_balance,
+        trial,
       });
     }
 
@@ -349,6 +418,7 @@ app.get('/api/reseller/sync-credits', auth, async (req, res) => {
       natv_credits: credits,
       credits,
       wallet_balance: reseller.wallet_balance,
+      trial,
     });
   } catch (err) {
     console.error('❌ [SYNC-CREDITS] Erro:', err.message);
@@ -773,6 +843,72 @@ app.post('/api/reseller/apps', auth, async (req, res) => {
   }
 });
 
+// Gerenciamento de Vídeos Tutoriais (.mp4) na pasta /videos da VPS
+app.get('/api/apps/videos', auth, (req, res) => {
+  try {
+    const files = fs
+      .readdirSync(VIDEOS_DIR)
+      .filter((f) => f.toLowerCase().endsWith('.mp4'))
+      .map((filename) => {
+        const stat = fs.statSync(path.join(VIDEOS_DIR, filename));
+        return {
+          filename,
+          url: `${BASE_URL}/videos/${filename}`,
+          size_mb: Number((stat.size / (1024 * 1024)).toFixed(2)),
+        };
+      });
+    res.json({ success: true, videos: files });
+  } catch (err) {
+    console.error('❌ [LISTAR VÍDEOS]:', err.message);
+    res.status(500).json({ error: 'Erro ao listar vídeos na VPS.' });
+  }
+});
+
+app.post('/api/apps/upload-video', auth, (req, res) => {
+  const { app_slug, video_base64 } = req.body || {};
+  if (!video_base64 || typeof video_base64 !== 'string') {
+    return res.status(400).json({ error: 'Envie um vídeo .mp4 válido em base64.' });
+  }
+
+  try {
+    const slug = String(app_slug || 'tutorial')
+      .toLowerCase()
+      .replace(/[^a-z0-9-_]/g, '');
+    if (!slug) return res.status(400).json({ error: 'Informe o nome/slug do aplicativo (ex: hd-player).' });
+
+    const cleanBase64 = video_base64.replace(/^data:video\/[a-zA-Z0-9.+-]+;base64,/, '').trim();
+    const buffer = Buffer.from(cleanBase64, 'base64');
+
+    if (buffer.length > 16 * 1024 * 1024) {
+      return res.status(400).json({ error: 'Vídeo muito pesado (máx. 16 MB para envio nativo no WhatsApp).' });
+    }
+
+    const fileName = `${slug}.mp4`;
+    fs.writeFileSync(path.join(VIDEOS_DIR, fileName), buffer);
+
+    res.json({
+      success: true,
+      filename: fileName,
+      url: `${BASE_URL}/videos/${fileName}`,
+      size_mb: Number((buffer.length / (1024 * 1024)).toFixed(2)),
+    });
+  } catch (err) {
+    console.error('❌ [UPLOAD VÍDEO]:', err.message);
+    res.status(500).json({ error: 'Erro ao salvar vídeo no servidor.' });
+  }
+});
+
+app.delete('/api/apps/videos/:filename', auth, (req, res) => {
+  try {
+    const safeName = path.basename(String(req.params.filename || ''));
+    const filePath = path.join(VIDEOS_DIR, safeName);
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    res.json({ success: true });
+  } catch {
+    res.status(500).json({ error: 'Erro ao remover vídeo.' });
+  }
+});
+
 // Personalizações (Nome do Assistente + Preços Personalizados)
 app.get('/api/reseller/customizations', auth, async (req, res) => {
   try {
@@ -819,7 +955,7 @@ app.post('/api/whatsapp/connect', auth, async (req, res) => {
     url: `${BASE_URL}/api/webhooks/evolution`,
     byEvents: false,
     base64: true,
-    events: ['MESSAGES_UPSERT'],
+    events: ['MESSAGES_UPSERT', 'CONNECTION_UPDATE'],
   };
 
   try {
@@ -883,6 +1019,10 @@ app.get('/api/whatsapp/status', auth, async (req, res) => {
     checkState(salesInstance),
     checkState(supportInstance),
   ]);
+
+  if (salesState === 'open' || supportState === 'open') {
+    await activateTrialOnFirstConnect(req.user.id);
+  }
 
   res.json({ sales: salesState === 'open', support: supportState === 'open' });
 });
@@ -1069,7 +1209,7 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
 
         await syncClientToGestor(reseller, lead, months, screens);
 
-        if (!isVipReseller(reseller)) {
+        if (shouldDebitBot(reseller)) {
           await debitWallet(
             reseller.id,
             Number(reseller.cost_per_activation ?? 0.18),
@@ -1159,6 +1299,18 @@ const APP_LOGOS = {
   'TOPTV': `${BASE_URL}/logos/toptv.png`,
 };
 
+// Vídeos tutoriais padrão na pasta /videos da VPS (só envia se o .mp4 existir no disco)
+const APP_VIDEOS = {
+  'HD PLAYER': 'hd-player.mp4',
+  'WATCH HUB': 'watch-hub.mp4',
+  'MAXPLAYER': 'maxplayer.mp4',
+  'PLAYER MASTER': 'player-master.mp4',
+  'LOBO PLAYER': 'lobo-player.mp4',
+  'TOPTV': 'toptv.mp4',
+  'CLOUDDY': 'clouddy.mp4',
+  'TXS PRO PLAYER': 'downloader-txs.mp4',
+};
+
 function buildSalesPrompt(reseller) {
   const botName = reseller?.bot_name || 'José';
   const prices = getResellerPrices(reseller);
@@ -1182,6 +1334,11 @@ function buildSalesPrompt(reseller) {
   return `Você é o ${botName}, um vendedor especialista, engajado, educado e consultivo de streaming no WhatsApp.
 Seu objetivo principal é encantar o cliente, conduzir até o teste grátis sem atrito e CONVERTER A VENDA do plano.
 Estilo: leve, entusiasmado na medida certa, simpático e natural. Mensagens CURTAS (máx. 2 a 3 linhas) e APENAS UMA pergunta por vez.
+
+ÁUDIOS E FOTOS (MUITO IMPORTANTE):
+- Você ENTENDE áudios e fotos normalmente.
+- Sempre que a mensagem do cliente começar com "(Áudio do cliente):" ou "[Áudio transcrito]:", leia o texto como uma fala normal do cliente e responda naturalmente.
+- NUNCA diga que não consegue ouvir áudios ou ver imagens. Se a transcrição vier muito curta ou incompleta (ex: só "Meu amigo,"), apenas responda de forma natural perguntando como pode ajudar (ex: "Oi! Pode falar, como posso te ajudar? 😊").
 
 POSTURA DE VENDEDOR (CONVERSÃO):
 - Sempre valorize o que o cliente vai ganhar (canais abertos e fechados, esportes ao vivo, filmes e séries atualizados sem travar).
@@ -1300,6 +1457,11 @@ function buildSupportPrompt(reseller) {
 
   return `Você é o ${botName} Suporte, assistente técnico e gestor de renovações de streaming no WhatsApp.
 Estilo: calmo, prestativo, paciente e objetivo. Mensagens CURTAS (máx. 3 linhas) e UM passo por vez.
+
+ÁUDIOS E FOTOS (MUITO IMPORTANTE):
+- Você ENTENDE áudios e fotos normalmente.
+- Sempre que a mensagem do cliente começar com "(Áudio do cliente):" ou "[Áudio transcrito]:", leia o texto como uma fala normal do cliente e responda naturalmente.
+- NUNCA diga que não consegue ouvir áudios ou ver imagens. Se a transcrição vier muito curta ou incompleta (ex: só "Meu amigo,"), apenas responda de forma natural perguntando como pode ajudar (ex: "Oi! Pode falar, como posso te ajudar? 😊").
 
 REGRA DE PAINEL:
 ${maxPlayerRule}
@@ -1424,6 +1586,46 @@ async function sendWhatsAppImage(instanceName, remoteJid, imageUrl, caption) {
     }
   } catch (err) {
     console.error('❌ [EXCEÇÃO AO ENVIAR LOGO]:', err.message);
+  }
+}
+
+async function sendWhatsAppVideo(instanceName, remoteJid, videoFilename, caption = '') {
+  if (!videoFilename) return false;
+  const safeFilename = path.basename(String(videoFilename).trim());
+  const localPath = path.join(VIDEOS_DIR, safeFilename);
+  if (!fs.existsSync(localPath)) return false;
+
+  markBotSending(instanceName, remoteJid);
+  const publicUrl = `${BASE_URL}/videos/${safeFilename}`;
+
+  try {
+    console.log(`🎬 [ENVIANDO VÍDEO] Para: ${remoteJid} | Arquivo: ${safeFilename}`);
+    const res = await fetch(`${EVOLUTION_URL}/message/sendMedia/${instanceName}`, {
+      method: 'POST',
+      headers: { apikey: EVOLUTION_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        number: remoteJid,
+        mediatype: 'video',
+        mimetype: 'video/mp4',
+        caption,
+        media: publicUrl,
+        fileName: safeFilename,
+      }),
+    });
+
+    if (!res.ok) {
+      const errBody = await res.text();
+      console.error(`❌ [ERRO AO ENVIAR VÍDEO] Status ${res.status}:`, errBody);
+      return false;
+    }
+
+    const data = await res.json().catch(() => ({}));
+    trackBotSentId(data?.key?.id || data?.data?.key?.id);
+    console.log(`🎬 [VÍDEO ENVIADO COM SUCESSO] ${safeFilename}`);
+    return true;
+  } catch (err) {
+    console.error('❌ [EXCEÇÃO AO ENVIAR VÍDEO]:', err.message);
+    return false;
   }
 }
 
@@ -1592,7 +1794,22 @@ app.post('/api/webhooks/evolution', async (req, res) => {
     const instance = body.instance;
     const dataObj = body.data || body;
 
-    if (event && (event.includes('contact') || event.includes('chat') || event.includes('connection') || event.includes('presence'))) {
+    const eventLower = String(event || '').toLowerCase();
+    if (eventLower.includes('connection')) {
+      const connState = dataObj.state || dataObj.status || dataObj.data?.state;
+      if (connState === 'open' && instance) {
+        const instCheck = await pool.query(
+          `SELECT reseller_id FROM whatsapp_instances WHERE instance_name = $1 LIMIT 1`,
+          [instance]
+        );
+        if (instCheck.rows[0]?.reseller_id) {
+          await activateTrialOnFirstConnect(instCheck.rows[0].reseller_id);
+        }
+      }
+      return;
+    }
+
+    if (eventLower && (eventLower.includes('contact') || eventLower.includes('chat') || eventLower.includes('presence'))) {
       return;
     }
 
@@ -1656,7 +1873,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
           'Transcreva fielmente em português tudo o que a pessoa falou neste áudio. Retorne apenas a transcrição, sem comentários.'
         );
         if (transcript) {
-          text = `[Áudio transcrito]: ${transcript}`;
+          text = `(Áudio do cliente): ${transcript}`;
           console.log(`🎙️ [ÁUDIO TRANSCRITO]: ${transcript}`);
         }
       }
@@ -1714,10 +1931,9 @@ app.post('/api/webhooks/evolution', async (req, res) => {
     const activeReseller = instRes.rows[0];
     if (!activeReseller) return;
 
-    const isVip = isVipReseller(activeReseller);
     const isSupportBot = activeReseller?.bot_type === 'support';
 
-    if (!activeReseller.bot_active || (!isVip && Number(activeReseller.wallet_balance) <= 0)) return;
+    if (!activeReseller.bot_active || !canUseBot(activeReseller)) return;
 
     // 3. Busca ou cria Lead
     let leadRes = await pool.query(
@@ -1876,7 +2092,24 @@ app.post('/api/webhooks/evolution', async (req, res) => {
               `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`,
               [lead.id, `[Logo enviado: ${appName}]`]
             );
-            toolResult = `Logo do ${appName} enviado com sucesso. Agora responda ao cliente em texto curto pedindo para instalar o ${appName} na loja da TV e mandar foto da tela inicial quando abrir.`;
+          }
+
+          const videoFile = customMatch?.video || APP_VIDEOS[appName.toUpperCase()] || '';
+          const videoSent = await sendWhatsAppVideo(
+            instance,
+            remoteJid,
+            videoFile,
+            `👆 Veja esse vídeo curtinho de como instalar e configurar o ${appName}!`
+          );
+          if (videoSent) {
+            await pool.query(
+              `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`,
+              [lead.id, `[Vídeo tutorial enviado: ${videoFile}]`]
+            );
+          }
+
+          if (logoUrl || videoSent) {
+            toolResult = `${logoUrl ? `Logo do ${appName}` : ''}${logoUrl && videoSent ? ' e ' : ''}${videoSent ? 'vídeo tutorial' : ''} enviado com sucesso. Agora responda ao cliente em texto curto pedindo para instalar o ${appName} na loja da TV e mandar foto da tela inicial quando abrir.`;
           } else {
             toolResult = `App ${appName} registrado (sem imagem de logo). Agora responda ao cliente em texto curto orientando a instalar o ${appName} e avisar quando abrir.`;
           }
@@ -1959,7 +2192,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
                 `UPDATE leads SET stage = 'TESTE', natv_username = $1, natv_password = $2, followup_step = 0, test_created_at = now() WHERE id = $3`,
                 [natvUser.username, natvUser.password || null, lead.id]
               );
-              if (!isVip) {
+              if (shouldDebitBot(activeReseller)) {
                 await debitWallet(
                   activeReseller.id,
                   Number(activeReseller.cost_per_test ?? 0.18),
@@ -2065,7 +2298,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       await sendWhatsAppText(instance, remoteJid, replyText);
       console.log('6. [ENVIADO COM SUCESSO]');
 
-      if (!isVip) {
+      if (shouldDebitBot(activeReseller)) {
         await debitWallet(activeReseller.id, Number(activeReseller.cost_per_reply ?? 0.09), 'reply', `Resposta IA: ${lead.name || lead.phone}`);
       }
       await pool.query(`INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`, [lead.id, replyText]);
@@ -2442,6 +2675,9 @@ async function initFollowupColumns() {
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS gestor_webhook_url TEXT;`);
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS gestor_token TEXT;`);
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS gestor_settings JSONB;`);
+    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMPTZ;`);
+    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS trial_expires_at TIMESTAMPTZ;`);
+    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS trial_used BOOLEAN DEFAULT FALSE;`);
     await pool.query(`ALTER TABLE resellers ALTER COLUMN natv_credits TYPE NUMERIC(10,2) USING natv_credits::numeric;`);
     await pool.query(`ALTER TABLE resellers ALTER COLUMN cost_per_reply SET DEFAULT 0.09;`);
     await pool.query(`ALTER TABLE resellers ALTER COLUMN cost_per_test SET DEFAULT 0.18;`);
@@ -2581,6 +2817,9 @@ async function runSalesFollowup() {
         r.wallet_balance,
         r.natv_api_key,
         r.custom_prices,
+        r.trial_started_at,
+        r.trial_expires_at,
+        r.trial_used,
         wi.instance_name,
         EXTRACT(EPOCH FROM (NOW() - COALESCE(l.last_interaction, l.created_at))) / 60 AS diff_min,
         EXTRACT(EPOCH FROM (NOW() - l.last_followup_at)) / 60 AS diff_followup_min
@@ -2614,7 +2853,7 @@ async function runSalesFollowup() {
     } catch {}
 
     for (const lead of rows) {
-      if (!isVipReseller(lead) && Number(lead.wallet_balance) <= 0) continue;
+      if (!canUseBot(lead)) continue;
 
       const diffMin = Number(lead.diff_min || 0);
       const diffFollowupMin = lead.last_followup_at ? Number(lead.diff_followup_min || 0) : 999999;
@@ -2777,7 +3016,7 @@ async function runRenewalFollowup() {
     const todayMidnightMs = Date.parse(`${todayKey}T00:00:00-03:00`);
 
     for (const reseller of resellersRes.rows) {
-      if (!isVipReseller(reseller) && Number(reseller.wallet_balance) <= 0) continue;
+      if (!canUseBot(reseller)) continue;
 
       // Só dispara avisos de vencimento se o revendedor usar o Gestor José (native) E tiver a opção marcada
       const provider = String(reseller.gestor_provider || 'native').toLowerCase();
@@ -2999,7 +3238,7 @@ app.get('/api/novidades/vod', auth, async (req, res) => {
 
     const topVodSource = topVodCatIds.size
       ? vodList.filter((i) => topVodCatIds.has(String(i.category_id)))
-      : [...vodList].sort((a, b) => Number(b.rating_5based || 0) - Number(a.rating_5based || 0) || Number(b.added || 0) - Number(b.added || 0));
+      : [...vodList].sort((a, b) => Number(b.rating_5based || 0) - Number(a.rating_5based || 0) || Number(b.added || 0) - Number(a.added || 0));
 
     const topSeriesSource = topSeriesCatIds.size
       ? seriesList.filter((i) => topSeriesCatIds.has(String(i.category_id)))
