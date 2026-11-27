@@ -32,7 +32,7 @@ app.use('/videos', express.static(VIDEOS_DIR));
 app.get('/', (req, res) =>
   res.json({
     status: 'ok',
-    app: 'API do José v5.7 (Follow-up Segmentado + Preço Promocional nos Planos + Push 24h + Failover Gemini)',
+    app: 'API do José v5.15 (Roteiro LG Antiga/Nova + Bloqueio Operadoras + Philips + Android + Sony + TCL)',
   })
 );
 
@@ -1051,6 +1051,149 @@ app.post('/api/reseller/followup-settings', auth, async (req, res) => {
   }
 });
 
+// Disparo manual de recuperação (até 40 contatos, pausa 45s-90s, com filtro de público)
+const recoveryRunning = new Set();
+
+app.post('/api/followup/recovery', auth, async (req, res) => {
+  const resellerId = req.user.id;
+  if (recoveryRunning.has(resellerId)) {
+    return res.status(429).json({
+      error: 'Já existe uma tentativa de recuperação em andamento. Aguarde concluir antes de iniciar outra.',
+    });
+  }
+
+  const customMessage = String(req.body?.message || '').trim();
+  const rawAudience = String(req.body?.audience || 'all_non_active').trim();
+  const validAudiences = ['all_non_active', 'tested_only', 'not_tested_only', 'app_only'];
+  const audience = validAudiences.includes(rawAudience) ? rawAudience : 'all_non_active';
+
+  try {
+    const [resellerRes, instRes] = await Promise.all([
+      pool.query('SELECT * FROM resellers WHERE id = $1', [resellerId]),
+      pool.query(
+        `SELECT instance_name FROM whatsapp_instances
+         WHERE reseller_id = $1 AND COALESCE(bot_type, 'sales') = 'sales'
+         ORDER BY updated_at DESC LIMIT 1`,
+        [resellerId]
+      ),
+    ]);
+
+    const reseller = resellerRes.rows[0];
+    if (!reseller) return res.status(404).json({ error: 'Revendedor não encontrado.' });
+    if (!canUseBot(reseller)) {
+      return res.status(400).json({ error: 'Saldo insuficiente na Carteira José para iniciar disparos.' });
+    }
+
+    const instanceName = instRes.rows[0]?.instance_name || `jose_${String(resellerId).slice(0, 8)}`;
+
+    let audienceFilterSql = '';
+    if (audience === 'tested_only') {
+      audienceFilterSql = `AND UPPER(COALESCE(stage, '')) = 'TESTE'`;
+    } else if (audience === 'not_tested_only') {
+      audienceFilterSql = `AND UPPER(COALESCE(stage, '')) <> 'TESTE'`;
+    } else if (audience === 'app_only') {
+      audienceFilterSql = `AND UPPER(COALESCE(stage, '')) <> 'TESTE' AND COALESCE(TRIM(chosen_app), '') <> ''`;
+    }
+
+    const leadsRes = await pool.query(
+      `SELECT id, phone, name, stage, chosen_app
+       FROM leads
+       WHERE reseller_id = $1
+         AND COALESCE(UPPER(stage), '') <> 'ATIVO'
+         AND COALESCE(needs_human, false) = false
+         AND phone IS NOT NULL
+         ${audienceFilterSql}
+       ORDER BY COALESCE(last_interaction, created_at) DESC
+       LIMIT 40`,
+      [resellerId]
+    );
+
+    const targets = leadsRes.rows;
+    if (!targets.length) {
+      return res.json({
+        success: true,
+        total: 0,
+        message: 'Nenhum contato encontrado nesse público para recuperação.',
+      });
+    }
+
+    const audienceLabels = {
+      all_non_active: 'todos que não assinaram',
+      tested_only: 'quem já fez teste',
+      not_tested_only: 'quem ainda não testou',
+      app_only: 'quem escolheu app sem testar',
+    };
+
+    const mensalEffective = getEffectivePlanPrice(reseller, 1, 1);
+    const mensalNormal = getResellerPrices(reseller)[1][1];
+    const precoTexto =
+      reseller.promo_active && mensalEffective && mensalEffective !== mensalNormal
+        ? `R$ ${formatBRL(mensalEffective)} (promoção, de R$ ${formatBRL(mensalNormal)})`
+        : `R$ ${formatBRL(mensalNormal)}`;
+
+    const testedTemplates = [
+      `Oi! Vi que você chegou a testar nossos canais por aqui 😊 Quer aproveitar e ativar o plano mensal por ${precoTexto} hoje? Libero em 1 minutinho!`,
+      `Opa! Tudo bem? Seu acesso do teste ainda está pronto por aqui. Se quiser liberar o mensal por ${precoTexto} pra assistir sem travar, é só me responder aqui 📺`,
+      `Passando pra ver o que achou da qualidade do teste! Se quiser ativar o plano mensal (${precoTexto}), já gero o Pix e libero na hora pra você 😉`,
+    ];
+
+    const notTestedTemplates = [
+      `Opa! Tudo bem? Vi que você chamou por aqui mas não chegou a fazer o teste grátis de 1 hora 📺 Quer testar agora sem compromisso?`,
+      `Oi! Ainda está disponível o seu teste grátis de 1 hora por aqui 😉 Me diz qual a marca da sua TV ou aparelho que te ajudo a colocar rapidinho!`,
+      `Passando só pra lembrar que você pode experimentar nossos canais, filmes e séries por 1 hora grátis antes de assinar (planos a partir de ${precoTexto}). Bora testar?`,
+    ];
+
+    recoveryRunning.add(resellerId);
+
+    // Executa os disparos em segundo plano com pausa segura de 45s a 90s
+    (async () => {
+      let sent = 0;
+      try {
+        for (let i = 0; i < targets.length; i++) {
+          const lead = targets[i];
+          const isTested = String(lead.stage || '').toUpperCase() === 'TESTE';
+          const poolMsgs = isTested ? testedTemplates : notTestedTemplates;
+          const textToSend = customMessage || poolMsgs[i % poolMsgs.length];
+
+          const result = await sendWhatsAppText(instanceName, lead.phone, textToSend);
+          if (result.ok) {
+            sent++;
+            await pool.query(
+              `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`,
+              [lead.id, textToSend]
+            );
+            await pool.query(
+              `UPDATE leads SET last_message = $1, last_interaction = now(), last_followup_at = now() WHERE id = $2`,
+              [textToSend, lead.id]
+            );
+          }
+
+          if (i < targets.length - 1) {
+            const delayMs = 45000 + Math.floor(Math.random() * 45000);
+            await new Promise((r) => setTimeout(r, delayMs));
+          }
+        }
+        console.log(`📣 [RECUPERAÇÃO CONCLUÍDA] Revendedor ${String(resellerId).slice(0, 8)} (${audience}) -> ${sent}/${targets.length} enviados.`);
+      } catch (err) {
+        console.error('❌ [ERRO RECUPERAÇÃO BG]:', err.message);
+      } finally {
+        recoveryRunning.delete(resellerId);
+      }
+    })();
+
+    res.json({
+      success: true,
+      total: targets.length,
+      audience,
+      message: `Recuperação iniciada para ${targets.length} contato(s) (${audienceLabels[audience]}). Pausa automática de 45s a 90s entre envios.`,
+    });
+  } catch (err) {
+    recoveryRunning.delete(resellerId);
+    console.error('❌ [ERRO /api/followup/recovery]:', err.message);
+    res.status(500).json({ error: 'Erro interno ao iniciar tentativa de recuperação.' });
+  }
+});
+
 // ==========================================
 // 3. CONECTAR WHATSAPP
 // ==========================================
@@ -1410,7 +1553,7 @@ const APP_LOGOS = {
   'TOPTV': `${BASE_URL}/logos/toptv.png`,
 };
 
-// Vídeos tutoriais padrão na pasta /videos da VPS (só envia se o .mp4 existir no disco)
+// Vídeos tutoriais na pasta /videos da VPS (só envia se o .mp4 existir no disco)
 const APP_VIDEOS = {
   'HD PLAYER': 'hd-player.mp4',
   'WATCH HUB': 'watch-hub.mp4',
@@ -1421,6 +1564,74 @@ const APP_VIDEOS = {
   'CLOUDDY': 'clouddy.mp4',
   'TXS PRO PLAYER': 'downloader-txs.mp4',
 };
+
+function normalizeTvSlug(rawBrand) {
+  const s = String(rawBrand || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim();
+  if (!s) return '';
+  if (s.includes('samsung')) return 'samsung';
+  if (s.includes('lg') || s.includes('webos')) return 'lg';
+  if (s.includes('roku')) return 'roku';
+  if (s.includes('android') || s.includes('google') || s.includes('box') || s.includes('fire') || s.includes('stick') || s.includes('mi ')) return 'android';
+  if (s.includes('iphone') || s.includes('ipad') || s.includes('ios') || s.includes('apple')) return 'ios';
+  if (s.includes('philips')) return 'philips';
+  if (s.includes('aoc')) return 'aoc';
+  if (s.includes('tcl') || s.includes('semp') || s.includes('toshiba')) return 'tcl';
+  if (s.includes('panasonic')) return 'panasonic';
+  if (s.includes('sony')) return 'sony';
+  return s.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+}
+
+function normalizeAppSlug(appName) {
+  const upper = String(appName || '').trim().toUpperCase();
+  if (APP_VIDEOS[upper]) return APP_VIDEOS[upper].replace(/\.mp4$/i, '');
+  return upper
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+function resolveAppVideoFile(tvBrand, appName, customMatch) {
+  const candidates = [];
+  if (customMatch?.video) candidates.push(path.basename(String(customMatch.video).trim()));
+
+  const tvSlug = normalizeTvSlug(tvBrand);
+  const appSlug = normalizeAppSlug(appName);
+
+  // 1ª prioridade: vídeo específico da TV + App (ex: samsung-hd-player.mp4, lg-hd-player.mp4)
+  if (tvSlug && appSlug) {
+    candidates.push(`${tvSlug}-${appSlug}.mp4`);
+  }
+  // 2ª prioridade (fallback): vídeo genérico do App (ex: hd-player.mp4)
+  const generic = APP_VIDEOS[String(appName || '').trim().toUpperCase()] || (appSlug ? `${appSlug}.mp4` : '');
+  if (generic) candidates.push(generic);
+
+  for (const file of candidates) {
+    if (file && fs.existsSync(path.join(VIDEOS_DIR, file))) {
+      return file;
+    }
+  }
+  return '';
+}
+
+function resolveDnsVideoFile(tvBrand) {
+  const tvSlug = normalizeTvSlug(tvBrand);
+  const candidates = [];
+  if (tvSlug) candidates.push(`dns-${tvSlug}.mp4`);
+  candidates.push('dns-geral.mp4');
+
+  for (const file of candidates) {
+    if (file && fs.existsSync(path.join(VIDEOS_DIR, file))) {
+      return file;
+    }
+  }
+  return '';
+}
 
 function buildSalesPrompt(reseller) {
   const botName = reseller?.bot_name || 'José';
@@ -1489,7 +1700,7 @@ REGRA DO DOWNLOADER (ANDROID / TV BOX / FIRE STICK):
   Senha: [senha]
 
 SMART TVS ANTIGAS E OUTRAS MARCAS (PERGUNTE SEMPRE O SISTEMA/ANO):
-- Se o cliente citar TVs Philips, AOC, TCL, Sharp, Multilaser, Panasonic ou Samsung antiga, pergunte primeiro qual é o sistema da TV (se é Android/Google TV, Roku ou Smart antiga) antes de indicar o app.
+- Se o cliente citar TVs Philips, AOC, TCL, Toshiba, Sony, Sharp, Multilaser, Panasonic ou Samsung antiga, pergunte primeiro qual é o sistema da TV (se é Android/Google TV, Roku ou Smart antiga) antes de indicar o app.
 
 ROTEIRO DO APLICATIVO CLOUDDY (PASSO A PASSO CURTO — UM PASSO POR VEZ):
 - Sempre que o cliente for usar o aplicativo CLOUDDY, conduza neste ritmo (sem mandar tudo de uma vez):
@@ -1509,7 +1720,7 @@ ROTEIRO DO APLICATIVO CLOUDDY (PASSO A PASSO CURTO — UM PASSO POR VEZ):
   5. Depois abra o app LOOKE.
 - Se não funcionar, orientar usar Clouddy ou SSIPTV pelo navegador da TV, ou recomendar comprar um Mi Stick / Fire Stick.
 
-2) PHILIPS / AOC / TCL / SHARP / MULTILASER (Smarts antigas):
+2) AOC / SHARP / MULTILASER (Smarts antigas):
 - Indicar o app CLOUDDY (avisando que é um app pago da loja).
 
 3) PANASONIC:
@@ -1525,13 +1736,55 @@ ROTEIRO DO APLICATIVO CLOUDDY (PASSO A PASSO CURTO — UM PASSO POR VEZ):
   • DUPLEX PLAY (pago): 192.185.7.111 (só funciona se o controle remoto tiver o botão SMART HUB colorido)
   • SMART UP (grátis): 193.201.81.128 (só roda com DNS configurado na rede da TV)
 
+5) TCL / TOSHIBA (Sem Android):
+- 1ª opção: A TV TCL/Toshiba já costuma ter o app **CLOUDDY** na loja de aplicativos — é só instalar e logar, NÃO precisa mexer em DNS.
+- 2ª opção: Caso não apareça o Clouddy, peça para procurar pelo **SSIPTV** ANTES de mexer no DNS. Se não tiver nenhum dos dois (nem Clouddy nem SSIPTV), NÃO adianta trocar o DNS.
+- Se tiver SSIPTV e precisar trocar o DNS (AVISE que a opção de trocar DNS só aparece se a TV estiver conectada via **CABO DE REDE**):
+  Envie o vídeo tutorial: **meajuda.top/dns-tcl.mp4** e passe o passo a passo:
+  1º Configurações (botão engrenagem no controle remoto)
+  2º Redes
+  3º Configurações de IP
+  4º Tipo de Endereço → selecione MANUAL
+  5º Desça até DNS Primário e digite: **45.139.122.240**
+  6º Clique em OK.
+- Se não tiver Clouddy nem SSIPTV, a única opção é usar o DNS ou o SSIPTV direto no **navegador da TV** — ou recomendar com educação a compra de um **Mi Stick** ou **Fire Stick**.
+
+6) SMART TV SONY (Sem Android):
+- ATENÇÃO: Só se troca o DNS da TV Sony se ela tiver o app **SSIPTV** na loja para instalar. Peça para o cliente verificar isso primeiro.
+- Se tiver o SSIPTV, envie o vídeo tutorial: **meajuda.top/dns-sony.mp4** e passe o passo a passo:
+  1º Botão AZUL (HOME) → canto superior direito em AJUSTES
+  2º Última opção em REDE → CONFIGURAÇÃO DE REDE → CONFIGURAR CONEXÃO A REDE → ESPECIALISTA
+  3º Escolha Wi-Fi ou Com fio → MANUAL
+  4º DNS Primário: **45.139.122.240** | DNS Secundário: **45.139.122.240**
+  5º Seta para o lado DIREITO → "Deseja utilizar um servidor Proxy?" escolha NÃO → seta para o lado DIREITO → SALVAR E CONECTAR
+  6º Depois é só instalar/abrir o app **SSIPTV** que ele já direciona para o DNS escolhido.
+
+7) SMART TV PHILIPS (Sem Android):
+- 1ª opção: A TV Philips já tem o app **CLOUDDY** na loja de aplicativos — é só instalar e logar, NÃO precisa mexer em DNS.
+- 2ª opção (caso o cliente queira usar o app **SMART UP**, aí sim precisa trocar o DNS):
+  1º Configurações (botão engrenagem no controle remoto) → REDE
+  2º Clique em **EXIBIR CONFIGURAÇÕES DE REDE**, peça para tirar uma **FOTO** das informações (IP, Máscara e Gateway) e clique em FECHAR
+  3º Clique em **CONFIGURAÇÕES DE REDE** → marque **IP ESTÁTICO** → clique em **CONFIGURAÇÃO DE IP ESTÁTICO**
+  4º Preencha **ENDEREÇO DE IP**, **MASC. REDE** e **GATEWAY** exatamente como estão na foto (clicando em CONCLUÍDO em cada um)
+  5º Em **DNS 1**, digite **45.139.122.240** (ou alternativa v2: **104.238.205.29**)
+  6º Pode voltar e abrir o app **SMART UP**.
+
+8) SMART TV LG (TROCA DE DNS — MAIS ANTIGA E MAIS NOVA):
+- **LG MAIS ANTIGA** (Vídeo: **http://meajuda.top/dns-lg-ant.mp4**):
+  1º MENU → CONFIGURAÇÕES → LIGAÇÃO DE REDE → INICIAR CONEXÃO → LISTA DE OUTRAS REDES → CONFIGURAÇÃO MANUAL
+  2º Escolha o tipo de rede (com fio ou sem fio) → MODO DNS → clique em MANUAL
+  3º Em SERVIDOR DNS digite: **45.139.122.240** (v1), **104.238.205.29** (v2) ou **46.165.236.165** (CLOUDDY) → clique em CONFIRMAR.
+- **LG MAIS NOVA** (Vídeo: **http://meajuda.top/dns-lg.mp4**):
+  1º MENU → TODAS AS CONFIGURAÇÕES → REDE → CONEXÃO COM FIO ou CONEXÃO DE REDE WI-FI
+  2º Clique em EDITAR → desça até SERVIDOR DNS e digite: **45.139.122.240** (v1) ou **104.238.205.29** (v2) → clique em CONECTAR.
+
 CONDUÇÃO FIRME DE APPS (MUITO IMPORTANTE):
 - Se o cliente mandar foto de um app diferente do recomendado, NÃO tente configurar esse app. Reconheça qual app ele abriu, confirme a marca da TV e peça com educação e firmeza para abrir o app certo que você indicou e mandar foto da tela inicial dele.
 - Se o app mostrar tela de pagamento, licença ou ativação paga, tranquilize o cliente dizendo que ele NÃO precisa pagar nada ali dentro do app.
 - Se a 1ª opção der problema, não abrir ou não tiver opção de sair/login, mude na hora para a 2ª opção da lista daquela TV, chame \`enviar_logo_app\` para o novo app e conduza a instalação dele. Só chame \`chamar_humano\` se todas as opções da TV falharem.
 
 FERRAMENTAS:
-- Ao indicar um app pela primeira vez (ou ao trocar para a 2ª/3ª opção), chame \`enviar_logo_app\` com o nome exato do app (exceto para TXS PRO PLAYER via Downloader).
+- Ao indicar um app pela primeira vez (ou ao trocar para a 2ª/3ª opção), chame \`enviar_logo_app\` passando o nome exato do app (\`app_name\`) e a marca/sistema da TV (\`tv_brand\`: samsung, lg, roku, android, ios, philips, aoc, tcl, panasonic, sony) para o sistema enviar também o vídeo tutorial específico daquela TV.
 - Quando o cliente instalar o app e confirmar que pode testar AGORA, chame \`gerar_teste\`.
   - Se o app escolhido for WATCH HUB e existir \`codigo_watch_hub\`, entregue EXATAMENTE neste formato:
     Seu teste está pronto, aqui os dados:
@@ -1583,10 +1836,58 @@ FLUXO DE ATENDIMENTO DE SUPORTE:
    - Se possivel_tela_ocupada for true, avise o cliente que o plano dele é de 1 tela e consta um acesso recente (informe o horário de ultimo_acesso), explique que abrir em dois aparelhos ao mesmo tempo derruba o sinal e pergunte se ficou aberto em outra TV/celular ou se deseja adicionar uma 2ª tela (Mensal R$ ${formatBRL(prices[2][1])}).
    - Na NATV, o nome de usuário do cliente geralmente é o próprio número de telefone (ex.: 55119...). Sempre que o cliente enviar um número ou login, chame consultar_status_natv imediatamente sem questionar.
    - Se estiver VENCIDO: avise a data de vencimento com educação e ofereça renovar na hora via Pix (usando \`gerar_pix_plano\`).
-2. TRAVAMENTO / TELA PRETA / CARREGANDO (com plano ativo e livre):
-   - Passo 1: Pergunte se ninguém está usando o login em outra TV/celular e peça para tirar a TV/TV Box e o roteador da tomada por 2 minutos, ligar de novo e testar.
-   - Passo 2: Pergunte se está travando em todos os canais ou apenas em um canal específico.
-   - Passo 3: Se continuar em todos, peça para testar no 4G do celular ou mandar foto da tela de erro.
+2. TRAVAMENTO / TELA PRETA / CARREGANDO / PROBLEMAS COM DNS (com plano ativo e livre):
+   - REGRA DE OURO: Conduza UM passo por vez e sempre peça para o cliente TENTAR ENTRAR NO APP DEPOIS DE CADA PROCEDIMENTO antes de passar para o próximo.
+   - Passo 1 (TESTE DE VELOCIDADE NA TV — SEMPRE PRIMEIRO): Peça para o cliente abrir o navegador da própria TV, digitar **fast.com** e mandar uma foto do resultado.
+     * Se a velocidade na foto estiver **abaixo de 30 Mbps**, avise que está chegando pouca internet na TV e mande tirar a TV e o MODEM da tomada por 2 minutos, religar e testar novamente.
+   - Passo 2 (REINICIAR TV E MODEM): Se a internet estiver acima de 30 Mbps (ou se ainda não fez), peça para tirar a TV e o MODEM da tomada por 2 minutos, ligar e testar o app.
+   - Passo 3 (REINSTALAR APP): Se continuar, peça para desinstalar o app, tirar a TV da tomada, ligar novamente e instalar o app de novo.
+   - Passo 4 (AJUSTE DE DNS POR TV): Se continuar travando em todos os canais, não carregar a lista ou der erro de servidor/conexão, pergunte a marca/sistema da TV e chame \`enviar_video_dns\` passando \`tv_brand\` (samsung, lg, roku, android, philips, aoc, tcl, panasonic, sony).
+     * Oriente também a colocar o DNS em **automático**, conectar, depois voltar e colocar o DNS **manualmente** e conectar novamente.
+     * **SÓ PARA TV SAMSUNG:** oriente a tirar uma foto dos dados da rede (IP, máscara de rede e gateway), selecionar **OBTER IP MANUALMENTE**, digitar os mesmos dados e salvar.
+   - Passo 5 (APPS RECOMENDADOS E NAVEGADOR):
+     * Para **SAMSUNG e LG**, recomende testar os apps **LOOKE** ou **SMART UP**.
+     * Se nenhum procedimento resolver, oriente que o cliente pode digitar o **DNS diretamente no NAVEGADOR DA TV** e assistir por lá.
+   - Passo 6 (MÉTODO E APLICATIVOS ALTERNATIVOS — SAMSUNG / TVS ANTIGAS):
+     * Se precisar de alternativa via IP, envie o link do vídeo tutorial: **meajuda.top/ins_clouddy_sam.mp4** e informe o IP conforme o app escolhido:
+       • CLOUDDY (pago): 46.165.236.165
+       • SS IPTV (grátis): 91.122.100.196
+       • DUPLEX PLAY (pago): 192.185.7.111 (só funciona se o controle remoto tiver o botão SMART HUB colorido)
+       • SMART ONE (pago): 152.228.218.238
+       • SMART IPTV (pago): 116.202.226.250
+       • SET IPTV (pago): 94.23.97.11
+     * **TCL / TOSHIBA (Sem Android):**
+       • Primeiro verifique se tem o app **CLOUDDY** na loja (se tiver, é só instalar e logar, não precisa mexer em DNS).
+       • Se não tiver Clouddy, verifique se tem o **SSIPTV** ANTES de trocar o DNS — se não tiver nenhum dos dois, NÃO adianta trocar o DNS (nesse caso, só usando o DNS ou SSIPTV direto no navegador da TV, ou comprando um **Mi Stick** ou **Fire Stick**).
+       • **OBS:** A opção de trocar DNS na TCL/Toshiba só aparece se a TV estiver conectada via **CABO DE REDE**. Vídeo tutorial: **meajuda.top/dns-tcl.mp4**.
+       • Passo a passo: Configurações (engrenagem) → Redes → Configurações de IP → Tipo de Endereço → Manual → DNS Primário: **45.139.122.240** → OK.
+     * **SMART TV SONY (Sem Android):**
+       • Só troque o DNS se a TV tiver o app **SSIPTV** na loja para instalar. Vídeo tutorial: **meajuda.top/dns-sony.mp4**.
+       • Passo a passo: Botão AZUL (HOME) → AJUSTES (canto superior direito) → REDE → CONFIGURAÇÃO DE REDE → CONFIGURAR CONEXÃO A REDE → ESPECIALISTA → Wi-Fi ou Com fio → MANUAL → DNS Primário e Secundário: **45.139.122.240** → seta DIREITA → Proxy: NÃO → seta DIREITA → SALVAR E CONECTAR → instalar/abrir o **SSIPTV**.
+     * **SISTEMA ANDROID (TV Android, Google TV, TV Box, Fire Stick ou celular Android):**
+       • Esse procedimento funciona em qualquer equipamento com sistema operacional Android.
+       • Envie o link do vídeo tutorial: **meajuda.top/dns-android.mp4**
+       • Link na Play Store (DNS Changer): **https://play.google.com/store/apps/details?id=com.frostnerd.dnschanger&hl=pt_BR&gl=US**
+       • Link para baixar direto (APK): **meajuda.top/dnschanger.apk**
+     * **SMART TV PHILIPS (Sem Android):**
+       • A TV Philips já tem o app **CLOUDDY** na loja — é só instalar e logar, não precisa mexer em DNS.
+       • Caso queira usar o app **SMART UP**, aí sim precisa trocar o DNS seguindo este passo a passo:
+         1º Configurações (engrenagem) → REDE → EXIBIR CONFIGURAÇÕES DE REDE → tirar uma **FOTO** dos dados (IP, Máscara e Gateway) → FECHAR.
+         2º CONFIGURAÇÕES DE REDE → marcar **IP ESTÁTICO** → CONFIGURAÇÃO DE IP ESTÁTICO.
+         3º Digitar ENDEREÇO DE IP, MASC. REDE e GATEWAY conforme a foto (clicando em CONCLUÍDO em cada campo).
+         4º Em **DNS 1**, digitar **45.139.122.240** (v1) ou **104.238.205.29** (v2).
+         5º Voltar e abrir o app **SMART UP**.
+     * **SMART TV LG (MAIS ANTIGA):**
+       • Vídeo tutorial: **http://meajuda.top/dns-lg-ant.mp4**
+       • Passo a passo: MENU → CONFIGURAÇÕES → LIGAÇÃO DE REDE → INICIAR CONEXÃO → LISTA DE OUTRAS REDES → CONFIGURAÇÃO MANUAL → tipo de rede (com fio ou sem fio) → MODO DNS: MANUAL → SERVIDOR DNS: **45.139.122.240** (v1), **104.238.205.29** (v2) ou **46.165.236.165** (CLOUDDY) → CONFIRMAR.
+     * **SMART TV LG (MAIS NOVA):**
+       • Vídeo tutorial: **http://meajuda.top/dns-lg.mp4**
+       • Passo a passo: MENU → TODAS AS CONFIGURAÇÕES → REDE → CONEXÃO COM FIO ou CONEXÃO DE REDE WI-FI → EDITAR → SERVIDOR DNS: **45.139.122.240** (v1) ou **104.238.205.29** (v2) → CONECTAR.
+     * **BLOQUEIO NAS OPERADORAS (quando funciona no 4G mas trava/não abre no Wi-Fi):**
+       • 1º Oriente trocar o DNS na rede da TV (ou no próprio modem/roteador) para **8.8.8.8** ou **1.1.1.1** e testar novamente.
+       • 2º Se mesmo com DNS 8.8.8.8 / 1.1.1.1 continuar bloqueado pela operadora, chame \`chamar_humano\` avisando ao atendente que o cliente precisa de **rota alternativa** ou **troca de domínio** (nunca mencione "painel de revendedor" para o cliente final).
+     * Para clientes com **TVs mais antigas**, recomende com educação que adquiram um **Mi Stick** ou **Fire Stick** para ter a melhor experiência.
+   - Passo 7: Se mesmo após esses passos o problema continuar (ou for apenas 1 canal específico fora do ar), chame \`chamar_humano\`.
 3. FOTOS DE ERRO / APP:
    - Analise a imagem enviada. Se o app pedir pagamento/licença, tranquilize dizendo que NÃO precisa pagar nada ali dentro.
    - Se o app deslogou ou travou na tela inicial, oriente a fechar e abrir novamente ou reinstalar.
@@ -2203,7 +2504,8 @@ app.post('/api/webhooks/evolution', async (req, res) => {
           '1) Qual aplicativo está aberto na tela (se identificável); ' +
           '2) Se for tela de login, TRANSCREVA EXATAMENTE caractere por caractere o que está digitado nos campos de Código/Servidor, Usuário e Senha; ' +
           '3) Qualquer mensagem de erro exibida (ex: "Servidor rejeitou as credenciais", "Invalid credentials"); ' +
-          '4) Se aparece tela de pagamento/licença, código/MAC/Device Key, ou comprovante PIX (com valor e status). Seja direto e preciso.';
+          '4) Se for teste de velocidade (ex: fast.com / Speedtest), informe EXATAMENTE o número da velocidade em Mbps ou Kbps; ' +
+          '5) Se aparece tela de pagamento/licença, código/MAC/Device Key, ou comprovante PIX (com valor e status). Seja direto e preciso.';
         const visionAnalysis = await analyzeMediaWithGemini(base64, mimeType, visionPrompt);
 
         if (visionAnalysis) {
@@ -2294,11 +2596,34 @@ app.post('/api/webhooks/evolution', async (req, res) => {
         type: 'function',
         function: {
           name: 'enviar_logo_app',
-          description: 'Envia a imagem do logo do aplicativo recomendado para o cliente.',
+          description: 'Envia a imagem do logo e o vídeo tutorial específico da TV para o aplicativo recomendado.',
           parameters: {
             type: 'object',
-            properties: { app_name: { type: 'string', description: 'Nome exato do aplicativo recomendado.' } },
+            properties: {
+              app_name: { type: 'string', description: 'Nome exato do aplicativo recomendado.' },
+              tv_brand: {
+                type: 'string',
+                description: 'Marca ou sistema da TV/aparelho do cliente (ex: samsung, lg, roku, android, ios, philips, aoc, tcl, panasonic, sony).',
+              },
+            },
             required: ['app_name'],
+          },
+        },
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'enviar_video_dns',
+          description: 'Envia o vídeo tutorial de como alterar/corrigir o DNS na TV do cliente para resolver travamentos ou bloqueio de operadora.',
+          parameters: {
+            type: 'object',
+            properties: {
+              tv_brand: {
+                type: 'string',
+                description: 'Marca ou sistema da TV/aparelho do cliente (ex: samsung, lg, roku, android, philips, aoc, tcl, panasonic, sony, geral).',
+              },
+            },
+            required: ['tv_brand'],
           },
         },
       },
@@ -2387,8 +2712,14 @@ app.post('/api/webhooks/evolution', async (req, res) => {
 
         if (fnName === 'enviar_logo_app') {
           const appName = String(args.app_name || '').trim();
-          const resellerApps = Object.values(getResellerApps(activeReseller, true)).flat();
-          const customMatch = resellerApps.find((a) => a.name.toUpperCase() === appName.toUpperCase());
+          const tvBrand = String(args.tv_brand || '').trim();
+          const tvSlug = normalizeTvSlug(tvBrand);
+          const allResellerApps = getResellerApps(activeReseller, true);
+          const brandApps = tvSlug && Array.isArray(allResellerApps[tvSlug]) ? allResellerApps[tvSlug] : [];
+          const flatApps = Object.values(allResellerApps).flat();
+          const customMatch =
+            brandApps.find((a) => a.name.toUpperCase() === appName.toUpperCase()) ||
+            flatApps.find((a) => a.name.toUpperCase() === appName.toUpperCase());
           const logoUrl = customMatch?.logo || APP_LOGOS[appName.toUpperCase()] || '';
 
           lead.chosen_app = appName;
@@ -2403,12 +2734,12 @@ app.post('/api/webhooks/evolution', async (req, res) => {
             );
           }
 
-          const videoFile = customMatch?.video || APP_VIDEOS[appName.toUpperCase()] || '';
+          const videoFile = resolveAppVideoFile(tvBrand, appName, customMatch);
           const videoSent = await sendWhatsAppVideo(
             instance,
             remoteJid,
             videoFile,
-            `👆 Veja esse vídeo curtinho de como instalar e configurar o ${appName}!`
+            `👆 Veja esse vídeo curtinho de como instalar e configurar o ${appName}${tvBrand ? ` na TV ${tvBrand.toUpperCase()}` : ''}!`
           );
           if (videoSent) {
             await pool.query(
@@ -2418,9 +2749,29 @@ app.post('/api/webhooks/evolution', async (req, res) => {
           }
 
           if (logoUrl || videoSent) {
-            toolResult = `${logoUrl ? `Logo do ${appName}` : ''}${logoUrl && videoSent ? ' e ' : ''}${videoSent ? 'vídeo tutorial' : ''} enviado com sucesso. Agora responda ao cliente em texto curto pedindo para instalar o ${appName} na loja da TV e mandar foto da tela inicial quando abrir.`;
+            toolResult = `${logoUrl ? `Logo do ${appName}` : ''}${logoUrl && videoSent ? ' e ' : ''}${videoSent ? `vídeo tutorial (${videoFile})` : ''} enviado com sucesso. Agora responda ao cliente em texto curto pedindo para instalar o ${appName} na loja da TV e mandar foto da tela inicial quando abrir.`;
           } else {
-            toolResult = `App ${appName} registrado (sem imagem de logo). Agora responda ao cliente em texto curto orientando a instalar o ${appName} e avisar quando abrir.`;
+            toolResult = `App ${appName} registrado (sem imagem de logo ou vídeo ainda cadastrado). Agora responda ao cliente em texto curto orientando a instalar o ${appName} e avisar quando abrir.`;
+          }
+        }
+
+        if (fnName === 'enviar_video_dns') {
+          const tvBrand = String(args.tv_brand || 'geral').trim();
+          const dnsVideo = resolveDnsVideoFile(tvBrand);
+          const videoSent = await sendWhatsAppVideo(
+            instance,
+            remoteJid,
+            dnsVideo,
+            `🔧 Veja esse vídeo rapidinho ensinando como ajustar o DNS na sua TV${tvBrand && tvBrand !== 'geral' ? ` (${tvBrand.toUpperCase()})` : ''} para destravar o sinal!`
+          );
+          if (videoSent) {
+            await pool.query(
+              `INSERT INTO messages (lead_id, sender, content) VALUES ($1, 'jose_ai', $2)`,
+              [lead.id, `[Vídeo DNS enviado: ${dnsVideo}]`]
+            );
+            toolResult = `Vídeo tutorial de ajuste de DNS (${dnsVideo}) enviado com sucesso para o cliente. Agora responda em texto curto pedindo para ele seguir o passo a passo do vídeo, reiniciar o app e avisar se normalizou.`;
+          } else {
+            toolResult = `Ainda não há vídeo de DNS cadastrado para "${tvBrand}" na pasta /videos. Passe uma orientação curta por texto (alterar DNS da rede da TV para 1.1.1.1 ou 8.8.8.8) ou chame chamar_humano se o cliente tiver dificuldade.`;
           }
         }
 
