@@ -32,7 +32,7 @@ app.use('/videos', express.static(VIDEOS_DIR));
 app.get('/', (req, res) =>
   res.json({
     status: 'ok',
-    app: 'API do José v5.5 (Failover Multi-Modelo Gemini + Auto-Descoberta + Trial 24h + Vídeos /videos)',
+    app: 'API do José v5.7 (Follow-up Segmentado + Preço Promocional nos Planos + Push 24h + Failover Gemini)',
   })
 );
 
@@ -146,6 +146,72 @@ function getResellerPrices(reseller) {
 
 function formatBRL(val) {
   return Number(val || 0).toFixed(2).replace('.', ',');
+}
+
+function getResellerPromoPrices(reseller) {
+  const promo = reseller?.promo_prices;
+  if (!promo || typeof promo !== 'object') return {};
+  const parseOpt = (v) => {
+    if (v === '' || v === null || v === undefined) return null;
+    const n = Number(String(v).replace(',', '.'));
+    return Number.isFinite(n) && n > 0 ? n : null;
+  };
+  return {
+    1: {
+      1: parseOpt(promo?.[1]?.[1]),
+      3: parseOpt(promo?.[1]?.[3]),
+      6: parseOpt(promo?.[1]?.[6]),
+      12: parseOpt(promo?.[1]?.[12]),
+    },
+    2: {
+      1: parseOpt(promo?.[2]?.[1]),
+      3: parseOpt(promo?.[2]?.[3]),
+      6: parseOpt(promo?.[2]?.[6]),
+      12: parseOpt(promo?.[2]?.[12]),
+    },
+    3: { 1: parseOpt(promo?.[3]?.[1]) },
+    4: { 1: parseOpt(promo?.[4]?.[1]) },
+  };
+}
+
+function getEffectivePlanPrice(reseller, screens, months) {
+  const prices = getResellerPrices(reseller);
+  const normal = prices[screens]?.[months];
+  if (!normal) return null;
+  if (reseller?.promo_active) {
+    const promo = getResellerPromoPrices(reseller);
+    const p = promo[screens]?.[months];
+    if (p && p > 0) return p;
+  }
+  return normal;
+}
+
+function formatPlanPriceText(reseller, screens, months) {
+  const prices = getResellerPrices(reseller);
+  const normal = prices[screens]?.[months];
+  if (!normal) return '';
+  if (reseller?.promo_active) {
+    const promo = getResellerPromoPrices(reseller);
+    const p = promo[screens]?.[months];
+    if (p && p > 0 && p !== normal) {
+      return `de R$ ${formatBRL(normal)} por R$ ${formatBRL(p)} (PROMOÇÃO)`;
+    }
+  }
+  return `R$ ${formatBRL(normal)}`;
+}
+
+const DEFAULT_FOLLOWUP_SETTINGS = {
+  enabled: true,
+  audience: 'all_non_active', // 'all_non_active' | 'tested_only' | 'not_tested_only' | 'app_only' | 'disabled'
+};
+
+function getResellerFollowupSettings(reseller) {
+  const raw = reseller?.followup_settings;
+  if (!raw || typeof raw !== 'object') return DEFAULT_FOLLOWUP_SETTINGS;
+  const validAudiences = ['all_non_active', 'tested_only', 'not_tested_only', 'app_only', 'disabled'];
+  const audience = validAudiences.includes(raw.audience) ? raw.audience : 'all_non_active';
+  const enabled = audience === 'disabled' ? false : raw.enabled !== false;
+  return { enabled, audience };
 }
 
 const DEFAULT_APPS_CONFIG = {
@@ -915,14 +981,20 @@ app.delete('/api/apps/videos/:filename', auth, (req, res) => {
   }
 });
 
-// Personalizações (Nome do Assistente + Preços Personalizados)
+// Personalizações (Nome do Assistente + Preços Personalizados + Preços Promocionais)
 app.get('/api/reseller/customizations', auth, async (req, res) => {
   try {
-    const r = await pool.query('SELECT bot_name, custom_prices FROM resellers WHERE id = $1', [req.user.id]);
+    const r = await pool.query(
+      'SELECT bot_name, custom_prices, promo_prices, promo_active, followup_settings FROM resellers WHERE id = $1',
+      [req.user.id]
+    );
     const row = r.rows[0] || {};
     res.json({
       bot_name: row.bot_name || 'José',
       prices: getResellerPrices(row),
+      promo_active: Boolean(row.promo_active),
+      promo_prices: getResellerPromoPrices(row),
+      followup_settings: getResellerFollowupSettings(row),
     });
   } catch {
     res.status(500).json({ error: 'Erro ao carregar personalizações' });
@@ -932,17 +1004,50 @@ app.get('/api/reseller/customizations', auth, async (req, res) => {
 app.post('/api/reseller/customizations', auth, async (req, res) => {
   const botName = String(req.body?.bot_name || 'José').trim() || 'José';
   const prices = req.body?.prices;
+  const promoActive = Boolean(req.body?.promo_active);
+  const promoPrices = req.body?.promo_prices && typeof req.body.promo_prices === 'object' ? req.body.promo_prices : {};
+
   if (!prices || typeof prices !== 'object') {
     return res.status(400).json({ error: 'Tabela de preços inválida' });
   }
   try {
     await pool.query(
-      'UPDATE resellers SET bot_name = $1, custom_prices = $2 WHERE id = $3',
-      [botName, JSON.stringify(prices), req.user.id]
+      'UPDATE resellers SET bot_name = $1, custom_prices = $2, promo_active = $3, promo_prices = $4 WHERE id = $5',
+      [botName, JSON.stringify(prices), promoActive, JSON.stringify(promoPrices), req.user.id]
     );
-    res.json({ success: true, bot_name: botName, prices });
+    res.json({
+      success: true,
+      bot_name: botName,
+      prices,
+      promo_active: promoActive,
+      promo_prices: promoPrices,
+    });
   } catch {
     res.status(500).json({ error: 'Erro ao salvar personalizações' });
+  }
+});
+
+// Configurações de Público do Follow-up Automático
+app.get('/api/reseller/followup-settings', auth, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT followup_settings FROM resellers WHERE id = $1', [req.user.id]);
+    res.json({ settings: getResellerFollowupSettings(r.rows[0]) });
+  } catch {
+    res.status(500).json({ error: 'Erro ao carregar configurações de follow-up' });
+  }
+});
+
+app.post('/api/reseller/followup-settings', auth, async (req, res) => {
+  const raw = req.body?.settings || req.body || {};
+  const settings = getResellerFollowupSettings({ followup_settings: raw });
+  try {
+    await pool.query('UPDATE resellers SET followup_settings = $1 WHERE id = $2', [
+      JSON.stringify(settings),
+      req.user.id,
+    ]);
+    res.json({ success: true, settings });
+  } catch {
+    res.status(500).json({ error: 'Erro ao salvar configurações de follow-up' });
   }
 });
 
@@ -1358,12 +1463,12 @@ CONFERÊNCIA DE ERRO DE DIGITAÇÃO (MUITO IMPORTANTE):
   3. Reenvie os dados corretos bem organizados e peça para apagar e digitar novamente com calma. Só chame \`chamar_humano\` se os dados na foto estiverem 100% idênticos aos gerados e mesmo assim não entrar.
 
 PLANOS (até 4 telas simultâneas):
-- 1 tela: Mensal R$ ${formatBRL(prices[1][1])} | Trimestral R$ ${formatBRL(prices[1][3])} | Semestral R$ ${formatBRL(prices[1][6])} | Anual R$ ${formatBRL(prices[1][12])}
-- 2 telas: Mensal R$ ${formatBRL(prices[2][1])} | Trimestral R$ ${formatBRL(prices[2][3])} | Semestral R$ ${formatBRL(prices[2][6])} | Anual R$ ${formatBRL(prices[2][12])}
-- 3 telas: Mensal R$ ${formatBRL(prices[3][1])}
-- 4 telas: Mensal R$ ${formatBRL(prices[4][1])}
+- 1 tela: Mensal ${formatPlanPriceText(reseller, 1, 1)} | Trimestral ${formatPlanPriceText(reseller, 1, 3)} | Semestral ${formatPlanPriceText(reseller, 1, 6)} | Anual ${formatPlanPriceText(reseller, 1, 12)}
+- 2 telas: Mensal ${formatPlanPriceText(reseller, 2, 1)} | Trimestral ${formatPlanPriceText(reseller, 2, 3)} | Semestral ${formatPlanPriceText(reseller, 2, 6)} | Anual ${formatPlanPriceText(reseller, 2, 12)}
+- 3 telas: Mensal ${formatPlanPriceText(reseller, 3, 1)}
+- 4 telas: Mensal ${formatPlanPriceText(reseller, 4, 1)}
 - Teste grátis: 1 hora.
-Regra: nunca jogue a tabela completa antes de oferecer o teste grátis (se perguntar preço, diga "a partir de R$ ${formatBRL(prices[1][1])}/mês" e puxe para o teste). Só informe opções de 2, 3 ou 4 telas se o cliente perguntar ou demonstrar interesse em mais telas.
+Regra: nunca jogue a tabela completa antes de oferecer o teste grátis (se perguntar preço, diga "a partir de R$ ${formatBRL(getEffectivePlanPrice(reseller, 1, 1))}/mês" e puxe para o teste). Se houver valor marcado como (PROMOÇÃO), destaque essa condição promocional na hora do fechamento. Só informe opções de 2, 3 ou 4 telas se o cliente perguntar ou demonstrar interesse em mais telas.
 
 CANAIS ADULTOS (+18):
 - Se o cliente perguntar se tem canais adultos (+18), responda de forma natural e discreta que SIM, o pacote já inclui canais adultos protegidos por senha (a senha padrão dos aplicativos costuma ser 0000 ou 1234).
@@ -2429,8 +2534,7 @@ app.post('/api/webhooks/evolution', async (req, res) => {
         if (fnName === 'gerar_pix_plano') {
           const screens = Number(args.screens) || 1;
           const months = Number(args.months) || 1;
-          const prices = getResellerPrices(activeReseller);
-          const amount = prices[screens]?.[months];
+          const amount = getEffectivePlanPrice(activeReseller, screens, months);
           if (!amount) {
             toolResult = `Plano indisponível para ${screens} tela(s) e ${months} mês(es).`;
           } else if (!activeReseller.mp_access_token) {
@@ -2875,6 +2979,9 @@ async function initFollowupColumns() {
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS custom_apps JSONB;`);
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS bot_name TEXT DEFAULT 'José';`);
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS custom_prices JSONB;`);
+    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS promo_prices JSONB;`);
+    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS promo_active BOOLEAN DEFAULT FALSE;`);
+    await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS followup_settings JSONB;`);
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS gestor_provider TEXT;`);
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS gestor_webhook_url TEXT;`);
     await pool.query(`ALTER TABLE resellers ADD COLUMN IF NOT EXISTS gestor_token TEXT;`);
@@ -3021,6 +3128,9 @@ async function runSalesFollowup() {
         r.wallet_balance,
         r.natv_api_key,
         r.custom_prices,
+        r.promo_prices,
+        r.promo_active,
+        r.followup_settings,
         r.trial_started_at,
         r.trial_expires_at,
         r.trial_used,
@@ -3059,13 +3169,26 @@ async function runSalesFollowup() {
     for (const lead of rows) {
       if (!canUseBot(lead)) continue;
 
+      const followupCfg = getResellerFollowupSettings(lead);
+      if (!followupCfg.enabled || followupCfg.audience === 'disabled') continue;
+
       const diffMin = Number(lead.diff_min || 0);
       const diffFollowupMin = lead.last_followup_at ? Number(lead.diff_followup_min || 0) : 999999;
       const step = Number(lead.followup_step || 0);
       const stage = String(lead.stage || '').toUpperCase();
       const chosenApp = String(lead.chosen_app || '').trim();
-      const prices = getResellerPrices(lead);
-      const mensalStr = formatBRL(prices[1][1]);
+
+      // Segmentação escolhida pelo revendedor
+      if (followupCfg.audience === 'tested_only' && stage !== 'TESTE') continue;
+      if (followupCfg.audience === 'not_tested_only' && stage === 'TESTE') continue;
+      if (followupCfg.audience === 'app_only' && (stage === 'TESTE' || !chosenApp)) continue;
+
+      const mensalEffective = getEffectivePlanPrice(lead, 1, 1);
+      const mensalNormal = getResellerPrices(lead)[1][1];
+      const mensalStr =
+        lead.promo_active && mensalEffective && mensalEffective !== mensalNormal
+          ? `${formatBRL(mensalEffective)} (valor promocional, de R$ ${formatBRL(mensalNormal)})`
+          : formatBRL(mensalNormal);
 
       let msg = null;
       let nextStep = step;
@@ -4357,6 +4480,234 @@ app.post('/api/reseller/subresellers/credits', auth, async (req, res) => {
     res.status(500).json({ error: 'Erro interno ao transferir créditos.' });
   }
 });
+
+// ==========================================
+// 14. NOTIFICAÇÕES PUSH PWA (RESUMO A CADA 2H — 24H POR DIA)
+// ==========================================
+let webpush = null;
+try {
+  webpush = require('web-push');
+} catch {
+  console.warn('⚠️ [PUSH] Pacote "web-push" ainda não instalado. Rode "npm install web-push" no backend para ativar notificações push.');
+}
+
+const VAPID_PUBLIC_KEY = (process.env.VAPID_PUBLIC_KEY || '').trim();
+const VAPID_PRIVATE_KEY = (process.env.VAPID_PRIVATE_KEY || '').trim();
+const VAPID_SUBJECT = (process.env.VAPID_SUBJECT || 'mailto:suporte@josebot.com').trim();
+
+let pushEnabled = false;
+if (webpush && VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+  try {
+    webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+    pushEnabled = true;
+    console.log('🔔 [PUSH] Web Push ativado com sucesso (chaves VAPID configuradas).');
+  } catch (err) {
+    console.error('❌ [PUSH] Erro ao configurar chaves VAPID:', err.message);
+  }
+} else if (webpush) {
+  console.warn('⚠️ [PUSH] Configure VAPID_PUBLIC_KEY e VAPID_PRIVATE_KEY no EasyPanel para ativar notificações push.');
+}
+
+async function initPushTable() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id SERIAL PRIMARY KEY,
+        reseller_id UUID NOT NULL,
+        endpoint TEXT NOT NULL UNIQUE,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        last_notified_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT now(),
+        updated_at TIMESTAMPTZ DEFAULT now()
+      );
+    `);
+  } catch (err) {
+    console.error('❌ [PUSH] Erro ao criar tabela push_subscriptions:', err.message);
+  }
+}
+initPushTable();
+
+app.get('/api/push/vapid-public-key', (req, res) => {
+  res.json({
+    enabled: pushEnabled,
+    publicKey: VAPID_PUBLIC_KEY || null,
+  });
+});
+
+app.post('/api/push/subscribe', auth, async (req, res) => {
+  const sub = req.body?.subscription || req.body;
+  const endpoint = String(sub?.endpoint || '').trim();
+  const p256dh = String(sub?.keys?.p256dh || '').trim();
+  const authKey = String(sub?.keys?.auth || '').trim();
+
+  if (!endpoint || !p256dh || !authKey) {
+    return res.status(400).json({ error: 'Assinatura de notificação inválida.' });
+  }
+
+  try {
+    await pool.query(
+      `INSERT INTO push_subscriptions (reseller_id, endpoint, p256dh, auth, updated_at)
+       VALUES ($1, $2, $3, $4, now())
+       ON CONFLICT (endpoint)
+       DO UPDATE SET reseller_id = $1, p256dh = $3, auth = $4, updated_at = now()`,
+      [req.user.id, endpoint, p256dh, authKey]
+    );
+    res.json({ success: true, message: 'Notificações ativadas neste dispositivo!' });
+  } catch (err) {
+    console.error('❌ [PUSH SUBSCRIBE]:', err.message);
+    res.status(500).json({ error: 'Erro ao salvar dispositivo para notificações.' });
+  }
+});
+
+app.post('/api/push/unsubscribe', auth, async (req, res) => {
+  const endpoint = String(req.body?.endpoint || '').trim();
+  try {
+    if (endpoint) {
+      await pool.query('DELETE FROM push_subscriptions WHERE reseller_id = $1 AND endpoint = $2', [
+        req.user.id,
+        endpoint,
+      ]);
+    } else {
+      await pool.query('DELETE FROM push_subscriptions WHERE reseller_id = $1', [req.user.id]);
+    }
+    res.json({ success: true });
+  } catch {
+    res.status(500).json({ error: 'Erro ao desativar notificações.' });
+  }
+});
+
+async function sendPushToSubscription(subRow, payloadObj) {
+  if (!pushEnabled || !webpush) return false;
+  const subscription = {
+    endpoint: subRow.endpoint,
+    keys: { p256dh: subRow.p256dh, auth: subRow.auth },
+  };
+  try {
+    await webpush.sendNotification(subscription, JSON.stringify(payloadObj));
+    return true;
+  } catch (err) {
+    if (err.statusCode === 404 || err.statusCode === 410) {
+      await pool.query('DELETE FROM push_subscriptions WHERE id = $1', [subRow.id]).catch(() => {});
+      console.log(`🧹 [PUSH] Dispositivo expirado removido (#${subRow.id}).`);
+    } else {
+      console.error(`❌ [PUSH] Falha ao enviar para #${subRow.id}:`, err.statusCode || err.message);
+    }
+    return false;
+  }
+}
+
+app.post('/api/push/test', auth, async (req, res) => {
+  if (!pushEnabled) {
+    return res.status(400).json({ error: 'Web Push não configurado no servidor (verifique web-push e chaves VAPID).' });
+  }
+  try {
+    const subs = await pool.query('SELECT * FROM push_subscriptions WHERE reseller_id = $1', [req.user.id]);
+    if (!subs.rows.length) {
+      return res.status(400).json({ error: 'Nenhum dispositivo inscrito ainda.' });
+    }
+    const payload = {
+      title: 'Enquanto você esteve fora... 🚀',
+      body: 'Notificações do José ativadas! A cada 2h você receberá o resumo de conversas, testes e vendas.',
+      url: '/',
+      tag: 'jose-away-test',
+    };
+    let sentCount = 0;
+    for (const sub of subs.rows) {
+      if (await sendPushToSubscription(sub, payload)) sentCount++;
+    }
+    res.json({ success: true, sent: sentCount });
+  } catch (err) {
+    console.error('❌ [PUSH TEST]:', err.message);
+    res.status(500).json({ error: 'Erro ao disparar notificação de teste.' });
+  }
+});
+
+// Motor automático 24h: dispara resumo a cada 2 horas para revendedores com movimento
+async function runAwayPushNotifications() {
+  if (!pushEnabled || !webpush) return;
+
+  try {
+    const { rows: dueResellers } = await pool.query(`
+      SELECT
+        ps.reseller_id,
+        COALESCE(r.bot_name, 'José') AS bot_name,
+        MAX(ps.last_notified_at) AS last_notified_at
+      FROM push_subscriptions ps
+      JOIN resellers r ON r.id = ps.reseller_id
+      GROUP BY ps.reseller_id, r.bot_name
+      HAVING MAX(ps.last_notified_at) IS NULL
+          OR MAX(ps.last_notified_at) <= NOW() - INTERVAL '2 hours'
+    `);
+
+    for (const row of dueResellers) {
+      const resellerId = row.reseller_id;
+      const botName = row.bot_name || 'José';
+
+      const [leadsStats, salesStats] = await Promise.all([
+        pool.query(
+          `SELECT
+             COUNT(*) FILTER (WHERE last_interaction >= NOW() - INTERVAL '2 hours') AS conversations_2h,
+             COUNT(*) FILTER (WHERE test_created_at >= NOW() - INTERVAL '2 hours') AS tests_2h
+           FROM leads
+           WHERE reseller_id = $1`,
+          [resellerId]
+        ),
+        pool.query(
+          `SELECT COUNT(*) AS sales_2h
+           FROM processed_payments
+           WHERE reseller_id = $1
+             AND lead_id IS NOT NULL
+             AND created_at >= NOW() - INTERVAL '2 hours'`,
+          [resellerId]
+        ),
+      ]);
+
+      const conv = Number(leadsStats.rows[0]?.conversations_2h || 0);
+      const tests = Number(leadsStats.rows[0]?.tests_2h || 0);
+      const sales = Number(salesStats.rows[0]?.sales_2h || 0);
+
+      // Só notifica se houve pelo menos 1 conversa, teste ou venda nas últimas 2h
+      if (conv === 0 && tests === 0 && sales === 0) continue;
+
+      const parts = [];
+      if (conv > 0) parts.push(`${conv} ${conv === 1 ? 'conversa' : 'conversas'}`);
+      if (tests > 0) parts.push(`${tests} ${tests === 1 ? 'teste' : 'testes'}`);
+      if (sales > 0) parts.push(`${sales} ${sales === 1 ? 'venda confirmada' : 'vendas confirmadas'}`);
+
+      let summaryText = '';
+      if (parts.length === 1) summaryText = parts[0];
+      else if (parts.length === 2) summaryText = `${parts[0]} e ${parts[1]}`;
+      else summaryText = `${parts[0]}, ${parts[1]} e ${parts[2]}`;
+
+      const payload = {
+        title: 'Enquanto você esteve fora... 🚀',
+        body: `O ${botName} registrou ${summaryText} nas últimas 2h. Toque para acompanhar!`,
+        url: '/',
+        tag: `jose-away-${resellerId}`,
+      };
+
+      const subs = await pool.query('SELECT * FROM push_subscriptions WHERE reseller_id = $1', [resellerId]);
+      let delivered = 0;
+      for (const sub of subs.rows) {
+        if (await sendPushToSubscription(sub, payload)) delivered++;
+      }
+
+      if (delivered > 0) {
+        await pool.query(
+          'UPDATE push_subscriptions SET last_notified_at = NOW() WHERE reseller_id = $1',
+          [resellerId]
+        );
+        console.log(`🔔 [PUSH 2H] Enviado para ${resellerId.slice(0, 8)} (${summaryText}) -> ${delivered} aparelho(s)`);
+      }
+    }
+  } catch (err) {
+    console.error('❌ [ERRO PUSH 2H]:', err.message);
+  }
+}
+
+// Verifica a cada 15 minutos quem completou janela de 2h com movimento (funciona 24h por dia)
+setInterval(runAwayPushNotifications, 15 * 60 * 1000);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`API do José rodando na porta ${PORT}`));
