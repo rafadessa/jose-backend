@@ -32,7 +32,7 @@ app.use('/videos', express.static(VIDEOS_DIR));
 app.get('/', (req, res) =>
   res.json({
     status: 'ok',
-    app: 'API do José v5.4 (Trial Exato 24h ao Conectar WhatsApp + Vídeos Tutoriais /videos + José Gestor)',
+    app: 'API do José v5.5 (Failover Multi-Modelo Gemini + Auto-Descoberta + Trial 24h + Vídeos /videos)',
   })
 );
 
@@ -378,7 +378,8 @@ app.get('/api/reseller/sync-credits', auth, async (req, res) => {
 
     const trial = getTrialStatus(reseller);
     const cached = natvCreditsCache.get(userId);
-    if (!forceSync && cached && Date.now() - cached.ts < 15000) {
+    const cacheTtl = cached?.rateLimited ? 120000 : 180000;
+    if ((!forceSync || cached?.rateLimited) && cached && Date.now() - cached.ts < cacheTtl) {
       return res.json({
         natv_credits: cached.credits,
         credits: cached.credits,
@@ -407,10 +408,15 @@ app.get('/api/reseller/sync-credits', auth, async (req, res) => {
           natvData.balance;
         credits = parseNatvCredits(rawCredits, credits);
         await pool.query('UPDATE resellers SET natv_credits = $1 WHERE id = $2', [credits, userId]);
-        natvCreditsCache.set(userId, { ts: Date.now(), credits });
+        natvCreditsCache.set(userId, { ts: Date.now(), credits, rateLimited: false });
       } else {
         const errText = await natvRes.text().catch(() => '');
-        console.error(`❌ [SYNC-CREDITS] NATV retornou ${natvRes.status}: ${errText.slice(0, 200)}`);
+        if (natvRes.status === 429) {
+          natvCreditsCache.set(userId, { ts: Date.now(), credits, rateLimited: true });
+          console.warn(`⚠️ [SYNC-CREDITS] NATV retornou 429 (cooldown 2 min ativado, usando saldo salvo: ${credits}).`);
+        } else {
+          console.error(`❌ [SYNC-CREDITS] NATV retornou ${natvRes.status}: ${errText.slice(0, 200)}`);
+        }
       }
     }
 
@@ -1704,7 +1710,136 @@ async function getEvolutionMediaBase64(instanceName, dataObj, key) {
   return null;
 }
 
-// Analisa áudio ou imagem diretamente via API nativa do Gemini com retry + fallback de modelos
+// ==========================================
+// MOTOR DE FAILOVER MULTI-MODELO GEMINI (RODA TODOS OS MODELOS DISPONÍVEIS)
+// ==========================================
+const CUSTOM_GEMINI_MODELS = (process.env.GEMINI_MODELS || '')
+  .split(',')
+  .map((m) => m.trim())
+  .filter(Boolean);
+
+const FALLBACK_GEMINI_MODELS = CUSTOM_GEMINI_MODELS.length
+  ? CUSTOM_GEMINI_MODELS
+  : [
+      'gemini-2.5-flash',
+      'gemini-2.5-flash-lite',
+      'gemini-3.8-flash',
+      'gemini-flash-latest',
+      'gemini-2.5-pro',
+      'gemini-pro-latest',
+    ];
+
+const geminiModelCooldown = new Map();
+let discoveredGeminiModelsCache = { ts: 0, models: [] };
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 25000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function isModelInCooldown(model) {
+  const entry = geminiModelCooldown.get(model);
+  if (!entry) return false;
+  if (Date.now() >= entry.until) {
+    geminiModelCooldown.delete(model);
+    return false;
+  }
+  return true;
+}
+
+function markModelCooldown(model, status, reason = '') {
+  const isPermanent = status === 404;
+  // 404 (descontinuado): pausa por 6h | 429/503/500/timeout: pausa por 60s para ir direto ao próximo modelo saudável
+  const durationMs = isPermanent ? 6 * 60 * 60 * 1000 : 60 * 1000;
+  geminiModelCooldown.set(model, {
+    until: Date.now() + durationMs,
+    permanent: isPermanent,
+  });
+  console.warn(
+    `⚠️ [GEMINI FAILOVER] ${model} pausado por ${isPermanent ? '6h (404)' : '60s'} | Status: ${status}${reason ? ` | ${reason}` : ''}`
+  );
+}
+
+// Auto-descoberta: busca TODOS os modelos Gemini ativos na API do Google se a lista padrão falhar
+async function discoverAvailableGeminiModels(apiKey) {
+  if (
+    discoveredGeminiModelsCache.models.length > 0 &&
+    Date.now() - discoveredGeminiModelsCache.ts < 60 * 60 * 1000
+  ) {
+    return discoveredGeminiModelsCache.models;
+  }
+
+  try {
+    const res = await fetchWithTimeout(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`,
+      { method: 'GET' },
+      10000
+    );
+    if (!res.ok) return [];
+    const json = await res.json().catch(() => ({}));
+    const list = Array.isArray(json.models) ? json.models : [];
+
+    const valid = list
+      .filter((m) => {
+        const methods = Array.isArray(m.supportedGenerationMethods)
+          ? m.supportedGenerationMethods
+          : [];
+        const name = String(m.name || '').replace(/^models\//, '');
+        if (!methods.includes('generateContent')) return false;
+        if (!/^gemini-/i.test(name)) return false;
+        if (/(embedding|imagen|veo|tts|audio|robotics|computer-use|deep-research|aqa|image-generation|live)/i.test(name)) {
+          return false;
+        }
+        return true;
+      })
+      .map((m) => String(m.name).replace(/^models\//, ''))
+      .sort((a, b) => {
+        const score = (n) => {
+          let s = 0;
+          if (/flash/i.test(n)) s += 100;
+          if (/pro/i.test(n)) s += 50;
+          if (/lite/i.test(n)) s -= 5;
+          if (/(exp|preview|thinking)/i.test(n)) s -= 15;
+          const ver = n.match(/gemini-(\d+(?:\.\d+)?)/i);
+          if (ver) s += parseFloat(ver[1]) * 10;
+          return s;
+        };
+        return score(b) - score(a);
+      });
+
+    if (valid.length > 0) {
+      discoveredGeminiModelsCache = { ts: Date.now(), models: valid };
+      console.log(`🔎 [GEMINI AUTO-DESCOBERTA] ${valid.length} modelos disponíveis: ${valid.slice(0, 10).join(', ')}`);
+    }
+    return valid;
+  } catch (err) {
+    console.warn('⚠️ [GEMINI AUTO-DESCOBERTA] Falha:', err.message);
+    return [];
+  }
+}
+
+async function buildGeminiModelQueue(apiKey, includeDiscovered = false) {
+  const ordered = [...FALLBACK_GEMINI_MODELS];
+  if (includeDiscovered) {
+    const discovered = await discoverAvailableGeminiModels(apiKey);
+    for (const m of discovered) {
+      if (!ordered.includes(m)) ordered.push(m);
+    }
+  }
+  const healthy = ordered.filter((m) => !isModelInCooldown(m));
+  const softPaused = ordered.filter((m) => {
+    const entry = geminiModelCooldown.get(m);
+    return entry && !entry.permanent;
+  });
+  return [...healthy, ...softPaused];
+}
+
+// Analisa áudio ou imagem diretamente via API nativa do Gemini com failover em cascata
 async function analyzeMediaWithGemini(base64, mimeType, promptText) {
   const apiKey = (process.env.GEMINI_API_KEY || process.env.OPENAI_API_KEY || '').trim();
   if (!apiKey || !base64) {
@@ -1714,12 +1849,16 @@ async function analyzeMediaWithGemini(base64, mimeType, promptText) {
 
   const cleanBase64 = base64.replace(/^data:[^;]+;base64,/, '').trim();
   const cleanMime = String(mimeType || 'audio/ogg').split(';')[0].trim();
-  const models = ['gemini-2.5-flash', 'gemini-2.0-flash'];
+  const tried = new Set();
 
-  for (const model of models) {
-    for (let attempt = 1; attempt <= 2; attempt++) {
+  for (const pass of [1, 2]) {
+    const queue = await buildGeminiModelQueue(apiKey, pass === 2);
+    for (const model of queue) {
+      if (tried.has(model)) continue;
+      tried.add(model);
+
       try {
-        const res = await fetch(
+        const res = await fetchWithTimeout(
           `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
           {
             method: 'POST',
@@ -1734,7 +1873,8 @@ async function analyzeMediaWithGemini(base64, mimeType, promptText) {
                 },
               ],
             }),
-          }
+          },
+          25000
         );
 
         if (res.ok) {
@@ -1744,18 +1884,21 @@ async function analyzeMediaWithGemini(base64, mimeType, promptText) {
             .filter(Boolean)
             .join('\n')
             .trim();
-          if (resultText) return resultText;
+          if (resultText) {
+            if (model !== FALLBACK_GEMINI_MODELS[0]) {
+              console.log(`✅ [GEMINI MÍDIA] Respondido via fallback: ${model}`);
+            }
+            return resultText;
+          }
         } else {
           const errText = await res.text().catch(() => '');
-          console.error(`❌ [GEMINI MÍDIA ${model} tentativa ${attempt}] Status ${res.status}: ${errText.slice(0, 250)}`);
-          if (res.status === 503 || res.status === 429) {
-            await new Promise((r) => setTimeout(r, 1500));
-            continue;
-          }
-          break;
+          console.error(`❌ [GEMINI MÍDIA ${model}] Status ${res.status}: ${errText.slice(0, 220)}`);
+          if (res.status === 401 || res.status === 403) return null;
+          markModelCooldown(model, res.status);
         }
       } catch (err) {
         console.error(`❌ [GEMINI MÍDIA ${model}] Exceção:`, err.message);
+        markModelCooldown(model, 'TIMEOUT', err.message);
       }
     }
   }
@@ -1763,24 +1906,85 @@ async function analyzeMediaWithGemini(base64, mimeType, promptText) {
 }
 
 async function callGeminiWithFallback(apiKey, messagesPayload, tools) {
-  const models = ['gemini-2.5-flash', 'gemini-2.0-flash'];
-  for (const model of models) {
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      const res = await fetch('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, temperature: 0.3, messages: messagesPayload, tools }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (res.ok) return { ok: true, status: res.status, data };
-      if (res.status === 503 || res.status === 429) {
-        await new Promise((r) => setTimeout(r, 1500));
-        continue;
+  if (!apiKey) {
+    return { ok: false, status: 401, data: { error: 'GEMINI_API_KEY não configurada.' } };
+  }
+
+  const tried = new Set();
+  let lastError = { ok: false, status: 503, data: { error: 'Todos os modelos Gemini indisponíveis.' } };
+
+  // Rodada 1: lista prioritária | Rodada 2: auto-descoberta de todos os modelos ativos na conta Google
+  for (const pass of [1, 2]) {
+    const queue = await buildGeminiModelQueue(apiKey, pass === 2);
+    for (const model of queue) {
+      if (tried.has(model)) continue;
+      tried.add(model);
+
+      try {
+        const res = await fetchWithTimeout(
+          'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
+          {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model, temperature: 0.3, messages: messagesPayload, tools }),
+          },
+          25000
+        );
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data?.choices?.[0]?.message) {
+          if (model !== FALLBACK_GEMINI_MODELS[0]) {
+            console.log(`✅ [GEMINI CHAT] Respondido via fallback: ${model}`);
+          }
+          return { ok: true, status: res.status, data, model };
+        }
+
+        lastError = { ok: false, status: res.status, data };
+        console.error(`❌ [GEMINI CHAT ${model}] Status ${res.status}:`, JSON.stringify(data).slice(0, 240));
+
+        if (res.status === 401 || res.status === 403) {
+          return lastError;
+        }
+        markModelCooldown(model, res.status);
+      } catch (err) {
+        console.error(`❌ [GEMINI CHAT ${model}] Exceção/Timeout:`, err.message);
+        lastError = { ok: false, status: 504, data: { error: err.message } };
+        markModelCooldown(model, 'TIMEOUT', err.message);
       }
-      return { ok: false, status: res.status, data };
     }
   }
-  return { ok: false, status: 503, data: { error: 'Todos os modelos Gemini indisponíveis.' } };
+
+  // Rodada 3 (emergência): se tudo falhou por pico momentâneo (503/429), aguarda 1,5s e tenta novamente os 2 primeiros não-404
+  const retryModels = FALLBACK_GEMINI_MODELS.filter((m) => {
+    const entry = geminiModelCooldown.get(m);
+    return !entry?.permanent;
+  }).slice(0, 2);
+
+  if (retryModels.length > 0) {
+    await new Promise((r) => setTimeout(r, 1500));
+    for (const model of retryModels) {
+      try {
+        const res = await fetchWithTimeout(
+          'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
+          {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model, temperature: 0.3, messages: messagesPayload, tools }),
+          },
+          25000
+        );
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data?.choices?.[0]?.message) {
+          console.log(`✅ [GEMINI CHAT EMERGÊNCIA] Respondido via ${model}`);
+          return { ok: true, status: res.status, data, model };
+        }
+        lastError = { ok: false, status: res.status, data };
+      } catch (err) {
+        lastError = { ok: false, status: 504, data: { error: err.message } };
+      }
+    }
+  }
+
+  return lastError;
 }
 
 const processedMessages = new Set();
