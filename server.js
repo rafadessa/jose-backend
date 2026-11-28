@@ -32,7 +32,7 @@ app.use('/videos', express.static(VIDEOS_DIR));
 app.get('/', (req, res) =>
   res.json({
     status: 'ok',
-    app: 'API do José v5.16 (Trava Atômica Anti-Duplicidade Pix/NATV + LG + Philips + Android + Sony + TCL)',
+    app: 'API do José v5.17 (Blindagem Total Anti-Duplicidade Pix/NATV + LG + Philips + Android + Sony + TCL)',
   })
 );
 
@@ -1485,6 +1485,8 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
       }
 
       if (actRes.ok) {
+        // NATV já renovou e consumiu o crédito: nunca remover a trava no catch abaixo
+        dbLockAcquired = false;
         await pool.query(`UPDATE leads SET stage = 'ATIVO' WHERE id = $1`, [lead.id]);
 
         await syncClientToGestor(reseller, lead, months, screens);
