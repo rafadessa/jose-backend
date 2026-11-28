@@ -32,7 +32,7 @@ app.use('/videos', express.static(VIDEOS_DIR));
 app.get('/', (req, res) =>
   res.json({
     status: 'ok',
-    app: 'API do José v5.17 (Blindagem Total Anti-Duplicidade Pix/NATV + LG + Philips + Android + Sony + TCL)',
+    app: 'API do José v5.18 (HD Player XC Account + Captura MAC + Blindagem Anti-Duplicidade Pix/NATV)',
   })
 );
 
@@ -1548,14 +1548,24 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
             const clientPhone = String(lead.phone || '').replace(/@.*$/, '');
             const amountPaid = formatBRL(payment.transaction_amount);
 
+            const isHdPlayerSale =
+              String(lead.chosen_app || '').toUpperCase().includes('HD PLAYER') ||
+              Boolean(lead.hd_player_mac);
+            const hdPlayerExtra = isHdPlayerSale
+              ? `\n\n📺 *Licença HD Player (NATV):*\n` +
+                `MAC: ${lead.hd_player_mac || 'Ainda não capturado (peça foto da tela ao cliente)'}\n` +
+                `Ativar com seu token: https://partner.activation.click/dbtdwt3x28a6ek3m`
+              : '';
+
             const saleAlert =
               `💰 *Nova Venda Confirmada!*\n\n` +
               `Cliente: ${lead.name || 'Sem nome'}\n` +
               `WhatsApp: ${clientPhone}\n` +
               `Usuário NATV: ${lead.natv_username}\n` +
               `Plano: ${months} ${months === 1 ? 'mês' : 'meses'} (${screens} ${screens === 1 ? 'tela' : 'telas'})\n` +
-              `Valor: R$ ${amountPaid}\n\n` +
-              `✅ Ativado automaticamente pelo ${reseller.bot_name || 'José'}.`;
+              `Valor: R$ ${amountPaid}` +
+              hdPlayerExtra +
+              `\n\n✅ Ativado automaticamente pelo ${reseller.bot_name || 'José'}.`;
 
             await sendWhatsAppText(instanceName, supportJid, saleAlert);
             console.log(`💰 [ALERTA VENDA] Enviado para ${supportJid}`);
@@ -1824,13 +1834,16 @@ FERRAMENTAS:
     Código: [codigo_watch_hub]
     Usuário: [usuario]
     Senha: [senha]
-  - Se o app escolhido for HD PLAYER, entregue EXATAMENTE neste formato:
-    Seu teste está pronto! Acesse o link abaixo e siga o passo a passo do site com o app aberto:
-    https://hd.activation.click
+  - Se o app escolhido for HD PLAYER:
+    • Sempre que o cliente mandar foto da tela inicial do HD Player (ou digitar o MAC) contendo um endereço MAC (ex: aa:bb:cc:dd:ee:ff), chame IMEDIATAMENTE \`registrar_mac_hdplayer\` passando \`mac_address\` para encaminhar o MAC ao revendedor (sem pausar a IA).
+    • Ao gerar o teste (\`gerar_teste\`), entregue EXATAMENTE neste formato usando o método **XC ACCOUNT** direto no aplicativo (NÃO envie mais hd.activation.click nem código 4200, e NUNCA envie links de parceiro/revendedor ao cliente):
+    Seu teste está pronto! No HD Player, escolha a opção *XC ACCOUNT* (ou Conta XC) e preencha estes dados:
 
-    Código do servidor: 4200
+    URL/Domínio: [dominio]
     Usuário: [usuario]
     Senha: [senha]
+
+    Se ainda não mandou, pode me mandar uma foto da tela inicial do HD Player mostrando o *MAC* pra gente já deixar seu aparelho vinculado certinho? 📺
   - Se o app escolhido for PLAYER MASTER, entregue EXATAMENTE neste formato:
     Seu teste está pronto! Basta abrir o PLAYER MASTER e entrar com estes dados:
 
@@ -1924,17 +1937,16 @@ FLUXO DE ATENDIMENTO DE SUPORTE:
 3. FOTOS DE ERRO / APP:
    - Analise a imagem enviada. Se o app pedir pagamento/licença, tranquilize dizendo que NÃO precisa pagar nada ali dentro.
    - Se o app deslogou ou travou na tela inicial, oriente a fechar e abrir novamente ou reinstalar.
-3.1. LISTA CAIU / SUMIU NO HD PLAYER (MUITO COMUM):
-   - Se o cliente disser que usa o HD PLAYER e a lista caiu, sumiu ou aparece tela vazia (e o plano estiver ATIVO na consulta NATV), garanta que chamou \`consultar_status_natv\` e oriente:
-     Sua lista caiu do HD Player, mas é bem rápido colocar de volta! Com o app aberto na TV, acesse este site pelo celular:
-     https://hd.activation.click
+3.1. LISTA CAIU / SUMIU OU LICENÇA NO HD PLAYER (MÉTODO XC ACCOUNT):
+   - Se o cliente disser que usa o HD PLAYER e a lista caiu, sumiu ou aparece tela vazia (e o plano estiver ATIVO na consulta NATV), garanta que chamou \`consultar_status_natv\` e oriente a colocar a lista direto pelo método **XC ACCOUNT** no aplicativo (NÃO envie mais hd.activation.click nem código 4200, e NUNCA envie link de revendedor/parceiro ao cliente):
+     É bem rápido colocar sua lista de volta no HD Player! Abra o app, escolha a opção *XC ACCOUNT* (Conta XC) e preencha:
 
-     Siga o passo a passo do site (colocando o código/MAC que aparece na tela da TV) e preencha com seus dados:
-     Código do servidor: 4200
+     URL/Domínio: [dominio]
      Usuário: [usuario]
      Senha: [senha]
 
-     Depois de salvar no site, feche e abra o HD Player na TV que os canais já voltam!
+     (Se o domínio não constar no contexto, informe Usuário e Senha e chame \`chamar_humano\` caso o cliente não saiba a URL).
+   - Se a tela do HD Player mostrar aviso de licença/ativação expirada ou exibir um endereço **MAC**, peça uma foto da tela (se ainda não enviou), chame \`registrar_mac_hdplayer\` com o \`mac_address\` identificado para avisar o revendedor ativar a licença, e tranquilize o cliente dizendo que já encaminhou o MAC para liberação.
 4. CLIENTE DIZ QUE PAGOU E NÃO ATIVOU:
    - Peça o comprovante e chame \`chamar_humano\` se não constar ativação automática.
 5. QUANDO CHAMAR HUMANO (\`chamar_humano\`):
@@ -2698,6 +2710,23 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       {
         type: 'function',
         function: {
+          name: 'registrar_mac_hdplayer',
+          description: 'Registra o endereço MAC do aplicativo HD Player enviado pelo cliente e alerta o revendedor no WhatsApp de suporte com o link de ativação NATV (sem pausar a IA).',
+          parameters: {
+            type: 'object',
+            properties: {
+              mac_address: {
+                type: 'string',
+                description: 'Endereço MAC exibido na tela do HD Player (ex: aa:bb:cc:dd:ee:ff).',
+              },
+            },
+            required: ['mac_address'],
+          },
+        },
+      },
+      {
+        type: 'function',
+        function: {
           name: 'chamar_humano',
           description: 'Pausa a IA e alerta o revendedor no WhatsApp de suporte humano para assumir o atendimento.',
           parameters: { type: 'object', properties: {} },
@@ -2711,6 +2740,8 @@ app.post('/api/webhooks/evolution', async (req, res) => {
       `- App escolhido: ${lead.chosen_app || 'Ainda não escolhido'}\n` +
       `- Usuário NATV gerado: ${lead.natv_username || 'Nenhum'}\n` +
       `- Senha NATV gerada: ${lead.natv_password || 'Nenhuma'}\n` +
+      `- Domínio NATV gerado: ${lead.natv_domain || process.env.XTREAM_HOST || 'Não informado'}\n` +
+      `- MAC HD Player salvo: ${lead.hd_player_mac || 'Ainda não informado'}\n` +
       `- Código Watch Hub da revenda: ${activeReseller.watch_hub_code || 'Não configurado'}`;
 
     const messagesPayload = [
@@ -2851,6 +2882,8 @@ app.post('/api/webhooks/evolution', async (req, res) => {
                     encontrado: true,
                     usuario: found.u,
                     senha: found.p || null,
+                    dominio: lead.natv_domain || process.env.XTREAM_HOST || null,
+                    mac_hd_player: lead.hd_player_mac || null,
                     status: expired ? 'VENCIDO' : String(found.t || 'ATIVO').toUpperCase(),
                     bloqueado: found.b === 'Yes' || found.b === true,
                     vencimento: found.e || 'Não informado',
@@ -2881,9 +2914,10 @@ app.post('/api/webhooks/evolution', async (req, res) => {
             const natvUser = await natvRes.json();
             if (natvRes.ok) {
               lead.natv_username = natvUser.username;
+              lead.natv_domain = natvUser.domain || lead.natv_domain || null;
               await pool.query(
-                `UPDATE leads SET stage = 'TESTE', natv_username = $1, natv_password = $2, followup_step = 0, test_created_at = now() WHERE id = $3`,
-                [natvUser.username, natvUser.password || null, lead.id]
+                `UPDATE leads SET stage = 'TESTE', natv_username = $1, natv_password = $2, natv_domain = COALESCE($3, natv_domain), followup_step = 0, test_created_at = now() WHERE id = $4`,
+                [natvUser.username, natvUser.password || null, natvUser.domain || null, lead.id]
               );
               if (shouldDebitBot(activeReseller)) {
                 await debitWallet(
@@ -2947,6 +2981,41 @@ app.post('/api/webhooks/evolution', async (req, res) => {
             toolResult = pixCode
               ? JSON.stringify({ valor: amount, meses: months, telas: screens, pix_copia_e_cola: pixCode })
               : 'Erro ao gerar Pix no Mercado Pago.';
+          }
+        }
+
+        if (fnName === 'registrar_mac_hdplayer') {
+          const mac = String(args.mac_address || '').trim().toUpperCase();
+          if (!mac) {
+            toolResult = 'Erro: MAC não informado. Peça ao cliente uma foto nítida da tela inicial do HD Player.';
+          } else {
+            lead.hd_player_mac = mac;
+            await pool.query(
+              `UPDATE leads SET hd_player_mac = $1, chosen_app = COALESCE(NULLIF(chosen_app, ''), 'HD PLAYER') WHERE id = $2`,
+              [mac, lead.id]
+            );
+
+            if (activeReseller.support_whatsapp) {
+              const digits = String(activeReseller.support_whatsapp).replace(/\D/g, '');
+              const supportNumber = digits.length <= 11 ? `55${digits}` : digits;
+              const supportJid = `${supportNumber}@s.whatsapp.net`;
+              const clientPhone = String(lead.phone || '').replace(/@.*$/, '');
+              const macAlert =
+                `📺 *MAC HD Player Capturado!*\n\n` +
+                `Cliente: ${lead.name || 'Sem nome'}\n` +
+                `WhatsApp: ${clientPhone}\n` +
+                `Usuário NATV: ${lead.natv_username || 'Ainda não gerado'}\n` +
+                `MAC: *${mac}*\n\n` +
+                `🔗 Ativar licença (exclusivo revendedor - use seu token NATV):\n` +
+                `https://partner.activation.click/dbtdwt3x28a6ek3m`;
+
+              const sent = await sendWhatsAppText(instance, supportJid, macAlert);
+              console.log(`📺 [MAC HD PLAYER] Salvo (${mac}) e enviado para ${supportJid} | OK: ${sent.ok}`);
+            } else {
+              console.log(`📺 [MAC HD PLAYER] Salvo (${mac}) para lead ${lead.id} (sem support_whatsapp cadastrado).`);
+            }
+
+            toolResult = `MAC ${mac} salvo e encaminhado ao revendedor com sucesso. Continue atendendo o cliente normalmente (NUNCA envie o link partner.activation.click para o cliente).`;
           }
         }
 
@@ -3354,7 +3423,9 @@ async function initFollowupColumns() {
       ADD COLUMN IF NOT EXISTS renewal_stage TEXT,
       ADD COLUMN IF NOT EXISTS instance_name TEXT,
       ADD COLUMN IF NOT EXISTS test_created_at TIMESTAMP,
-      ADD COLUMN IF NOT EXISTS natv_password TEXT;
+      ADD COLUMN IF NOT EXISTS natv_password TEXT,
+      ADD COLUMN IF NOT EXISTS natv_domain TEXT,
+      ADD COLUMN IF NOT EXISTS hd_player_mac TEXT;
     `);
 
     await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_url TEXT;`);
