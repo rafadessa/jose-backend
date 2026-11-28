@@ -32,7 +32,7 @@ app.use('/videos', express.static(VIDEOS_DIR));
 app.get('/', (req, res) =>
   res.json({
     status: 'ok',
-    app: 'API do José v5.15 (Roteiro LG Antiga/Nova + Bloqueio Operadoras + Philips + Android + Sony + TCL)',
+    app: 'API do José v5.16 (Trava Atômica Anti-Duplicidade Pix/NATV + LG + Philips + Android + Sony + TCL)',
   })
 );
 
@@ -1404,27 +1404,38 @@ app.post('/api/wallet/confirm/:paymentId', auth, async (req, res) => {
 });
 
 // ==========================================
-// 5. WEBHOOK DE VENDA DE PLANOS
+// 5. WEBHOOK DE VENDA DE PLANOS (COM TRAVA ATÔMICA ANTI-DUPLICIDADE)
 // ==========================================
+const inFlightResellerPayments = new Set();
+
 app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
   res.sendStatus(200);
-  const paymentId =
+  const rawPaymentId =
     req.body?.data?.id ||
     req.query?.['data.id'] ||
     req.query?.id ||
     req.body?.id;
+  const cleanPaymentId = String(rawPaymentId || '').replace(/\D/g, '');
   const { resellerId } = req.params;
-  if (!paymentId || !resellerId) return;
+  if (!cleanPaymentId || !resellerId) return;
 
+  // Trava 1 (memória): bloqueia webhooks simultâneos no mesmo milissegundo
+  if (inFlightResellerPayments.has(cleanPaymentId)) {
+    console.log(`🛡️ [TRAVA MEMÓRIA] Webhook duplicado ignorado para Pix #${cleanPaymentId}`);
+    return;
+  }
+  inFlightResellerPayments.add(cleanPaymentId);
+
+  let dbLockAcquired = false;
   try {
-    const already = await pool.query('SELECT 1 FROM processed_payments WHERE payment_id = $1', [String(paymentId)]);
+    const already = await pool.query('SELECT 1 FROM processed_payments WHERE payment_id = $1', [cleanPaymentId]);
     if (already.rows.length > 0) return;
 
     const resRes = await pool.query('SELECT * FROM resellers WHERE id = $1', [resellerId]);
     const reseller = resRes.rows[0];
     if (!reseller?.mp_access_token || !reseller?.natv_api_key) return;
 
-    const mpRes = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
+    const mpRes = await fetch(`https://api.mercadopago.com/v1/payments/${cleanPaymentId}`, {
       headers: { Authorization: `Bearer ${reseller.mp_access_token}` },
     });
     const payment = await mpRes.json();
@@ -1437,6 +1448,17 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
       const leadRes = await pool.query('SELECT * FROM leads WHERE id = $1', [leadId]);
       const lead = leadRes.rows[0];
       if (!lead?.natv_username) return;
+
+      // Trava 2 (banco atômica): reserva o payment_id ANTES de chamar a NATV
+      const lockRes = await pool.query(
+        'INSERT INTO processed_payments (payment_id, reseller_id, lead_id) VALUES ($1, $2, $3) ON CONFLICT (payment_id) DO NOTHING RETURNING payment_id',
+        [cleanPaymentId, reseller.id, lead.id]
+      );
+      if (lockRes.rows.length === 0) {
+        console.log(`🛡️ [TRAVA BANCO] Pix #${cleanPaymentId} já foi processado anteriormente.`);
+        return;
+      }
+      dbLockAcquired = true;
 
       const actBody = {
         username: lead.natv_username,
@@ -1452,13 +1474,17 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
         },
         body: JSON.stringify(actBody),
       });
-      const actData = await actRes.json();
+      const actData = await actRes.json().catch(() => ({}));
+
+      if (!actRes.ok) {
+        // Se a NATV recusar/falhar, libera a trava para permitir nova tentativa
+        await pool.query('DELETE FROM processed_payments WHERE payment_id = $1', [cleanPaymentId]);
+        dbLockAcquired = false;
+        console.error(`❌ [NATV FALHOU] Pix #${cleanPaymentId} não ativado (status ${actRes.status}):`, actData);
+        return;
+      }
 
       if (actRes.ok) {
-        await pool.query(
-          'INSERT INTO processed_payments (payment_id, reseller_id, lead_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
-          [String(paymentId), reseller.id, lead.id]
-        );
         await pool.query(`UPDATE leads SET stage = 'ATIVO' WHERE id = $1`, [lead.id]);
 
         await syncClientToGestor(reseller, lead, months, screens);
@@ -1536,7 +1562,12 @@ app.post('/api/webhooks/mp-reseller/:resellerId', async (req, res) => {
       }
     }
   } catch (err) {
+    if (dbLockAcquired) {
+      await pool.query('DELETE FROM processed_payments WHERE payment_id = $1', [cleanPaymentId]).catch(() => {});
+    }
     console.error('Erro no webhook mp-reseller:', err);
+  } finally {
+    inFlightResellerPayments.delete(cleanPaymentId);
   }
 });
 
